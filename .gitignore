@@ -4,3 +4,10 @@ dist/
 workflow-state.json
 build_output.txt
 *.log
+
+# .NET build artifacts (CsharpAstAnalyzer)
+src/analysis/tools/CsharpAstAnalyzer/bin/
+src/analysis/tools/CsharpAstAnalyzer/obj/
+
+# Native addon build artifacts (tree-sitter)
+build/

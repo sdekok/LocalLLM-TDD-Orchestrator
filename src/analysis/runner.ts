@@ -4,6 +4,8 @@ import { getLogger } from '../utils/logger.js';
 import { LLMClient } from '../llm/client.js';
 import { AnalyzerRegistry, formatMultiAnalysisForPrompt, type AnalysisResult, type AnalyzeOptions } from './types.js';
 import { TypeScriptAnalyzer } from './typescript-analyzer.js';
+import { CSharpAnalyzer } from './csharp-analyzer.js';
+import { CppAnalyzer } from './cpp-analyzer.js';
 
 const ANALYSIS_DIR = '.tdd-workflow/analysis';
 
@@ -13,9 +15,9 @@ const ANALYSIS_DIR = '.tdd-workflow/analysis';
 export function createDefaultRegistry(): AnalyzerRegistry {
   const registry = new AnalyzerRegistry();
   registry.register(new TypeScriptAnalyzer());
-  // Future: registry.register(new CSharpAnalyzer());
+  registry.register(new CSharpAnalyzer());
   // Future: registry.register(new PythonAnalyzer());
-  // Future: registry.register(new CppAnalyzer());
+  registry.register(new CppAnalyzer());
   return registry;
 }
 

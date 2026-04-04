@@ -29,6 +29,9 @@ The orchestrator operates seamlessly with Pi Coding Agent's `mcp.json`.
 
 This auto-discovers all GGUF files in the directory and loads them on demand.
 
+**.NET 10 SDK** (required for C# analysis):
+The C# analyzer uses a Roslyn-based CLI tool that requires the .NET 10 SDK. Install it from [dotnet.microsoft.com](https://dotnet.microsoft.com/download). Verify with `dotnet --version`.
+
 **SearXNG** (recommended, for web search):
 ```bash
 docker run -d --name searxng --restart unless-stopped \
@@ -243,6 +246,28 @@ Map them in your `models.config.json` routing:
 ```
 
 If not mapped, they fall back to the planner model automatically.
+
+## Multi-Language Code Analysis
+
+The `/analyze` command (or `analyze_project` MCP tool) performs deep architectural analysis of your codebase. The analyzer automatically detects the project type and uses the appropriate native AST parser:
+
+| Language | Parser | What It Extracts |
+|---|---|---|
+| **TypeScript** | ts-morph | Full dependency graph, exports, imports, type information |
+| **C#** | Roslyn (Microsoft.CodeAnalysis.CSharp) | Namespaces, classes/interfaces/enums, `using` directives, test detection (`[Fact]`/`[Test]`) |
+| **C++** | tree-sitter (native bindings) | `#include` graph (system vs local), classes/structs/enums, function definitions, pattern detection (Abstract Class, Singleton) |
+
+Analysis results are cached in `.tdd-workflow/analysis/` and fed into the context gatherer so the planner and implementer have architectural awareness when generating code.
+
+### Building the C# Analyzer
+
+The C# analyzer uses a sidecar .NET CLI tool. To build it:
+```bash
+cd src/analysis/tools/CsharpAstAnalyzer
+dotnet build -c Release
+```
+
+The built DLL is invoked automatically by the Node.js wrapper when analyzing C# projects.
 
 ## Troubleshooting
 

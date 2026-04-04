@@ -55,3 +55,16 @@ As a developer using local LLMs alongside the Pi Coding Agent, I want a robust, 
 2. Publishes the `start_tdd_workflow`, `resume_tdd_workflow`, `check_workflow_status`, and `analyze_project` tools to the host.
 3. Functions asynchronously so Pi’s chat window is never blocked while the orchestrator works in the background.
 4. Automatically discovers and acts as an *MCP client* to registered third-party servers, actively requesting knowledge via `context-mode` and reporting workflow events back to its proxy.
+
+## Story 6: Multi-Language Code Analysis
+**As a** developer working in polyglot codebases,
+**I need** the orchestrator to deeply understand my project's architecture regardless of whether it's TypeScript, C#, or C++,
+**So that** the planner and implementer can reason about dependency graphs, module boundaries, and design patterns using native AST-level information instead of shallow text search.
+
+**Acceptance Criteria:**
+1. The `AnalyzerRegistry` auto-detects the project language by presence of marker files (`tsconfig.json`, `*.csproj`, `CMakeLists.txt`).
+2. **TypeScript** analysis uses `ts-morph` for full dependency graph, export maps, and type information.
+3. **C#** analysis uses a Roslyn sidecar CLI (`Microsoft.CodeAnalysis.CSharp`) to parse namespaces, class hierarchies, `using` directives, and detect test frameworks (`[Fact]`/`[Test]`).
+4. **C++** analysis uses native `tree-sitter` bindings to extract `#include` graphs (distinguishing `<system>` from `"local"`), class/struct/enum definitions, function signatures, and detect common patterns (Abstract Class, Singleton).
+5. Analysis results conform to the shared `AnalysisResult` schema and are cached in `.tdd-workflow/analysis/`.
+6. Cached analysis is fed into the context gatherer to enrich the planner and implementer prompts.

@@ -47,6 +47,7 @@ Every merge commit includes: quality gate results, test counts, code coverage (i
 ### 1. Prerequisites
 
 - **Node.js 20+**
+- **.NET 10 SDK** (required for C# code analysis via Roslyn)
 - **llama.cpp** running in Router Mode:
   ```bash
   ./llama-server --models-dir /path/to/your/models --host 0.0.0.0 --port 8080
@@ -90,6 +91,8 @@ To analyze a repository's architecture without starting a workflow:
 ```
 /analyze
 ```
+
+The analyzer automatically detects and supports **TypeScript**, **C#**, and **C++** projects.
 
 #### Option B: MCP Server
 If you are using cursor, windsurf, or pi in headless mode, deploy via MCP:
@@ -219,6 +222,14 @@ src/
     reviewer.ts                 # Adversarial reviewer with scoring rubric
     designer.ts                 # UI/UX prototyping agent
     design-reviewer.ts          # Design system consistency checker
+  analysis/
+    types.ts                    # CodeAnalyzer interface, AnalyzerRegistry
+    runner.ts                   # Multi-language analysis orchestration
+    typescript-analyzer.ts      # TypeScript AST analysis via ts-morph
+    csharp-analyzer.ts          # C# analysis via Roslyn sidecar CLI
+    cpp-analyzer.ts             # C++ AST analysis via native tree-sitter
+    tools/
+      CsharpAstAnalyzer/        # .NET 10 CLI tool (Microsoft.CodeAnalysis.CSharp)
   llm/
     client.ts                   # Multi-provider LLM client with timeouts + JSON parsing
     model-router.ts             # Config-driven model selection
@@ -232,7 +243,7 @@ src/
     logger.ts                   # File-based logger (MCP-safe)
 scripts/
   setup-wizard.ts               # Interactive model configuration CLI
-tests/                          # 112 unit + integration tests (vitest)
+tests/                          # 132 unit + integration tests (vitest)
 ```
 
 ## Development
