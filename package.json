@@ -1,0 +1,41 @@
+{
+  "name": "tdd-agentic-workflow",
+  "version": "2.0.0",
+  "description": "Agentic TDD workflow orchestrator for Pi, powered by local LLMs via llama.cpp",
+  "main": "dist/interfaces/mcp/index.js",
+  "type": "module",
+  "pi": {
+    "extensions": ["./dist/interfaces/pi"]
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/interfaces/mcp/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": [
+    "tdd",
+    "mcp",
+    "pi-package",
+    "llm",
+    "pi-agent",
+    "llama-cpp"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "json5": "^2.2.3",
+    "openai": "^6.33.0",
+    "ts-morph": "^27.0.2",
+    "uuid": "^13.0.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@types/node": "^25.5.2",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

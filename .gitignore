@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.tdd-workflow/
+workflow-state.json
+build_output.txt
+*.log
