@@ -1,0 +1,35 @@
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.2.0
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{827E0CD3-B72D-47B6-A68D-7590B98EB39B}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "analysis", "analysis", "{54A4987F-76E1-72D5-7D2A-A4C7D3ACCFF5}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tools", "tools", "{67A2EFDB-136B-663E-81A7-BE21FE6F4A20}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "CsharpAstAnalyzer", "src\analysis\tools\CsharpAstAnalyzer\CsharpAstAnalyzer.csproj", "{B2EE1D1D-F454-8AE1-0CA9-893C54A63410}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{B2EE1D1D-F454-8AE1-0CA9-893C54A63410}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B2EE1D1D-F454-8AE1-0CA9-893C54A63410}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B2EE1D1D-F454-8AE1-0CA9-893C54A63410}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B2EE1D1D-F454-8AE1-0CA9-893C54A63410}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{54A4987F-76E1-72D5-7D2A-A4C7D3ACCFF5} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{67A2EFDB-136B-663E-81A7-BE21FE6F4A20} = {54A4987F-76E1-72D5-7D2A-A4C7D3ACCFF5}
+		{B2EE1D1D-F454-8AE1-0CA9-893C54A63410} = {67A2EFDB-136B-663E-81A7-BE21FE6F4A20}
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {780ABFC8-3A92-46CA-ADCC-56B13589CDB7}
+	EndGlobalSection
+EndGlobal

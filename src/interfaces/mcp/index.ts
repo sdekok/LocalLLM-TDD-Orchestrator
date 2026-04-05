@@ -1,5 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import * as path from 'path';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -20,10 +21,19 @@ const server = new Server(
 );
 
 // Lazy-initialized per project
-const executors = new Map<string, { state: StateManager; executor: WorkflowExecutor }>();
+const executors = new Map<string, { state: StateManager; executor: WorkflowExecutor; llm: LLMClient }>();
 // Share one pool for the MCP server process
 let globalMcpPool: MCPClientPool | null = null;
 let mcpPoolInitPromise: Promise<void> | null = null;
+
+function resolveProjectDir(projectDirArg: string): string {
+  let resolved = projectDirArg;
+  if (resolved.startsWith('~')) {
+    const home = process.env.HOME || process.env.USERPROFILE || '';
+    resolved = path.join(home, resolved.slice(1));
+  }
+  return path.resolve(resolved);
+}
 
 async function initGlobalMcpPool(projectDir: string) {
   if (!globalMcpPool) {
@@ -45,7 +55,7 @@ async function getOrCreate(projectDir: string) {
       searchClient,
       mcpPool: globalMcpPool,
     });
-    executors.set(projectDir, { state, executor });
+    executors.set(projectDir, { state, executor, llm });
   }
   return executors.get(projectDir)!;
 }
@@ -119,7 +129,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const toolName = request.params.name;
 
   if (toolName === 'start_tdd_workflow') {
-    const projectDir = args.projectDir as string;
+    const projectDir = resolveProjectDir(args.projectDir as string);
     const userRequest = args.request as string;
     const { executor } = await getOrCreate(projectDir);
 
@@ -139,7 +149,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (toolName === 'resume_tdd_workflow') {
-    const projectDir = args.projectDir as string;
+    const projectDir = resolveProjectDir(args.projectDir as string);
     const retryFailed = (args.retryFailed as boolean) || false;
     const { executor } = await getOrCreate(projectDir);
 
@@ -158,10 +168,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (toolName === 'check_workflow_status') {
-    const projectDir = args.projectDir as string;
-    const { state } = await getOrCreate(projectDir);
+    const projectDir = resolveProjectDir(args.projectDir as string);
+    const { state, llm } = await getOrCreate(projectDir);
     const summary = state.getSummary();
     const fullState = state.getState();
+    const modelConfig = llm['router'].getConfig().routing;
 
     return {
       content: [
@@ -171,6 +182,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               summary,
               refinedRequest: fullState.refined_request,
+              modelConfig,
               subtasks: fullState.subtasks.map((t) => ({
                 id: t.id,
                 description: t.description.substring(0, 100),
@@ -188,7 +200,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (toolName === 'analyze_project') {
-    const projectDir = args.projectDir as string;
+    const projectDir = resolveProjectDir(args.projectDir as string);
     const generateDocs = (args.generateDocs as boolean) || false;
     const forceRefresh = (args.forceRefresh as boolean) || false;
 
@@ -231,7 +243,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         content: [
           {
             type: 'text',
-            text: `Analysis failed: ${err instanceof Error ? err.message : String(err)}`,
+            text: `Analysis failed for ${projectDir}: ${err instanceof Error ? err.message : String(err)}`,
           },
         ],
         isError: true,
