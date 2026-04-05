@@ -167,21 +167,7 @@ export class WorkflowExecutor {
 
         try {
           // 4. Sub-refinement check (Plan the HOW if we only have the WHAT)
-          // If the task description is short or lacks technical detail, we run it through the planner again
-          // specifically to get TDD-granular subtasks.
-          let technicalDescription = task.description;
-          if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
-            logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
-            const subPlan = await planAndBreakdown(
-              `Implement this specific work item: ${task.description}\n\nExisting architectural context:\n${this.state.getState().refined_request}`, 
-              this.modelRouter, 
-              this.searchClient || undefined
-            );
-            
-            // We combine the refined subtasks into a prompt for the implementer
-            technicalDescription = `Task: ${task.description}\n\nTechnical Plan:\n` + 
-              subPlan.subtasks.map((s, i) => `${i+1}. ${s.description}`).join('\n');
-          }
+          let technicalDescription = await this.refineTaskIntoSubtasks(task.id, attempt);
 
           // 1. Create/Reset sandbox branch
           await this.sandbox.createBranch(branchName);
@@ -221,7 +207,9 @@ export class WorkflowExecutor {
           if (!qualityReport.allBlockingPassed) {
             feedback = formatGateFailures(qualityReport);
             logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
-            await this.sandbox.rollback(originalBranch);
+            if (originalBranch) {
+              await this.sandbox.rollback(originalBranch);
+            }
             continue;
           }
 
@@ -265,12 +253,14 @@ export class WorkflowExecutor {
           // 6. Parse Reviewer Verdict
           const isApproved = reviewText.includes('APPROVED: true');
           const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-          const reviewerFeedback = feedbackMatch ? feedbackMatch[1].trim() : reviewText;
+          const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
 
           if (!isApproved) {
             logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
             feedback = reviewerFeedback;
-            await this.sandbox.rollback(originalBranch);
+            if (originalBranch) {
+              await this.sandbox.rollback(originalBranch);
+            }
             continue;
           }
 
@@ -309,5 +299,33 @@ export class WorkflowExecutor {
         });
       }
     }
+  }
+
+  /**
+   * Refines a task into more granular technical subtasks if it's too high-level.
+   */
+  public async refineTaskIntoSubtasks(taskId: string, attempt: number): Promise<string> {
+    const logger = getLogger();
+    const task = this.state.getSubtask(taskId);
+    if (!task) return '';
+
+    let technicalDescription = task.description;
+
+    // If the task description is short or lacks technical detail, we run it through the planner again
+    // specifically to get TDD-granular subtasks.
+    if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
+      logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
+      const subPlan = await planAndBreakdown(
+        `Implement this specific work item: ${task.description}\n\nExisting architectural context:\n${this.state.getState().refined_request}`,
+        this.modelRouter,
+        this.searchClient || undefined
+      );
+
+      // We combine the refined subtasks into a prompt for the implementer
+      technicalDescription = `Task: ${task.description}\n\nTechnical Plan:\n` +
+        subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
+    }
+
+    return technicalDescription;
   }
 }
