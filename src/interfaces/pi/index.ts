@@ -3,7 +3,8 @@ import { StateManager } from '../../orchestrator/state.js';
 import { WorkflowExecutor } from '../../orchestrator/executor.js';
 import { ModelRouter } from '../../llm/model-router.js';
 import { SearchClient } from '../../search/searxng.js';
-import { analyzeProject } from '../../analysis/runner.js';
+import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
+import { planProject } from '../../agents/project-planner.js';
 import { getLogger } from '../../utils/logger.js';
 import * as path from 'path';
 
@@ -71,6 +72,38 @@ export default function(pi: ExtensionAPI) {
     }
   });
 
+  pi.registerCommand('plan', {
+    description: 'Structure a new project or large feature into epics and work items',
+    handler: async (args: string, ctx) => {
+      if (!args) {
+        args = await ctx.ui.input('Enter project or feature description:') || '';
+        if (!args) return;
+      }
+
+      ctx.ui.notify('Project Planner starting...', 'info');
+      ctx.ui.setStatus('plan', '📐 Planning project structure...');
+
+      try {
+        // 1. Check if analysis is stale. If so, run it first.
+        if (isAnalysisStale(ctx.cwd)) {
+          ctx.ui.setStatus('plan', '🔍 Running fresh code analysis first...');
+          await analyzeProject(ctx.cwd);
+        }
+
+        const modelRouter = new ModelRouter();
+        const result = await planProject(args, modelRouter, ctx.cwd);
+        
+        ctx.ui.setStatus('plan', undefined);
+        ctx.ui.notify(result.summary, 'info');
+
+      } catch (err) {
+        ctx.ui.setStatus('plan', undefined);
+        const e = err as Error;
+        ctx.ui.notify(`Planning failed: ${e.message}`, 'error');
+      }
+    }
+  });
+
   pi.registerCommand('analyze', {
     description: 'Run architectural analysis on the repository',
     handler: async (args: string, ctx) => {
@@ -96,8 +129,10 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.on('session_shutdown', async () => {
-    if (executor && (executor as any).mcpPool) {
-      await (executor as any).mcpPool.disconnect();
+    if (executor) {
+      if ((executor as any).searchClient?.mcpPool) {
+        await (executor as any).searchClient.mcpPool.disconnect();
+      }
     }
   });
 }

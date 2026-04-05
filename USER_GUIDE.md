@@ -1,141 +1,80 @@
-# User Guide — TDD Agentic Workflow
+# User Guide — TDD Agentic Workflow (Pi Native)
 
 ## Overview
 
-The TDD Agentic Workflow orchestrator automates feature implementation through your Pi Coding Agent. You describe what you want, and the system:
+The TDD Agentic Workflow orchestrator is a native **Pi Extension** that automates feature implementation through ephemeral sub-agent sessions. You describe what you want, and the system:
 
-1. **Plans** — Breaks your request into testable subtasks, researching best practices via web search
-2. **Implements** — Writes tests first, then code, in a sandboxed git branch
-3. **Validates** — Runs deterministic quality gates (TypeScript compilation, test suite, linting)
-4. **Reviews** — An adversarial LLM reviewer scores the implementation on test coverage, integration, error handling, and security
-5. **Merges or retries** — If gates pass, the code is merged with a rich commit message. If not, the implementer gets the error output and tries again (up to 3 attempts)
-6. **Detects loops** — If the agent produces nearly identical output across attempts (>90% similarity), it bails early instead of wasting compute
+1. **Plans** — Breaks your request into testable subtasks, researching best practices via web search.
+2. **Implements** — Spawns a headless Pi sub-agent that writes tests and code natively using `read`, `edit`, and `bash` tools.
+3. **Validates** — Runs deterministic quality gates (TypeScript compilation, test suite, linting) on the sub-agent's work.
+4. **Reviews** — Spawns a reviewer sub-agent to score the implementation on test coverage and code quality.
+5. **Merges or Retries** — If gates pass, code is merged. If not, the implementer gets feedback and tries again (up to 3 attempts).
 
-## First-Time Setup
+## Installation
 
-### 0. MCP Servers & Context Integration (Pi)
-
-The orchestrator operates seamlessly with Pi Coding Agent's `mcp.json`.
-- **Enriched Context**: If you have `context-mode` registered in Pi, the TDD workflow automatically utilizes its memory index to deeply analyze your repository using `ctx_search`.
-- **Knowledge Share**: At the completion of each subtask, the orchestrator updates `context-mode` via `ctx_index`, ensuring standard Pi chats retain knowledge of your TDD changes.
-- **Headless MCP Usage**: If you are using this plugin standalone (Cursor, Windsurf), you can define a `.tdd-workflow/mcp.json` in your project root to connect to MCP servers like `searxng`.
-
-### 1. Start Your Local Infrastructure
-
-**llama.cpp in Router Mode** (required):
-```bash
-./llama-server --models-dir /path/to/your/gguf-models --host 0.0.0.0 --port 8080
-```
-
-This auto-discovers all GGUF files in the directory and loads them on demand.
-
-**.NET 10 SDK** (required for C# analysis):
-The C# analyzer uses a Roslyn-based CLI tool that requires the .NET 10 SDK. Install it from [dotnet.microsoft.com](https://dotnet.microsoft.com/download). Verify with `dotnet --version`.
-
-**SearXNG** (recommended, for web search):
-```bash
-docker run -d --name searxng --restart unless-stopped \
-  -p 8888:8080 -e SEARXNG_BASE_URL=http://localhost:8888 \
-  searxng/searxng
-```
-
-### 2. Configure Models
-
-Run the interactive wizard:
+### 1. Build the Project
 ```bash
 cd /path/to/pi-coding-agent
-npx tsx scripts/setup-wizard.ts
+npm install
+npm run build
 ```
 
-The wizard will:
-- Connect to your llama.cpp server and list available models
-- Let you name each model and set its architecture (MoE vs dense)
-- Configure sampling parameters (temperature, top_k, top_p, etc.)
-- Map models to agent roles (planner, implementer, reviewer, researcher)
-- Save everything to `models.config.json`
-
-**Or configure manually** — copy and edit the example:
+### 2. Register with Pi
+Run the following command in your terminal to register the extension:
 ```bash
-cp models.config.example.json models.config.json
+pi install local:.
 ```
 
-### 3. Using Cloud Models (Optional)
+## Using Slash Commands
 
-You can add OpenRouter or OpenAI models alongside your local ones. In `models.config.json`:
+Once installed, you can trigger the workflow directly from any Pi session using slash commands.
 
-```json
-{
-  "cloud-research": {
-    "name": "Claude 4 Sonnet (via OpenRouter)",
-    "ggufFilename": "",
-    "modelId": "anthropic/claude-sonnet-4",
-    "provider": "openrouter",
-    "apiKeyEnvVar": "OPENROUTER_API_KEY",
-    "contextWindow": 200000,
-    "maxOutputTokens": 16384,
-    "architecture": "dense",
-    "speed": "medium",
-    "samplingParams": { "temperature": 0.1 }
-  }
-}
-```
+### `/tdd <request>`
+Starts a full TDD workflow in the current directory.
+- **Example**: `/tdd Add a secure JWT authentication middleware with refresh tokens`
+- **What happens**: The Planner starts, subtasks are created, and Pi begins the implementation loop in the background.
 
-Set the environment variable: `export OPENROUTER_API_KEY=sk-or-...`
+### `/plan <request>`
+Decomposes a large project or feature into structured Epics and WorkItems.
+- **Output**: Creates a `WorkItems/` directory at the project root with markdown files.
+- **Workflow**: Plan first, review the generated files, then use `/tdd` to implement.
+- **Analysis Integration**: Automatically runs `/analyze` first to ensure the architect has a fresh blueprint of the codebase.
 
-Then in your routing, assign it to a role: `"research": "cloud-research"`
+### `/analyze`
+Performs a deep architectural analysis of the current repository.
+- **Supported Languages**: TypeScript, JavaScript, C#, C++.
+- **Benefit**: Caches a "blueprint" of the repository that the Planner and Architect use to generate more accurate tasks.
 
-## Using the Workflow
+## Model Configuration
 
-### Starting a Workflow
+The orchestrator uses a `models.config.json` file to route different tasks to appropriate models.
 
-Tell Pi what you want to build and which project to work on:
+- **Local (llama.cpp)**: Default provider. Supports "Router Mode" for on-demand model loading.
+- **Cloud**: Supports OpenRouter, OpenAI, and Anthropic providers.
 
-> "Start a TDD workflow to add user authentication with JWT tokens to the Express app at /home/stephen/projects/my-api"
+### Optimized Tunings
+The system includes built-in "Tuners" that automatically adjust sampling and prompts for specific models:
+- **Gemma 4**: Injects `<|think|>` triggers into system prompts when thinking is enabled.
+- **Qwen 3.5**: Floors temperature to `0.6` for thinking models to prevent degradation.
 
-Pi will call the `start_tdd_workflow` MCP tool with your request and project path. The orchestrator runs in the background.
+## Project Planning: Plan-Review-Execute
 
-### Epic-Level Workflows
+For complex features, we recommend the following lifecycle:
 
-For larger features, create a feature branch first:
+1.  **Plan**: Run `/plan "Feature description"` to generate epics.
+2.  **Review**: Open the generated `WorkItems/epic-XX.md` files. Edit them if the plan isn't quite right.
+3.  **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
+4.  **Execute**: Run `/tdd Implement Epic 01`. The system will load the work items and sub-refine them into TDD steps.
 
-```bash
-cd /home/stephen/projects/my-api
-git checkout -b feature/jwt-auth
-```
+## Under the Hood: Agentic Sessions
 
-Then start the workflow. All subtask merges land on `feature/jwt-auth`, giving you a clean commit history:
+Unlike legacy MCP servers, this orchestrator uses **ephemeral agent sessions** (`createAgentSession`). 
 
-```
-feature/jwt-auth
-  ├── TDD: Create user model with validation
-  ├── TDD: Add password hashing with bcrypt
-  ├── TDD: Create JWT token generation
-  ├── TDD: Build login endpoint
-  └── TDD: Add auth middleware
-```
+- **Statefulness**: Within a single "attempt", the Implementer agent can freely read files, run tests, and fix its own errors multiple times before submitting for validation.
+- **Tool Access**: Agents have access to the same native tools as you: `read`, `write`, `edit`, and `bash`.
+- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the error/feedback into the *next* session's system prompt.
 
-When the workflow completes, open a PR from `feature/jwt-auth` → `main` and review the aggregate result.
-
-### Checking Progress
-
-> "Check the status of the TDD workflow for /home/stephen/projects/my-api"
-
-Pi will show you:
-- How many subtasks were created
-- Which are pending, in progress, completed, or failed
-- Any feedback from failed attempts
-
-### Resuming After Interruption
-
-If the process is interrupted (machine restart, power loss), your progress is saved:
-
-> "Resume the TDD workflow for /home/stephen/projects/my-api"
-
-This picks up from the last pending task. To also retry previously failed tasks:
-
-> "Resume the TDD workflow for /home/stephen/projects/my-api and retry any failed tasks"
-
-## How Quality Gates Work
+## Quality Gates & Coverage
 
 The orchestrator does **not** ask an AI if the code is good enough. Instead, it runs deterministic checks:
 
@@ -146,137 +85,23 @@ The orchestrator does **not** ask an AI if the code is good enough. Instead, it 
 | **Lint** | Non-blocking | ESLint warnings are logged but don't block |
 | **File Safety** | Blocking | Ensures files were only written to expected directories (src/, tests/) |
 
-If any **blocking** gate fails, the error output is fed back to the implementer as context for the next attempt. The LLM reviewer only runs **after** gates pass, and its feedback is advisory.
+### Code Coverage Detection
+If you have a coverage tool installed, coverage is **automatically** detected and included in the merge commit message:
+- **Vitest**: Install `@vitest/coverage-v8` for automatic support.
+- **Jest**: Built-in `--coverage` flag is utilized.
+- **Custom**: If you have a `test:coverage` or `coverage` script in `package.json`, it's used instead.
 
-### Test Metrics
+## Safety & Controls
 
-After tests run, the orchestrator automatically parses test counts from the runner output. This is included in every commit message so you can see at a glance how many tests were added:
-
-```
-Tests: 47/47 passed
-```
-
-Supports vitest, jest, mocha, and node:test output formats.
-
-### Code Coverage
-
-If you have a coverage tool installed, coverage is **automatically** detected and included:
-
-- **Vitest**: Install `@vitest/coverage-v8` → coverage runs automatically
-- **Jest**: Built-in `--coverage` flag is added
-- **c8 / nyc**: Detected from devDependencies
-- **Custom script**: If you have a `test:coverage` or `coverage` script in package.json, it's used instead
-
-Coverage appears in the commit message:
-```
-Coverage: 87.3% lines, 72.1% branches, 91.0% functions
-```
-
-If no coverage tool is installed, coverage is simply omitted — no error, no noise.
-
-## Safety Guards
-
-The orchestrator has three layers of protection against runaway execution:
-
-### 1. Loop Detection (Per Attempt)
-If the implementer produces output that is >90% similar to the previous attempt, it means the agent is stuck in a loop. The system **bails immediately** instead of wasting the remaining attempts on identical output.
-
-### 2. Time Budget (Per Task)
-Each subtask has a 10-minute total time budget across all attempts. If exceeded, the task is marked as failed and the workflow continues.
-
-### 3. Circuit Breaker (Workflow-Level)
-If 3 consecutive tasks fail (not just individual attempts — entire tasks), the workflow stops. This catches systemic issues like a misconfigured model, missing project dependencies, or a fundamentally broken build. Resume with `retryFailed=true` after fixing the root cause.
-
-## Commit Messages
-
-Every merge commit is **self-documenting** with full quality details:
-
-```
-TDD: Create JWT token generation
-
----
-Attempt: 1
-
-Quality Gates:
-  ✅ typescript (blocking)
-  ✅ tests (blocking)
-  ⚠️ lint
-
-Tests: 47/47 passed
-Coverage: 87.3% lines, 72.1% branches, 91.0% functions
-
-Reviewer Score: 17/20
-Reviewer: Good test coverage, clean error handling. Minor: could use a constant for expiry.
-
-Files: src/auth/jwt.ts, tests/auth/jwt.test.ts
-```
-
-This means your git log and PRs are fully auditable without reading log files.
-
-## Workflow State
-
-All state is stored in your project under `.tdd-workflow/`:
-- `state.json` — Current subtask list, statuses, and feedback
-- `logs/` — Timestamped log files for debugging
-
-To reset completely, delete the directory:
-```bash
-rm -rf /path/to/your/project/.tdd-workflow
-```
-
-## Design Agents (Optional)
-
-For UI-heavy projects, two additional agent roles are available:
-
-- **Designer** (`design`): Generates component specifications, layout prototypes, and suggests design tokens
-- **Design Reviewer** (`design_review`): Checks for component duplication, design system consistency, and naming conventions
-
-Map them in your `models.config.json` routing:
-```json
-{
-  "routing": {
-    "plan": "gemma-4-dense",
-    "implement": "qwen-moe",
-    "review": "gemma-4-dense",
-    "research": "qwen-dense",
-    "design": "gemma-4-dense",
-    "design_review": "gemma-4-dense"
-  }
-}
-```
-
-If not mapped, they fall back to the planner model automatically.
-
-## Multi-Language Code Analysis
-
-The `/analyze` command (or `analyze_project` MCP tool) performs deep architectural analysis of your codebase. The analyzer automatically detects the project type and uses the appropriate native AST parser:
-
-| Language | Parser | What It Extracts |
-|---|---|---|
-| **TypeScript** | ts-morph | Full dependency graph, exports, imports, type information |
-| **C#** | Roslyn (Microsoft.CodeAnalysis.CSharp) | Namespaces, classes/interfaces/enums, `using` directives, test detection (`[Fact]`/`[Test]`) |
-| **C++** | tree-sitter (native bindings) | `#include` graph (system vs local), classes/structs/enums, function definitions, pattern detection (Abstract Class, Singleton) |
-
-Analysis results are cached in `.tdd-workflow/analysis/` and fed into the context gatherer so the planner and implementer have architectural awareness when generating code.
-
-### Building the C# Analyzer
-
-The C# analyzer uses a sidecar .NET CLI tool. To build it:
-```bash
-cd src/analysis/tools/CsharpAstAnalyzer
-dotnet build -c Release
-```
-
-The built DLL is invoked automatically by the Node.js wrapper when analyzing C# projects.
+- **Git Sandboxing**: Every subtask is isolated in its own branch. No code is merged unless it passes all deterministic gates.
+- **Circuit Breaker**: If 3 consecutive subtasks fail completely (exhausted retries), the entire workflow stops to prevent wasting tokens/compute.
+- **Loop Detection**: If an agent produces nearly identical changes (>90% similarity) across attempts, the system bails early and flags the task for manual intervention.
 
 ## Troubleshooting
 
-| Problem | Solution |
+| Issue | Solution |
 |---|---|
-| "No model configuration found" | Run `npx tsx scripts/setup-wizard.ts` or copy `models.config.example.json` to `models.config.json` |
-| Workflow hangs | Check `.tdd-workflow/logs/` for timeout errors. Increase `maxOutputTokens` in config or check llama.cpp VRAM usage |
-| LLM returns malformed JSON | The parser handles most cases (trailing commas, comments, prose). If persistent, try a larger/smarter model for that role |
-| Quality gates always fail | Check that `package.json` has correct test/build scripts and that existing tests pass before starting a workflow |
-| MCP server doesn't connect | Check `~/.pi/agent/mcp.json` points to the correct `dist/mcp-server/index.js` path |
-| "Loop detected" on every task | The model can't solve the problem — try a different model for the implementer role or simplify the request |
-| "Circuit breaker" triggers | Something systemic is wrong — check if the project builds and tests pass before the workflow, and verify your model config |
+| Command not found | Ensure you ran `npm run build` and `pi install local:.` correctly. |
+| Model "X" not found | Check `models.config.json` and ensure your llama.cpp server is running in "Router Mode". |
+| Workflow hangs | Check `.tdd-workflow/logs/` for details. Usually means the LLM is stuck or local VRAM is exhausted. |
+| Quality gates always fail | Verify your `package.json` scripts (`test`, `build`) work manually first. |

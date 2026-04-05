@@ -45,7 +45,7 @@ export interface ModelProfile {
  * - analyze: Algorithmic code analysis (dependency graphs, patterns)
  * - document: LLM-powered architecture documentation
  */
-export type TaskType = 'plan' | 'implement' | 'review' | 'research' | 'design' | 'design_review' | 'analyze' | 'document';
+export type TaskType = 'plan' | 'project-plan' | 'implement' | 'review' | 'research' | 'design' | 'design_review' | 'analyze' | 'document';
 
 export interface ModelRouterConfig {
   llamaCppUrl?: string;

@@ -1,10 +1,12 @@
 import { EventEmitter } from 'events';
-import { StateManager } from './state.js';
+import { StateManager, WorkflowState } from './state.js';
+import * as path from 'path';
 import { Sandbox } from './sandbox.js';
 import { runQualityGates, formatGateFailures } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
+import { EpicLoader, EpicPlan } from './epic-loader.js';
 import { createSubAgentSession } from '../subagent/factory.js';
 import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
@@ -77,10 +79,33 @@ export class WorkflowExecutor {
     logger.info(`Starting new workflow: ${request.substring(0, 100)}`);
     this.state.initWorkflow(request);
 
-    // Planner still uses a structured JSON call (Option B)
-    const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
-    this.state.updateRefinedRequest(plan.refinedRequest);
-    this.state.setSubtasks(plan.subtasks);
+    // 1. Check if the request refers to a pre-planned Epic
+    const epicLoader = new EpicLoader(this.state.projectDir);
+    const epicPath = epicLoader.findEpic(request);
+    let epic: EpicPlan | null = null;
+
+    if (epicPath) {
+      logger.info(`Detected pre-planned Epic: ${path.basename(epicPath)}`);
+      epic = epicLoader.parseEpic(epicPath);
+    }
+
+    // 2. Initial planning or Epic loading
+    if (epic) {
+      // If an epic is found, we use its work items as base subtasks
+      // Note: We'll sub-refine them during execution if needed
+      this.state.updateRefinedRequest(epic.title);
+      this.state.setSubtasks(epic.workItems.map(wi => ({
+        id: wi.id,
+        description: wi.description,
+        status: 'pending',
+        attempts: 0
+      })));
+    } else {
+      // Fallback to standard on-the-fly planning
+      const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
+      this.state.updateRefinedRequest(plan.refinedRequest);
+      this.state.setSubtasks(plan.subtasks);
+    }
 
     await this.processQueue();
   }
@@ -141,6 +166,23 @@ export class WorkflowExecutor {
         this.state.updateSubtask(task.id, { attempts: attempt });
 
         try {
+          // 4. Sub-refinement check (Plan the HOW if we only have the WHAT)
+          // If the task description is short or lacks technical detail, we run it through the planner again
+          // specifically to get TDD-granular subtasks.
+          let technicalDescription = task.description;
+          if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
+            logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
+            const subPlan = await planAndBreakdown(
+              `Implement this specific work item: ${task.description}\n\nExisting architectural context:\n${this.state.getState().refined_request}`, 
+              this.modelRouter, 
+              this.searchClient || undefined
+            );
+            
+            // We combine the refined subtasks into a prompt for the implementer
+            technicalDescription = `Task: ${task.description}\n\nTechnical Plan:\n` + 
+              subPlan.subtasks.map((s, i) => `${i+1}. ${s.description}`).join('\n');
+          }
+
           // 1. Create/Reset sandbox branch
           await this.sandbox.createBranch(branchName);
 
@@ -161,7 +203,7 @@ export class WorkflowExecutor {
           });
 
           try {
-            await implementerSession.prompt(task.description);
+            await implementerSession.prompt(technicalDescription);
             // Agent finished — it has already modified files in options.cwd via tools
           } finally {
             implementerSession.dispose();
