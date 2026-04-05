@@ -51,7 +51,7 @@ async function getOrCreate(projectDir: string) {
     const state = new StateManager(projectDir);
     const llm = new LLMClient();
     const searchClient = new SearchClient(undefined, globalMcpPool || undefined);
-    const executor = new WorkflowExecutor(state, llm, {
+    const executor = new WorkflowExecutor(state, llm.router, {
       searchClient,
       mcpPool: globalMcpPool,
     });

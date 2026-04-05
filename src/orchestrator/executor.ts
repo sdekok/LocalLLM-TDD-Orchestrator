@@ -222,8 +222,9 @@ export class WorkflowExecutor {
           });
 
           // 5. Adversarial Review via Sub-Agent
+          const subtask = task!; // Use ! to satisfy TSC since we know task is not null
           this.events.emit('taskProgress', { 
-            id: task.id, 
+            id: subtask.id, 
             attempt, 
             phase: 'review',
             message: 'Waiting for hostile code review...'

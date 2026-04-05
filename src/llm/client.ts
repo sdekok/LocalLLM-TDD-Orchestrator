@@ -8,7 +8,7 @@ const DEFAULT_TIMEOUT_MS = 60_000; // 1 minute for planning
 
 export class LLMClient {
   private clients = new Map<string, OpenAI>();
-  private router: ModelRouter;
+  public router: ModelRouter;
 
   constructor(modelRouter?: ModelRouter) {
     this.router = modelRouter || new ModelRouter();
