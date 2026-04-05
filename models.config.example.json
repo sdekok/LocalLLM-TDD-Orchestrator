@@ -1,14 +1,15 @@
 {
   "_comment": "Example configuration. Run `npx tsx scripts/setup-wizard.ts` to auto-detect and configure models.",
+  "llamaCppUrl": "http://localhost:8080/v1",
   "models": {
     "gemma-4-moe": {
       "name": "Gemma 4 27b A4 (MoE)",
-      "ggufFilename": "gemma-4-27b-a4b-it-Q4_K_M.gguf",
+      "ggufFilename": "gemma-4-26b-a4b-it-Q4_K_M.gguf",
       "provider": "local",
       "contextWindow": 200000,
       "maxOutputTokens": 16384,
       "architecture": "moe",
-      "parameterCount": "27b (4b active)",
+      "parameterCount": "26b (4b active)",
       "speed": "fast",
       "samplingParams": {
         "temperature": 0.2,
@@ -45,7 +46,7 @@
       "parameterCount": "35b (3b active)",
       "speed": "fast",
       "samplingParams": {
-        "temperature": 0.2,
+        "temperature": 0.6,
         "top_k": 50,
         "top_p": 0.95,
         "repeat_penalty": 1.05
@@ -61,7 +62,7 @@
       "parameterCount": "27b",
       "speed": "medium",
       "samplingParams": {
-        "temperature": 0.15,
+        "temperature": 0.6,
         "top_k": 40,
         "top_p": 0.9,
         "repeat_penalty": 1.1

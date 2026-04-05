@@ -43,6 +43,7 @@ export interface ModelProfile {
 export type TaskType = 'plan' | 'implement' | 'review' | 'research' | 'design' | 'design_review' | 'analyze' | 'document';
 
 export interface ModelRouterConfig {
+  llamaCppUrl?: string;
   models: Record<string, ModelProfile>;
   routing: Partial<Record<TaskType, string>>;  // Partial — design roles are optional
 }
@@ -177,7 +178,7 @@ export class ModelRouter {
     if (profile.baseURL) return profile.baseURL;
     if (profile.provider === 'openrouter') return 'https://openrouter.ai/api/v1';
     if (profile.provider === 'openai') return 'https://api.openai.com/v1';
-    return process.env['LLAMA_CPP_URL'] || 'http://localhost:8080/v1';
+    return process.env['LLAMA_CPP_URL'] || this.config.llamaCppUrl || 'http://localhost:8080/v1';
   }
 
   getSamplingParams(taskType: TaskType): SamplingParams {

@@ -20,11 +20,7 @@ export default function(pi: ExtensionAPI) {
       // Lazy init orchestrator state
       if (!stateManager) {
         stateManager = new StateManager(ctx.cwd);
-        const llmClient = new LLMClient(
-          process.env.LLAMA_CPP_URL || 'http://localhost:8080/v1',
-          'llama-3.1',
-          { temperature: 0, maxTokens: 4096 }
-        );
+        const llmClient = new LLMClient();
         let mcpPool: MCPClientPool | null = null;
         const mcpConfigPath = path.join(os.homedir(), '.pi', 'agent', 'mcp.json');
         if (fs.existsSync(mcpConfigPath)) {
@@ -99,7 +95,7 @@ export default function(pi: ExtensionAPI) {
       ctx.ui.setStatus('analyze', '🔍 Analyzing project...');
       
       try {
-        const result = await analyzeProject(ctx.cwd, { force: true });
+        const result = await analyzeProject(ctx.cwd);
         ctx.ui.setStatus('analyze', undefined);
         
         ctx.ui.notify(
