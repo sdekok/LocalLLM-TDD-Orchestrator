@@ -2,6 +2,7 @@ import OpenAI from 'openai';
 import JSON5 from 'json5';
 import { ModelRouter, type TaskType, type ModelProfile } from './model-router.js';
 import { getLogger } from '../utils/logger.js';
+import { getTuner } from './tuners/registry.js';
 
 const DEFAULT_TIMEOUT_MS = 180_000; // 3 minutes
 
@@ -67,8 +68,22 @@ export class LLMClient {
     const logger = getLogger();
     const profile = this.router.selectModel(taskType);
 
+    const tuner = getTuner(profile.modelFamily);
+    const sampling = profile.samplingParams || {};
+    const baseEffectiveTemp = temperature ?? sampling.temperature ?? 0.2;
+    
+    // Create base sampling object with effectively requested temperature
+    const currentSampling = {
+      ...sampling,
+      temperature: baseEffectiveTemp
+    };
+
+    // Let the tuner adapt the prompt and parameter floor conditions
+    const { systemPrompt: finalSystemPrompt, sampling: finalSampling } = 
+      tuner.applyTweaks(profile, systemPrompt, currentSampling);
+
     // Token budget enforcement
-    const totalEstimate = this.estimateTokens(systemPrompt + userPrompt);
+    const totalEstimate = this.estimateTokens(finalSystemPrompt + userPrompt);
     const maxPrompt = profile.contextWindow - profile.maxOutputTokens - 1000; // safety margin
     if (totalEstimate > maxPrompt) {
       logger.warn(
@@ -76,7 +91,7 @@ export class LLMClient {
       );
       userPrompt = this.truncateToTokenBudget(
         userPrompt,
-        maxPrompt - this.estimateTokens(systemPrompt)
+        maxPrompt - this.estimateTokens(finalSystemPrompt)
       );
     }
 
@@ -84,33 +99,18 @@ export class LLMClient {
     const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
 
     try {
-      // Merge sampling params: model config defaults + per-call override
-      const sampling = profile.samplingParams || {};
-      const effectiveTemp = temperature ?? sampling.temperature ?? 0.2;
-
       const modelIdentifier = this.router.getModelIdentifier(profile);
-      logger.info(`LLM request: model=${modelIdentifier} provider=${profile.provider} task=${taskType} temp=${effectiveTemp}`);
+      logger.info(`LLM request: model=${modelIdentifier} provider=${profile.provider} task=${taskType} temp=${finalSampling.temperature}`);
       const client = this.getClient(profile);
       const response = await client.chat.completions.create(
         {
           model: modelIdentifier,
           messages: [
-            { role: 'system', content: systemPrompt },
+            { role: 'system', content: finalSystemPrompt },
             { role: 'user', content: userPrompt },
           ],
-          temperature: effectiveTemp,
+          ...finalSampling,
           max_tokens: profile.maxOutputTokens,
-          top_p: sampling.top_p,
-          frequency_penalty: sampling.frequency_penalty,
-          presence_penalty: sampling.presence_penalty,
-          // llama.cpp-specific params passed via extra_body
-          ...(sampling.top_k || sampling.min_p || sampling.repeat_penalty
-            ? {
-                top_k: sampling.top_k,
-                min_p: sampling.min_p,
-                repeat_penalty: sampling.repeat_penalty,
-              }
-            : {}),
         },
         { signal: controller.signal }
       );

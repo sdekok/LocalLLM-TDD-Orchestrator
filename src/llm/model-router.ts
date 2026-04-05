@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { getTuner } from './tuners/registry.js';
 
 export interface SamplingParams {
   temperature?: number;
@@ -12,6 +13,7 @@ export interface SamplingParams {
 }
 
 export type ModelProvider = 'local' | 'openrouter' | 'openai' | 'custom';
+export type ModelFamily = 'gemma4' | 'qwen35' | 'llama' | 'deepseek' | 'claude' | 'generic';
 
 export interface ModelProfile {
   name: string;
@@ -21,6 +23,8 @@ export interface ModelProfile {
   baseURL?: string;              // Override per-model (e.g., 'https://openrouter.ai/api/v1')
   apiKey?: string;               // API key for cloud providers (or use env var)
   apiKeyEnvVar?: string;         // Environment variable name for API key
+  modelFamily?: ModelFamily;     // Model family for auto-tuning defaults and prompt handling
+  enableThinking?: boolean;      // Whether to attempt to activate reasoning/thinking mode
   contextWindow: number;
   maxOutputTokens: number;
   architecture: 'dense' | 'moe' | 'unknown';
@@ -120,8 +124,9 @@ export class ModelRouter {
     } else {
       const loaded = loadConfig();
       if (!loaded) {
+        const expectedPath = path.join(process.cwd(), 'models.config.json');
         throw new Error(
-          'No model configuration found. Run `npx tsx scripts/setup-wizard.ts` to create one, ' +
+          `No model configuration found at ${expectedPath}. Run \`npx tsx scripts/setup-wizard.ts\` to create one, ` +
           'or copy models.config.example.json to models.config.json and edit it.'
         );
       }
@@ -183,7 +188,21 @@ export class ModelRouter {
 
   getSamplingParams(taskType: TaskType): SamplingParams {
     const profile = this.selectModel(taskType);
-    return profile.samplingParams || { temperature: 0.2 };
+    const configured = profile.samplingParams || {};
+    
+    // Get family-specific defaults from the tuner registry
+    const tuner = getTuner(profile.modelFamily);
+    const defaults = tuner.getDefaultSampling(profile);
+
+    return {
+      temperature: configured.temperature ?? defaults.temperature,
+      top_p: configured.top_p ?? defaults.top_p,
+      top_k: configured.top_k ?? defaults.top_k,
+      min_p: configured.min_p ?? defaults.min_p,
+      repeat_penalty: configured.repeat_penalty ?? defaults.repeat_penalty,
+      frequency_penalty: configured.frequency_penalty ?? defaults.frequency_penalty,
+      presence_penalty: configured.presence_penalty ?? defaults.presence_penalty
+    };
   }
 
   listModels(): ModelProfile[] {
