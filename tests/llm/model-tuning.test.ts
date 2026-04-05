@@ -72,50 +72,77 @@ describe('Model Tuning and Family Defaults', () => {
   });
 });
 
+const { mockCreate } = vi.hoisted(() => ({
+  mockCreate: vi.fn().mockResolvedValue({
+    choices: [{ message: { content: '{"status": "ok"}' } }]
+  })
+}));
+
+vi.mock('openai', () => {
+  class MockOpenAI {
+    chat = {
+      completions: {
+        create: mockCreate
+      }
+    }
+  }
+  return {
+    default: MockOpenAI,
+    OpenAI: MockOpenAI
+  };
+});
+
+describe('Model Tuning and Family Defaults', () => {
+  it('supplies gemma4 defaults when samplingParams is omitted', () => {
+    const router = new ModelRouter(makeTestConfig());
+    const params = router.getSamplingParams('plan');
+    expect(params.temperature).toBe(1.0);
+    expect(params.top_p).toBe(0.95);
+    expect(params.top_k).toBe(64);
+  });
+
+  it('supplies qwen thinking defaults', () => {
+    const router = new ModelRouter(makeTestConfig());
+    const params = router.getSamplingParams('implement');
+    expect(params.temperature).toBe(0.6);
+    expect(params.top_p).toBe(0.95);
+    expect(params.top_k).toBe(20);
+  });
+
+  it('supplies qwen instruct defaults', () => {
+    const router = new ModelRouter(makeTestConfig());
+    const params = router.getSamplingParams('review');
+    expect(params.temperature).toBe(0.7);
+    expect(params.top_p).toBe(0.8);
+  });
+});
+
 describe('LLMClient Prompt Mutations', () => {
-  let mockCreate: any;
-
   beforeEach(() => {
-    mockCreate = vi.fn().mockResolvedValue({
-      choices: [{ message: { content: 'mock test' } }]
-    });
-
-    vi.mock('openai', () => {
-      return {
-        default: vi.fn().mockImplementation(() => {
-          return {
-            chat: {
-              completions: {
-                create: mockCreate
-              }
-            }
-          };
-        })
-      };
+    mockCreate.mockClear();
+    mockCreate.mockResolvedValue({
+      choices: [{ message: { content: '{"status": "ok"}' } }]
     });
   });
 
   it('injects <|think|> into system prompt for gemma4 with thinking enabled', async () => {
     const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient({ modelRouter: router });
+    const client = new LLMClient(router);
     
-    // Using simple mock to just check arguments passed to OpenAI
-    // We already mocked OpenAI natively above, but LLMClient uses its own client cache instance
-    // Let's just bypass the actual network call somehow. Actually our vi.mock('openai') takes care of it.
-    await client.ask('You are a helpful assistant.', 'Help me', 'plan');
+    await client.askStructured('You are a helpful assistant.', 'Help me', { type: 'object' }, 'plan');
     
     expect(mockCreate).toHaveBeenCalled();
     const args = mockCreate.mock.calls[0][0];
     
     expect(args.messages[0].role).toBe('system');
-    expect(args.messages[0].content).toBe('<|think|>\nYou are a helpful assistant.');
+    expect(args.messages[0].content).toContain('<|think|>\nYou are a helpful assistant.');
   });
 
   it('floors temperature to 0.6 for qwen thinking models', async () => {
     const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient({ modelRouter: router });
+    const client = new LLMClient(router);
     
-    await client.ask('System', 'User', 'implement', 0.1); // Ask explicitly passes 0.1
+    await client.askStructured('System', 'User', { type: 'object' }, 'implement', 0.1);
     
     const args = mockCreate.mock.calls[0][0];
     expect(args.temperature).toBe(0.6); // Should be floored!
@@ -123,9 +150,9 @@ describe('LLMClient Prompt Mutations', () => {
 
   it('allows temperature lower than 0.6 for qwen instruct models', async () => {
     const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient({ modelRouter: router });
+    const client = new LLMClient(router);
     
-    await client.ask('System', 'User', 'review', 0.1); // Ask explicitly passes 0.1
+    await client.askStructured('System', 'User', { type: 'object' }, 'review', 0.1);
     
     const args = mockCreate.mock.calls[0][0];
     expect(args.temperature).toBe(0.1); // Should remain 0.1 since not thinking

@@ -27,6 +27,8 @@
   "license": "ISC",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@sinclair/typebox": "^0.34.28",
     "json5": "^2.2.3",
     "openai": "^6.33.0",
     "tree-sitter": "^0.21.1",
@@ -37,7 +39,6 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
     "@types/node": "^25.5.2",
     "@types/uuid": "^10.0.0",
     "typescript": "^6.0.2",

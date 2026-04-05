@@ -1,14 +1,11 @@
-import type { ExtensionAPI, ExtensionContext } from '@mariozechner/pi-coding-agent';
+import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { StateManager } from '../../orchestrator/state.js';
 import { WorkflowExecutor } from '../../orchestrator/executor.js';
-import { LLMClient } from '../../llm/client.js';
+import { ModelRouter } from '../../llm/model-router.js';
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject } from '../../analysis/runner.js';
 import { getLogger } from '../../utils/logger.js';
-import { MCPClientPool } from '../../mcp/client-pool.js';
-import * as os from 'os';
 import * as path from 'path';
-import * as fs from 'fs';
 
 export default function(pi: ExtensionAPI) {
   let executor: WorkflowExecutor | null = null;
@@ -20,42 +17,28 @@ export default function(pi: ExtensionAPI) {
       // Lazy init orchestrator state
       if (!stateManager) {
         stateManager = new StateManager(ctx.cwd);
-        const llmClient = new LLMClient();
-        let mcpPool: MCPClientPool | null = null;
-        const mcpConfigPath = path.join(os.homedir(), '.pi', 'agent', 'mcp.json');
-        if (fs.existsSync(mcpConfigPath)) {
-          mcpPool = await MCPClientPool.fromPiConfig(mcpConfigPath);
-        }
+        const modelRouter = new ModelRouter();
 
-        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL, mcpPool || undefined) : null;
+        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
 
-        executor = new WorkflowExecutor(stateManager, llmClient, {
+        executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
-          mcpPool,
         });
 
         // Bind UI events
-        executor.events.on('taskStarted', (data) => {
+        executor.events.on('taskStarted', (data: { description: string }) => {
           ctx.ui.setStatus('tdd', `⚙️  [TDD] Starting: ${data.description.substring(0, 30)}...`);
         });
 
-        executor.events.on('taskProgress', (data) => {
+        executor.events.on('taskProgress', (data: { attempt: number, message: string }) => {
           ctx.ui.setStatus('tdd', `⚙️  [TDD] Attempt ${data.attempt}: ${data.message}`);
         });
 
-        executor.events.on('taskCompleted', async (data) => {
+        executor.events.on('taskCompleted', async (data: { id: string }) => {
           ctx.ui.notify(`✅ [TDD] Task completed: ${data.id}`, 'info');
-          if (mcpPool?.hasServer('context-mode')) {
-            const files = data.task?.files_changed || [];
-            await mcpPool.callTool('context-mode', 'ctx_index', {
-              content: `## TDD Task Completed: ${data.task?.description || data.id}\n` +
-                       `Status: Success\n`,
-              title: `TDD: ${(data.task?.description || data.id).substring(0, 50)}`
-            }).catch(e => getLogger().warn(`Failed to notify context-mode: ${e.message}`));
-          }
         });
 
-        executor.events.on('taskFailed', (data) => {
+        executor.events.on('taskFailed', (data: { id: string, feedback: string, isCircuitBroken: boolean }) => {
           ctx.ui.notify(`❌ [TDD] Task failed: ${data.id}. Feedback:\n${data.feedback}`, 'error');
           if (data.isCircuitBroken) {
             ctx.ui.setStatus('tdd', undefined);

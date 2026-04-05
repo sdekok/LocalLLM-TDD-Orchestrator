@@ -2,18 +2,15 @@ import { EventEmitter } from 'events';
 import { StateManager } from './state.js';
 import { Sandbox } from './sandbox.js';
 import { runQualityGates, formatGateFailures } from './quality-gates.js';
-import { LLMClient } from '../llm/client.js';
+import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
-import { gatherWorkspaceSnapshot } from '../context/gatherer.js';
 import { planAndBreakdown } from '../agents/planner.js';
-import { implementSubtask } from '../agents/implementer.js';
-import { reviewImplementation } from '../agents/reviewer.js';
+import { createSubAgentSession } from '../subagent/factory.js';
+import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
-import { MCPClientPool } from '../mcp/client-pool.js';
 
 export interface ExecutorOptions {
   searchClient?: SearchClient | null;
-  mcpPool?: MCPClientPool | null;
 }
 
 const MAX_ATTEMPTS = 3;
@@ -59,22 +56,20 @@ export function outputSimilarity(a: string, b: string): number {
 
 export class WorkflowExecutor {
   private state: StateManager;
-  private llm: LLMClient;
+  private modelRouter: ModelRouter;
   private sandbox: Sandbox;
   private searchClient: SearchClient | null;
-  private mcpPool: MCPClientPool | null;
   public events = new EventEmitter();
 
   constructor(
     state: StateManager,
-    llm: LLMClient,
+    modelRouter: ModelRouter,
     options?: ExecutorOptions
   ) {
     this.state = state;
-    this.llm = llm;
+    this.modelRouter = modelRouter;
     this.sandbox = new Sandbox(state.projectDir);
     this.searchClient = options?.searchClient || null;
-    this.mcpPool = options?.mcpPool || null;
   }
 
   async startNew(request: string): Promise<void> {
@@ -82,7 +77,8 @@ export class WorkflowExecutor {
     logger.info(`Starting new workflow: ${request.substring(0, 100)}`);
     this.state.initWorkflow(request);
 
-    const plan = await planAndBreakdown(request, this.llm, this.searchClient || undefined);
+    // Planner still uses a structured JSON call (Option B)
+    const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
     this.state.updateRefinedRequest(plan.refinedRequest);
     this.state.setSubtasks(plan.subtasks);
 
@@ -114,23 +110,13 @@ export class WorkflowExecutor {
     let consecutiveFailures = 0;
 
     while (true) {
-      // Circuit breaker: stop if too many tasks fail in a row
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        logger.error(
-          `Circuit breaker: ${consecutiveFailures} consecutive task failures. ` +
-          `Stopping workflow to prevent wasted compute. Resume with retryFailed=true to try again.`
-        );
+        logger.error(`Circuit breaker: ${consecutiveFailures} consecutive task failures.`);
         break;
       }
 
       const task = this.state.getNextPendingTask();
-      if (!task) {
-        const summary = this.state.getSummary();
-        logger.info(
-          `Queue empty. Total: ${summary.total} Completed: ${summary.completed} Failed: ${summary.failed}`
-        );
-        break;
-      }
+      if (!task) break;
 
       logger.info(`\n--- Task ${task.id}: ${task.description.substring(0, 80)} ---`);
       this.state.updateSubtask(task.id, { status: 'in_progress' });
@@ -141,14 +127,13 @@ export class WorkflowExecutor {
       const branchName = `tdd-workflow/${task.id.substring(0, 8)}`;
       let approved = false;
       let feedback = '';
-      let lastOutput = '';  // For loop detection
 
+      // Ephemeral feedback for current task attempts
       for (let attempt = 1; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
-        // Time budget check
         const elapsed = Date.now() - taskStartTime;
-        if (elapsed > MAX_TASK_DURATION_MS) {
-          logger.error(`Task ${task.id} exceeded time budget (${Math.round(elapsed / 1000)}s). Bailing out.`);
-          feedback = `Task exceeded time budget of ${MAX_TASK_DURATION_MS / 1000}s`;
+        if (elapsed > 15 * 60 * 1000) { // 15 min total budget per subtask
+          logger.error(`Task ${task.id} timed out.`);
+          feedback = `Task exceeded time budget of 15 minutes`;
           break;
         }
 
@@ -156,55 +141,38 @@ export class WorkflowExecutor {
         this.state.updateSubtask(task.id, { attempts: attempt });
 
         try {
-          // 1. Gather fresh workspace context
-          const snapshot = await gatherWorkspaceSnapshot(
-            this.state.projectDir, 
-            task.description,
-            this.mcpPool || undefined
-          );
-
-          // 2. Create sandbox branch
+          // 1. Create/Reset sandbox branch
           await this.sandbox.createBranch(branchName);
 
-          // 3. Implement
+          // 2. Implement via Sub-Agent
           this.events.emit('taskProgress', { 
             id: task.id, 
             attempt, 
             phase: 'implementing',
-            message: 'Writing tests and code...'
-          });
-          const implementation = await implementSubtask(task.description, snapshot, this.llm, {
-            feedbackContext: feedback || undefined,
-            attempt,
-            searchClient: this.searchClient || undefined,
+            message: 'Agent is implementing (Read -> Test -> Code)...'
           });
 
-          // 4. Loop detection — check if output is suspiciously similar to last attempt
-          const currentOutput = JSON.stringify(implementation);
-          if (attempt > 1 && lastOutput) {
-            const similarity = outputSimilarity(currentOutput, lastOutput);
-            if (similarity > SIMILARITY_THRESHOLD) {
-              logger.error(
-                `Loop detected: attempt ${attempt} output is ${Math.round(similarity * 100)}% similar to attempt ${attempt - 1}. ` +
-                `Agent is stuck — bailing out early.`
-              );
-              feedback = `Loop detected: agent produced nearly identical output across attempts. Similarity: ${Math.round(similarity * 100)}%`;
-              await this.sandbox.rollback(originalBranch);
-              break;
-            }
+          const implementerSession = await createSubAgentSession({
+            taskType: 'implement',
+            systemPrompt: IMPLEMENTER_PROMPT,
+            cwd: this.state.projectDir,
+            modelRouter: this.modelRouter,
+            feedback: feedback || undefined, // Inject feedback from previous attempt
+          });
+
+          try {
+            await implementerSession.prompt(task.description);
+            // Agent finished — it has already modified files in options.cwd via tools
+          } finally {
+            implementerSession.dispose();
           }
-          lastOutput = currentOutput;
 
-          // 5. Write files to sandbox
-          const allFiles = [...implementation.tests, ...implementation.code];
-          const written = this.sandbox.writeFiles(allFiles);
-
-          // 6. Run DETERMINISTIC quality gates (the algorithm decides)
+          // 3. Run Quality Gates (DETERMINISTIC)
           this.events.emit('taskProgress', { 
             id: task.id, 
             attempt, 
             phase: 'quality-gates',
-            message: 'Running quality gates (TypeScript, Tests, Lint)...'
+            message: 'Verifying implementation (TSC, Tests, Lint)...'
           });
           const qualityReport = await runQualityGates(this.state.projectDir);
 
@@ -215,57 +183,56 @@ export class WorkflowExecutor {
             continue;
           }
 
-          // 7. Gates passed — commit with full details
-          await this.sandbox.commit(`TDD: ${task.description.substring(0, 50)}`, {
+          // 4. Commit passing code
+          await this.sandbox.commit(`TDD [Attempt ${attempt}]: ${task.description.substring(0, 50)}`, {
             attempt,
-            gateResults: qualityReport.gates.map((g) => ({
-              gate: g.gate,
-              passed: g.passed,
-              blocking: g.blocking,
-            })),
+            gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
             testMetrics: qualityReport.testMetrics,
             coverageMetrics: qualityReport.coverageMetrics,
-            filesChanged: written,
           });
 
-          // 8. LLM review (ADVISORY — gates already passed)
+          // 5. Adversarial Review via Sub-Agent
           this.events.emit('taskProgress', { 
             id: task.id, 
             attempt, 
             phase: 'review',
-            message: 'Waiting for adversarial review...'
+            message: 'Waiting for hostile code review...'
           });
-          const review = await reviewImplementation(
-            this.state.getState().original_request,
-            task.description,
-            implementation.tests,
-            implementation.code,
-            qualityReport,
-            this.llm
-          );
 
-          if (!review.approved) {
-            logger.info(`Review rejected (advisory): ${review.feedback.substring(0, 200)}`);
-            feedback = review.feedback;
+          const reviewerSession = await createSubAgentSession({
+            taskType: 'review',
+            systemPrompt: REVIEWER_PROMPT,
+            cwd: this.state.projectDir,
+            modelRouter: this.modelRouter,
+            tools: 'readonly'
+          });
+
+          let reviewText = '';
+          try {
+            // Re-subscribe to capture the final message
+            reviewerSession.subscribe((event) => {
+              if (event.type === 'message_end' && event.message.role === 'assistant') {
+                reviewText = event.message.content.find(c => c.type === 'text')?.text || '';
+              }
+            });
+            await reviewerSession.prompt(`Review the implementation for task: ${task.description}`);
+          } finally {
+            reviewerSession.dispose();
+          }
+
+          // 6. Parse Reviewer Verdict
+          const isApproved = reviewText.includes('APPROVED: true');
+          const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
+          const reviewerFeedback = feedbackMatch ? feedbackMatch[1].trim() : reviewText;
+
+          if (!isApproved) {
+            logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
+            feedback = reviewerFeedback;
             await this.sandbox.rollback(originalBranch);
             continue;
           }
 
-          // 9. Approved! Merge with reviewer details in commit.
-          await this.sandbox.commit(`TDD: ${task.description.substring(0, 50)}`, {
-            attempt,
-            gateResults: qualityReport.gates.map((g) => ({
-              gate: g.gate,
-              passed: g.passed,
-              blocking: g.blocking,
-            })),
-            testMetrics: qualityReport.testMetrics,
-            coverageMetrics: qualityReport.coverageMetrics,
-            reviewerScore: review.scores.test_coverage + review.scores.integration + review.scores.error_handling + review.scores.security,
-            reviewerSummary: review.feedback.substring(0, 200),
-            filesChanged: written,
-          });
-
+          // 7. Approved! Merge and Cleanup.
           approved = true;
           await this.sandbox.mergeAndCleanup(branchName, originalBranch);
           this.state.updateSubtask(task.id, {
@@ -274,15 +241,15 @@ export class WorkflowExecutor {
             code_implemented: true,
           });
           logger.info(`Task ${task.id} completed and merged!`);
-          this.events.emit('taskCompleted', { id: task.id, task: this.state.getState().subtasks.find((t) => t.id === task.id) });
+          const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+          if (completedTask) {
+            this.events.emit('taskCompleted', { id: task.id, task: completedTask });
+          }
+
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
-          try {
-            await this.sandbox.rollback(originalBranch);
-          } catch {
-            /* best-effort rollback */
-          }
+          try { await this.sandbox.rollback(originalBranch); } catch {}
         }
       }
 
@@ -290,24 +257,14 @@ export class WorkflowExecutor {
         consecutiveFailures = 0;
       } else {
         consecutiveFailures++;
-        logger.error(`Task ${task.id} failed after ${MAX_ATTEMPTS} attempts (consecutive failures: ${consecutiveFailures})`);
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
-        
-        const subtaskObj = this.state.getState().subtasks.find((t) => t.id === task.id);
+        const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         this.events.emit('taskFailed', { 
           id: task.id, 
-          task: subtaskObj,
+          task: failedTask,
           feedback,
           isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES 
         });
-
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          logger.error(
-            `Circuit breaker: ${consecutiveFailures} consecutive task failures. ` +
-            `Stopping workflow to prevent wasted compute. Resume with retryFailed=true to try again.`
-          );
-          break;
-        }
       }
     }
   }

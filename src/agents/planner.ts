@@ -2,17 +2,19 @@ import { LLMClient } from '../llm/client.js';
 import { SearchClient, shouldSearch } from '../search/searxng.js';
 import { v4 as uuidv4 } from 'uuid';
 import { getLogger } from '../utils/logger.js';
+import { ModelRouter } from '../llm/model-router.js';
+import { PLANNER_PROMPT } from '../subagent/prompts.js';
 
 const PLANNER_SCHEMA = {
   type: 'object',
   properties: {
-    refinedRequest: { type: 'string', description: 'A clear, refined version of the original request.' },
+    refinedRequest: { type: 'string' },
     subtasks: {
       type: 'array',
       items: {
         type: 'object',
         properties: {
-          description: { type: 'string', description: 'A specific, testable vertical slice of functionality.' },
+          description: { type: 'string' },
         },
         required: ['description'],
       },
@@ -28,10 +30,11 @@ export interface PlanResult {
 
 export async function planAndBreakdown(
   request: string,
-  llm: LLMClient,
+  modelRouter: ModelRouter,
   searchClient?: SearchClient
 ): Promise<PlanResult> {
   const logger = getLogger();
+  const llm = new LLMClient(modelRouter);
   logger.info('Planning and breaking down request...');
 
   // Optionally research before planning
@@ -49,16 +52,10 @@ export async function planAndBreakdown(
     }
   }
 
-  const systemPrompt = `You are an expert software architect and planner.
-Your job is to take a raw user request, ensure it is completely understood, and break it down into fine, cross-cutting slices of functionality.
-Each slice must be a detailed subtask that can be executed in a Test-Driven Development (TDD) way.
-Focus on vertical slices that result in testable integrations.
-Order subtasks by dependency — foundational work first, integration last.`;
-
   const result = await llm.askStructured<{
     refinedRequest: string;
     subtasks: { description: string }[];
-  }>(systemPrompt, `${request}${researchContext}`, PLANNER_SCHEMA, 'plan', 0.3);
+  }>(PLANNER_PROMPT, `${request}${researchContext}`, PLANNER_SCHEMA, 'plan', 0.3);
 
   const subtasks = result.subtasks.map((t) => ({
     id: uuidv4(),

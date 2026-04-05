@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { type Model } from '@mariozechner/pi-ai';
 import { getTuner } from './tuners/registry.js';
 
 export interface SamplingParams {
