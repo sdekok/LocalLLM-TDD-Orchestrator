@@ -40,7 +40,9 @@ export function generatePlanMarkdown(plan: ProjectPlan): string {
       lines.push('');
       lines.push(`**Acceptance Criteria**:`);
       lines.push('');
-      lines.push(wi.acceptance);
+      wi.acceptance.forEach(a => {
+        lines.push(`- ${a}`);
+      });
       lines.push('');
       lines.push('---');
       lines.push('');
