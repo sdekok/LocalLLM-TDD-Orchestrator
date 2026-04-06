@@ -272,7 +272,11 @@ export async function writePlanFiles(plan: ProjectPlan, cwd: string): Promise<vo
     epic.workItems.forEach(wi => {
       epicMd += `### ${wi.id}: ${wi.title}\n\n`;
       epicMd += `**Description**: ${wi.description}\n\n`;
-      epicMd += `**Acceptance Criteria**:\n- ${wi.acceptance.split('\n').join('\n- ')}\n\n`;
+      epicMd += `**Acceptance Criteria**:\n`;
+      wi.acceptance.forEach(a => {
+        epicMd += `- ${a}\n`;
+      });
+      epicMd += `\n`;
       
       if (wi.security) {
         epicMd += `**Security Considerations**: ${wi.security}\n\n`;

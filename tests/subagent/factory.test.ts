@@ -5,16 +5,25 @@ import { IMPLEMENTER_PROMPT } from '../../src/subagent/prompts.js';
 
 // Mock Pi SDK
 vi.mock('@mariozechner/pi-coding-agent', () => ({
-  createAgentSession: vi.fn().mockResolvedValue({
-    session: {
-      agent: { state: { systemPrompt: '' } },
-      setThinkingLevel: vi.fn(),
-      dispose: vi.fn(),
-    }
+  createAgentSession: vi.fn().mockImplementation(async (options) => {
+    const systemPrompt = options.resourceLoader.systemPromptOverride?.() || '';
+    return {
+      session: {
+        agent: { state: { systemPrompt } },
+        setThinkingLevel: vi.fn(),
+        dispose: vi.fn(),
+      }
+    };
   }),
   SessionManager: {
     inMemory: vi.fn().mockReturnValue({}),
   },
+  DefaultResourceLoader: vi.fn().mockImplementation(function(config) {
+    return {
+      ...config,
+      reload: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
   createCodingTools: vi.fn().mockReturnValue([]),
   createReadOnlyTools: vi.fn().mockReturnValue([]),
 }));
