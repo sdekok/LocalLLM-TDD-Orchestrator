@@ -29,15 +29,17 @@ pi install local:.
 
 Once installed, you can trigger the workflow directly from any Pi session using slash commands.
 
-### `/tdd <request>`
-Starts a full TDD workflow in the current directory.
-- **Example**: `/tdd Add a secure JWT authentication middleware with refresh tokens`
-- **What happens**: The Planner starts, subtasks are created, and Pi begins the implementation loop in the background.
+### `/tdd <request | id>`
+Starts a full TDD workflow.
+- **Pre-planned**: `/tdd 1` or `/tdd epic-01` (Loads richer metadata from `WorkItems/epic-01-*.md`)
+- **Fuzzy Match**: `/tdd auth` (Matches any epic file containing 'auth')
+- **Ad-hoc**: `/tdd "Add a secure JWT endpoint"` (On-the-fly planning for immediate tasks)
+- **What happens**: The system loads the epic, parses **Acceptance Criteria**, **Security requirements**, and **Tests**, and injects them into the implementer's system prompt.
 
 ### `/plan <request>`
-Decomposes a large project or feature into structured Epics and WorkItems.
-- **Output**: Creates a `WorkItems/` directory at the project root with markdown files.
-- **Workflow**: Plan first, review the generated files, then use `/tdd` to implement.
+Decomposes a project into "World-Class" Epics and WorkItems.
+- **Enhanced Planning**: Generates structured markdown files including per-task **Security Considerations**, **Dev Notes**, and **Mock/Test Case suggestions**.
+- **Output**: Creates a `WorkItems/` directory at the project root.
 - **Analysis Integration**: Automatically runs `/analyze` first to ensure the architect has a fresh blueprint of the codebase.
 
 ### `/analyze`
@@ -64,7 +66,7 @@ For complex features, we recommend the following lifecycle:
 1.  **Plan**: Run `/plan "Feature description"` to generate epics.
 2.  **Review**: Open the generated `WorkItems/epic-XX.md` files. Edit them if the plan isn't quite right.
 3.  **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
-4.  **Execute**: Run `/tdd Implement Epic 01`. The system will load the work items and sub-refine them into TDD steps.
+4.  **Execute**: Run `/tdd 1`. The orchestrator will **parse the rich metadata** from the markdown and inject it directly into the sub-agent's prompt, ensuring the generated code hits every requirement (Security, Acceptance, Tests).
 
 ## Under the Hood: Agentic Sessions
 

@@ -2,8 +2,8 @@
 
 A deeply integrated, agentic TDD workflow engine for the **Pi Coding Agent**. It replaces rigid JSON-based orchestration with native Pi sub-agent sessions, providing surgical file editing and self-correcting development loops using local or cloud LLMs.
 
-### NEW: Project-Level Planning
-The orchestrator now features a dedicated `/plan` command for long-term project decomposition. This creates human-readable `WorkItems/*.md` files that subsequent `/tdd` runs consume, enabling a "Plan → Review → Execute" cycle.
+### NEW: World-Class Project Planning
+The orchestrator now features a "World-Class" `/plan` command for deep project decomposition. This generates rich, multi-dimensional `WorkItems/*.md` files including **Acceptance Criteria**, **Security Strategies**, and **Specific Test Cases**. Subsequent `/tdd` runs automatically parse and inject this metadata into the implementation sub-agent, ensuring code adheres to the full scope of the planned requirements.
 
 ## How It Works (Agentic Mode)
 
@@ -63,9 +63,9 @@ pi install local:.
 
 Inside any project, simply use the slash commands:
 
-- **Plan**: `/plan Build a secure login system` (Decomposes into Epics/WorkItems)
-- **Implement**: `/tdd Implement Epic 1` (Loads from `WorkItems/` and executes)
-- **Direct**: `/tdd Add a secure login endpoint` (On-the-fly planning)
+- **Plan**: `/plan "Build a secure login system"` (Generates rich Epics with security and test strategies)
+- **Implement**: `/tdd 1` (Loads Epic 01 from `WorkItems/`, parses all metadata, and executes)
+- **Direct**: `/tdd "Add a secure login endpoint"` (On-the-fly planning for simple tasks)
 
 ## Safety & Runaway Protection
 
