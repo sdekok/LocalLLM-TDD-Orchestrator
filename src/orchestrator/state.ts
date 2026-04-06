@@ -12,6 +12,11 @@ export interface Subtask {
   attempts: number;
   feedback?: string;
   test_failures?: string;
+  // New world-class metadata
+  acceptance?: string[];
+  security?: string;
+  tests?: string[];
+  devNotes?: string;
 }
 
 export interface WorkflowState {
@@ -63,7 +68,7 @@ export class StateManager {
     this.saveState();
   }
 
-  setSubtasks(subtasks: { id: string; description: string }[]): void {
+  setSubtasks(subtasks: Partial<Subtask> & { id: string; description: string }[]): void {
     this.state.subtasks = subtasks.map((t) => ({
       ...t,
       status: 'pending' as const,

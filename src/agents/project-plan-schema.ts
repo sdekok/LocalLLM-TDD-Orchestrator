@@ -18,7 +18,7 @@ export const ProjectPlanSchema = z.object({
           id: z.string().describe("A unique identifier (e.g., 'WI-1')."),
           title: z.string().describe("The title of the work item."),
           description: z.string().describe("A detailed description of the task."),
-          acceptance: z.string().describe("Concrete, crystal-clear acceptance criteria for the TDD cycle."),
+          acceptance: z.array(z.string()).describe("Detailed bullet points of specific, verifiable criteria for the TDD cycle."),
           security: z.string().optional().describe("Specific security considerations for this work item."),
           tests: z.array(z.string()).describe("A list of specific test cases to be implemented (e.g. 'Should throw Error when input is negative')."),
           devNotes: z.string().optional().describe("Implementation notes, technical gotchas, or library recommendations."),

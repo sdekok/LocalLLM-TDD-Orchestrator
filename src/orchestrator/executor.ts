@@ -91,17 +91,20 @@ export class WorkflowExecutor {
 
     // 2. Initial planning or Epic loading
     if (epic) {
-      // If an epic is found, we use its work items as base subtasks
-      // Note: We'll sub-refine them during execution if needed
+      logger.info(`✅ Successfully loaded Epic with ${epic.workItems.length} tasks: ${epic.title}`);
       this.state.updateRefinedRequest(epic.title);
       this.state.setSubtasks(epic.workItems.map(wi => ({
         id: wi.id,
         description: wi.description,
         status: 'pending',
-        attempts: 0
+        attempts: 0,
+        acceptance: wi.acceptance,
+        security: wi.security,
+        tests: wi.tests,
+        devNotes: wi.devNotes
       })));
     } else {
-      // Fallback to standard on-the-fly planning
+      logger.warn(`⚠️ No pre-planned Epic found for "${request}". Falling back to on-the-fly decomposition.`);
       const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
       this.state.updateRefinedRequest(plan.refinedRequest);
       this.state.setSubtasks(plan.subtasks);
@@ -188,8 +191,23 @@ export class WorkflowExecutor {
             feedback: feedback || undefined, // Inject feedback from previous attempt
           });
 
+          // Enrich the prompt with the rich planning metadata
+          let implementerPrompt = technicalDescription;
+          if (task.acceptance && task.acceptance.length > 0) {
+            implementerPrompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
+          }
+          if (task.security) {
+            implementerPrompt += `\n\n### Security Requirements\n${task.security}`;
+          }
+          if (task.tests && task.tests.length > 0) {
+            implementerPrompt += `\n\n### Required Tests\n- ${task.tests.join('\n- ')}`;
+          }
+          if (task.devNotes) {
+            implementerPrompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
+          }
+
           try {
-            await implementerSession.prompt(technicalDescription);
+            await implementerSession.prompt(implementerPrompt);
             // Agent finished — it has already modified files in options.cwd via tools
           } finally {
             implementerSession.dispose();

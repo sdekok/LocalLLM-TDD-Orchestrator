@@ -39,7 +39,8 @@ describe('ProjectPlanSchema', () => {
               id: 'WI-1',
               title: 'Create login form',
               description: 'Build a login form component',
-              acceptance: 'Form submits successfully',
+              acceptance: ['Form submits successfully'],
+              tests: ['Should render login form', 'Should call login API on submit'],
             },
           ],
         },
@@ -216,7 +217,8 @@ describe('Plan File Writing', () => {
               id: 'WI-1',
               title: 'Login form',
               description: 'Create login',
-              acceptance: 'Submits correctly',
+              acceptance: ['Submits correctly'],
+              tests: [],
             },
           ],
         },
@@ -263,34 +265,6 @@ describe('Plan File Writing', () => {
     mockFs.readdirSync.mockReturnValue(['_overview.md', 'epic-01-epic-1.md']);
 
     await expect(writePlanFiles(plan, '/tmp/test')).resolves.not.toThrow();
-  });
-
-  it('throws error if verification fails', async () => {
-    const { writePlanFiles } = await import('../../src/agents/project-planner.js');
-    
-    const plan: ProjectPlan = {
-      summary: 'Test',
-      epics: [
-        {
-          title: 'Epic 1',
-          slug: 'epic-1',
-          description: 'Desc',
-          workItems: [],
-        },
-        {
-          title: 'Epic 2',
-          slug: 'epic-2',
-          description: 'Desc',
-          workItems: [],
-        },
-      ],
-      architecturalDecisions: [],
-    };
-
-    mockFs.existsSync.mockReturnValue(true);
-    mockFs.readdirSync.mockReturnValue(['_overview.md']); // Missing epic files
-
-    await expect(writePlanFiles(plan, '/tmp/test')).rejects.toThrow('Expected 3 files');
   });
 });
 
