@@ -5,6 +5,10 @@ export interface EpicWorkItem {
   id: string;
   title: string;
   description: string;
+  acceptance: string[];
+  security: string;
+  tests: string[];
+  devNotes: string;
 }
 
 export interface EpicPlan {
@@ -73,13 +77,32 @@ export class EpicLoader {
       const id = match[1]!;
       const title = match[2]!;
       
-      // Get description until next header or end of file
+      // Extract the block for this work item (until next ### or ## header)
       const startIdx = match.index + match[0].length;
-      let nextHeaderIdx = content.indexOf('\n#', startIdx);
-      if (nextHeaderIdx === -1) nextHeaderIdx = content.length;
+      let nextHeaderIdx = content.search(/\n(###|##)\s/);
+      // search() returns index relative to start of string, but if we want it after startIdx
+      const remainingContent = content.substring(startIdx);
+      const nextMatch = remainingContent.match(/\n(###|##)\s/);
+      const block = nextMatch ? remainingContent.substring(0, nextMatch.index) : remainingContent;
+
+      // Extract details from block using world-class headers
+      const description = block.match(/^\*\*Description\*\*:\s*(.*)/m)?.[1] || "";
       
-      const description = content.substring(startIdx, nextHeaderIdx).trim();
-      workItems.push({ id, title, description });
+      const acceptanceBlock = block.match(/\*\*Acceptance Criteria\*\*:\n([\s\S]*?)(?=\n\*\*|$)/i)?.[1] || "";
+      const acceptance = acceptanceBlock.split('\n')
+        .map(l => l.replace(/^[-*]\s*/, '').trim())
+        .filter(l => l.length > 0);
+
+      const security = block.match(/\*\*Security Considerations\*\*:\s*(.*)/m)?.[1] || "";
+      
+      const testsBlock = block.match(/\*\*Recommended Tests\*\*:\n([\s\S]*?)(?=\n\*\*|$)/i)?.[1] || "";
+      const tests = testsBlock.split('\n')
+        .map(l => l.replace(/^[-*]\s*/, '').trim())
+        .filter(l => l.length > 0);
+
+      const devNotes = block.match(/\*\*Dev Notes\*\*:\s*(.*)/m)?.[1] || "";
+
+      workItems.push({ id, title, description, acceptance, security, tests, devNotes });
     }
 
     return {

@@ -91,17 +91,20 @@ export class WorkflowExecutor {
 
     // 2. Initial planning or Epic loading
     if (epic) {
-      // If an epic is found, we use its work items as base subtasks
-      // Note: We'll sub-refine them during execution if needed
+      logger.info(`✅ Successfully loaded Epic with ${epic.workItems.length} tasks: ${epic.title}`);
       this.state.updateRefinedRequest(epic.title);
       this.state.setSubtasks(epic.workItems.map(wi => ({
         id: wi.id,
         description: wi.description,
         status: 'pending',
-        attempts: 0
+        attempts: 0,
+        acceptance: wi.acceptance,
+        security: wi.security,
+        tests: wi.tests,
+        devNotes: wi.devNotes
       })));
     } else {
-      // Fallback to standard on-the-fly planning
+      logger.warn(`⚠️ No pre-planned Epic found for "${request}". Falling back to on-the-fly decomposition.`);
       const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
       this.state.updateRefinedRequest(plan.refinedRequest);
       this.state.setSubtasks(plan.subtasks);
@@ -180,9 +183,15 @@ export class WorkflowExecutor {
             message: 'Agent is implementing (Read -> Test -> Code)...'
           });
 
+          const finalPrompt = IMPLEMENTER_PROMPT
+            .replace('{acceptance}', task.acceptance?.map(a => `- ${a}`).join('\n') || 'None')
+            .replace('{security}', task.security || 'None')
+            .replace('{tests}', task.tests?.map(t => `- ${t}`).join('\n') || 'None')
+            .replace('{devNotes}', task.devNotes || 'None');
+
           const implementerSession = await createSubAgentSession({
             taskType: 'implement',
-            systemPrompt: IMPLEMENTER_PROMPT,
+            systemPrompt: finalPrompt,
             cwd: this.state.projectDir,
             modelRouter: this.modelRouter,
             feedback: feedback || undefined, // Inject feedback from previous attempt
@@ -206,10 +215,8 @@ export class WorkflowExecutor {
 
           if (!qualityReport.allBlockingPassed) {
             feedback = formatGateFailures(qualityReport);
-            logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
-            if (originalBranch) {
-              await this.sandbox.rollback(originalBranch);
-            }
+            logger.warn(`Quality gates failed for task ${task.id} (Attempt ${attempt}/${MAX_ATTEMPTS}). Retrying with feedback...`);
+            // We NO LONGER rollback here. We stay on the branch so the next attempt can fix the code.
             continue;
           }
 
@@ -257,11 +264,9 @@ export class WorkflowExecutor {
           const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
 
           if (!isApproved) {
-            logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
+            logger.info(`Review rejected for task ${task.id}: ${reviewerFeedback.substring(0, 200)}`);
             feedback = reviewerFeedback;
-            if (originalBranch) {
-              await this.sandbox.rollback(originalBranch);
-            }
+            // Again, no rollback. Let the agent fix its current branch.
             continue;
           }
 
@@ -282,7 +287,7 @@ export class WorkflowExecutor {
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
-          try { await this.sandbox.rollback(originalBranch); } catch {}
+          // Persistence: No rollback here.
         }
       }
 
@@ -292,6 +297,13 @@ export class WorkflowExecutor {
         consecutiveFailures++;
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+        
+        // Critical: Rollback the entire task since all attempts failed.
+        if (originalBranch) {
+          logger.error(`Task ${task.id} failed after ${MAX_ATTEMPTS} attempts. Rolling back changes.`);
+          await this.sandbox.rollback(originalBranch);
+        }
+
         this.events.emit('taskFailed', { 
           id: task.id, 
           task: failedTask,
