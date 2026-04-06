@@ -189,23 +189,19 @@ export async function planProject(
  * Generates a markdown representation of the plan for user review.
  */
 export function generatePlanMarkdown(plan: ProjectPlan): string {
-  let md = `# Project Plan: ${plan.summary}\n\n`;
-  md += `## Architectural Decisions\n`;
-  plan.architecturalDecisions.forEach(dec => {
-    md += `- ${dec}\n`;
-  });
-  md += `\n---\n\n`;
+  let md = `# Plan Summary: ${plan.summary}\n\n`;
+  md += `The following epics and workitems will be created/updated:\n\n`;
 
   plan.epics.forEach((epic, idx) => {
-    md += `## Epic ${idx + 1}: ${epic.title}\n\n`;
-    md += `${epic.description}\n\n`;
-    md += `### Work Items\n\n`;
+    md += `- **Epic ${idx + 1}: ${epic.title}** (${epic.slug})\n`;
     epic.workItems.forEach(wi => {
-      md += `#### ${wi.id}: ${wi.title}\n`;
-      md += `${wi.description}\n`;
-      md += `**Acceptance**: ${wi.acceptance}\n\n`;
+      md += `  - [ ] ${wi.id}: ${wi.title}\n`;
     });
-    md += `---\n\n`;
+  });
+
+  md += `\n### Architectural Decisions\n`;
+  plan.architecturalDecisions.forEach(dec => {
+    md += `- ${dec}\n`;
   });
 
   return md;
@@ -261,9 +257,40 @@ export async function writePlanFiles(plan: ProjectPlan, cwd: string): Promise<vo
     
     const epicPath = path.join(workItemsDir, filename);
     
-    let epicMd = `# Epic: ${epic.title}\n\n## Summary\n${epic.description}\n\n## Work Items\n\n`;
+    let epicMd = `# Epic: ${epic.title}\n\n## Summary\n${epic.description}\n\n`;
+    
+    if (epic.securityStrategy) {
+      epicMd += `## Security Strategy\n${epic.securityStrategy}\n\n`;
+    }
+    
+    if (epic.testStrategy) {
+      epicMd += `## Testing Strategy\n${epic.testStrategy}\n\n`;
+    }
+    
+    epicMd += `## Work Items\n\n`;
+    
     epic.workItems.forEach(wi => {
-      epicMd += `### ${wi.id}: ${wi.title}\n\n${wi.description}\n\n**Acceptance**: ${wi.acceptance}\n\n`;
+      epicMd += `### ${wi.id}: ${wi.title}\n\n`;
+      epicMd += `**Description**: ${wi.description}\n\n`;
+      epicMd += `**Acceptance Criteria**:\n- ${wi.acceptance.split('\n').join('\n- ')}\n\n`;
+      
+      if (wi.security) {
+        epicMd += `**Security Considerations**: ${wi.security}\n\n`;
+      }
+      
+      if (wi.tests && wi.tests.length > 0) {
+        epicMd += `**Recommended Tests**:\n`;
+        wi.tests.forEach(t => {
+          epicMd += `- ${t}\n`;
+        });
+        epicMd += `\n`;
+      }
+      
+      if (wi.devNotes) {
+        epicMd += `**Developer Notes**: ${wi.devNotes}\n\n`;
+      }
+      
+      epicMd += `---\n\n`;
     });
     
     fs.writeFileSync(epicPath, epicMd);

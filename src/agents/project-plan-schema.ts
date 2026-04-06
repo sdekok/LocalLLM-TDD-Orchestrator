@@ -11,12 +11,17 @@ export const ProjectPlanSchema = z.object({
       title: z.string().describe("The title of the epic."),
       slug: z.string().describe("A URL-friendly slug for the epic (e.g., 'auth-system')."),
       description: z.string().describe("A detailed description of the epic's scope."),
+      securityStrategy: z.string().optional().describe("High-level security considerations for this epic."),
+      testStrategy: z.string().optional().describe("Overall testing approach for this epic."),
       workItems: z.array(
         z.object({
           id: z.string().describe("A unique identifier (e.g., 'WI-1')."),
           title: z.string().describe("The title of the work item."),
           description: z.string().describe("A detailed description of the task."),
-          acceptance: z.string().describe("Concrete acceptance criteria for the TDD cycle."),
+          acceptance: z.string().describe("Concrete, crystal-clear acceptance criteria for the TDD cycle."),
+          security: z.string().optional().describe("Specific security considerations for this work item."),
+          tests: z.array(z.string()).describe("A list of specific test cases to be implemented (e.g. 'Should throw Error when input is negative')."),
+          devNotes: z.string().optional().describe("Implementation notes, technical gotchas, or library recommendations."),
         })
       ).describe("The sequence of small, atomic TDD tasks within this epic."),
     })

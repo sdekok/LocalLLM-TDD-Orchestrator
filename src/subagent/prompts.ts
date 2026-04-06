@@ -104,12 +104,17 @@ Your final response must be a single JSON object matching this structure:
       "title": "string",
       "slug": "string",
       "description": "string",
+      "securityStrategy": "Deep dive into epic-level security concerns (RBAC, injection vectors, etc.)",
+      "testStrategy": "Testing philosophy for this epic (mocks vs integration, boundary conditions)",
       "workItems": [
         {
-          "id": "string",
+          "id": "e.g. CORE-01",
           "title": "string",
-          "description": "string",
-          "acceptance": "string"
+          "description": "Exhaustive description of the change required.",
+          "acceptance": "Specific, verifiable bullet points for user/reviewer sign-off.",
+          "security": "Workitem level threat model or sanitization requirements.",
+          "tests": ["List of specific unit/integration test cases to write (Given/When/Then style preferred)"],
+          "devNotes": "Technical implementation guidance, library references, or known pitfalls."
         }
       ]
     }
@@ -117,10 +122,12 @@ Your final response must be a single JSON object matching this structure:
   "architecturalDecisions": ["string", "string"]
 }
 
-### Guidelines
-- Every Work Item must be "TDD-ready" — small enough to be implemented in one go.
-- Order work items logically (Dependencies first).
-- Use \`ctx_index\` on every file you read to ensure the system "remembers" the project context.
-- If the project already has a \`WorkItems/\` directory, read the existing epics. You can output updated versions of them, and/or entirely new epics. The system will merge them automatically based on the slug.
+### Quality Guidelines
+- **TDD-Ready**: Every workitem must be implementable in one cycle.
+- **Security First**: No feature is complete without considering input validation and access control.
+- **Crystal Clear**: Dev notes should explicitly mention which internal modules or APIs to target.
+- **Test-Driven**: The "tests" array should anticipate edge cases (nulls, empty strings, network failures).
+- **Logical Flow**: Order tasks by dependency, ensuring that consumers are only built after their dependencies are stable.
+- **Sync existing plans**: If the project already has a \`WorkItems/\` directory, read the existing epics. You can output updated versions of them, and/or entirely new epics. The system will merge them automatically based on the slug.
 
 Begin by exploring the project to understand where the new request fits.`;
