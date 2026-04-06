@@ -91,7 +91,20 @@ export default function(pi: ExtensionAPI) {
         }
 
         const modelRouter = new ModelRouter();
-        const result = await planProject(args, modelRouter, ctx.cwd);
+        const result = await planProject(args, modelRouter, ctx.cwd, {
+          input: async (prompt: string) => {
+            const result = await ctx.ui.input(prompt);
+            return result ?? null;
+          },
+          notify: (message: string, type?: 'info' | 'warning' | 'error') => ctx.ui.notify(message, type || 'info'),
+          editor: async (label: string, initialText: string) => {
+            const result = await ctx.ui.editor(label, initialText);
+            return result ?? null;
+          },
+          confirm: async (message: string) => {
+            return await ctx.ui.confirm(message, 'This will create files in WorkItems/');
+          },
+        });
         
         ctx.ui.setStatus('plan', undefined);
         ctx.ui.notify(result.summary, 'info');

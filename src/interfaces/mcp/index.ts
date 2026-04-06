@@ -13,8 +13,6 @@ import { analyzeProject, loadCachedAnalysis, isAnalysisStale } from '../../analy
 import { formatMultiAnalysisForPrompt } from '../../analysis/types.js';
 import { getLogger } from '../../utils/logger.js';
 
-import { MCPClientPool } from '../../mcp/client-pool.js';
-
 const server = new Server(
   { name: 'tdd-agentic-workflow', version: '2.1.0' },
   { capabilities: { tools: {} } }
@@ -22,9 +20,6 @@ const server = new Server(
 
 // Lazy-initialized per project
 const executors = new Map<string, { state: StateManager; executor: WorkflowExecutor; llm: LLMClient }>();
-// Share one pool for the MCP server process
-let globalMcpPool: MCPClientPool | null = null;
-let mcpPoolInitPromise: Promise<void> | null = null;
 
 function resolveProjectDir(projectDirArg: string): string {
   let resolved = projectDirArg;
@@ -35,25 +30,13 @@ function resolveProjectDir(projectDirArg: string): string {
   return path.resolve(resolved);
 }
 
-async function initGlobalMcpPool(projectDir: string) {
-  if (!globalMcpPool) {
-    globalMcpPool = await MCPClientPool.fromProjectConfig(projectDir);
-  }
-}
-
 async function getOrCreate(projectDir: string) {
-  if (!mcpPoolInitPromise) {
-    mcpPoolInitPromise = initGlobalMcpPool(projectDir);
-  }
-  await mcpPoolInitPromise;
-
   if (!executors.has(projectDir)) {
     const state = new StateManager(projectDir);
     const llm = new LLMClient();
-    const searchClient = new SearchClient(undefined, globalMcpPool || undefined);
+    const searchClient = new SearchClient(undefined);
     const executor = new WorkflowExecutor(state, llm.router, {
       searchClient,
-      mcpPool: globalMcpPool,
     });
     executors.set(projectDir, { state, executor, llm });
   }

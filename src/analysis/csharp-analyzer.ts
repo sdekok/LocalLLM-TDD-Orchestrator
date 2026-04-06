@@ -1,5 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { getLogger } from '../utils/logger.js';
@@ -8,6 +10,9 @@ import type {
   AnalyzeOptions,
   AnalysisResult,
 } from './types.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const execFileAsync = promisify(execFile);
 

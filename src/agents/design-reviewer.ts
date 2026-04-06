@@ -1,7 +1,12 @@
 import { LLMClient } from '../llm/client.js';
 import { type WorkspaceSnapshot, formatSnapshotForPrompt } from '../context/gatherer.js';
-import type { ComponentSpec } from './designer.js';
 import { getLogger } from '../utils/logger.js';
+
+export interface ComponentSpec {
+  name: string;
+  props?: Record<string, any>;
+  description?: string;
+}
 
 const DESIGN_REVIEW_SCHEMA = {
   type: 'object',

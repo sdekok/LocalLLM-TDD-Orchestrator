@@ -20,3 +20,12 @@
 | **Planner** | Refines high-level work items into technical subtasks during execution. |
 | **Implementer** | Native sub-session that writes tests and code to pass them for a specific work item. |
 | **Reviewer** | Adversarial sub-session that scores code on quality, security, and coverage. |
+## Architectural Decisions (Auto-generated)
+
+- Single Responsibility: Calculator class handles only arithmetic operations, UI handles presentation, inputs are validated separately.
+- TDD First: Every feature must have tests written before implementation to ensure test-driven development workflow is followed.
+- Exception-Based Error Handling: Division by zero and invalid inputs throw exceptions rather than returning null or special values for clarity.
+- Pure Functions: Core arithmetic operations are pure functions (no side effects) for predictability and ease of testing.
+- Use GitHub Actions for CI/CD.
+- Standardize on Node.js 20 for the CI environment.
+- Utilize npm cache in GitHub Actions to speed up dependency installation.

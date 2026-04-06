@@ -10,7 +10,9 @@
     ]
   },
   "scripts": {
-    "build": "tsc",
+    "build": "dotnet build src/analysis/tools/CsharpAstAnalyzer/CsharpAstAnalyzer.csproj -c Release && tsc && npm run bundle && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
+    "bundle": "esbuild dist/interfaces/pi/index.js --bundle --platform=node --format=esm --outfile=dist/interfaces/pi/index.bundle.js --external:tree-sitter --external:tree-sitter-cpp && mv dist/interfaces/pi/index.bundle.js dist/interfaces/pi/index.js",
+    "deploylocal": "npm run build && rm -rf ~/.pi/extensions/tdd-workflow && ln -sf $(pwd) ~/.pi/extensions/tdd-workflow",
     "start": "node dist/interfaces/mcp/index.js",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -26,8 +28,8 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@sinclair/typebox": "^0.34.28",
     "json5": "^2.2.3",
     "openai": "^6.33.0",
@@ -41,6 +43,7 @@
   "devDependencies": {
     "@types/node": "^25.5.2",
     "@types/uuid": "^10.0.0",
+    "esbuild": "^0.27.7",
     "typescript": "^6.0.2",
     "vitest": "^4.1.2"
   }

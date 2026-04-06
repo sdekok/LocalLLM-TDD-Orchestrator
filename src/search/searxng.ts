@@ -1,4 +1,4 @@
-import { MCPClientPool } from '../mcp/client-pool.js';
+import { getLogger } from '../utils/logger.js';
 
 export interface SearchResult {
   title: string;
@@ -23,11 +23,9 @@ const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888';
 
 export class SearchClient {
   private baseURL: string;
-  private mcpPool?: MCPClientPool;
 
-  constructor(baseURL?: string, mcpPool?: MCPClientPool) {
+  constructor(baseURL?: string) {
     this.baseURL = baseURL || SEARXNG_URL;
-    this.mcpPool = mcpPool;
   }
 
   async search(query: string, options?: SearchOptions): Promise<SearchResult[]> {
@@ -58,19 +56,6 @@ export class SearchClient {
 
     const pages: string[] = [];
     for (const result of results) {
-      if (this.mcpPool && this.mcpPool.hasServer('context-mode')) {
-        try {
-          const res = await this.mcpPool.callTool('context-mode', 'ctx_fetch_and_index', { url: result.url });
-          const text = res?.content?.[0]?.text;
-          if (text) {
-            pages.push(`## ${result.title}\nSource: ${result.url}\n\n${text.substring(0, 8_000)}`);
-            continue;
-          }
-        } catch {
-          // Fallback to fetch if it fails
-        }
-      }
-
       try {
         const response = await fetch(result.url, {
           signal: AbortSignal.timeout(8_000),
