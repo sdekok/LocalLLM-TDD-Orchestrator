@@ -40,7 +40,7 @@ describe('ProjectPlanSchema', () => {
               title: 'Create login form',
               description: 'Build a login form component',
               acceptance: ['Form submits successfully'],
-              tests: ['Should render login form', 'Should call login API on submit'],
+              tests: ['Should render login form'],
             },
           ],
         },
@@ -137,7 +137,7 @@ describe('Project Planner Integration', () => {
 
   it('extracts JSON from agent response with conversational text', async () => {
     const { extractPlanFromResponse } = await import('../../src/agents/project-planner.js');
-    
+
     const response = "Here's the plan you requested:\n\n```json\n{\n  \"summary\": \"Test project\",\n  \"epics\": [],\n  \"architecturalDecisions\": []\n}\n```\n\nLet me know if you need any changes!";
 
     const result = extractPlanFromResponse(response);
@@ -147,7 +147,7 @@ describe('Project Planner Integration', () => {
 
   it('throws error when no JSON found in response', async () => {
     const { extractPlanFromResponse } = await import('../../src/agents/project-planner.js');
-    
+
     const response = 'I cannot create a plan at this time.';
 
     expect(() => extractPlanFromResponse(response)).toThrow('No JSON object found');
@@ -155,7 +155,7 @@ describe('Project Planner Integration', () => {
 
   it('throws error when JSON is invalid', async () => {
     const { extractPlanFromResponse } = await import('../../src/agents/project-planner.js');
-    
+
     const response = 'No json here at all';
 
     expect(() => extractPlanFromResponse(response)).toThrow('No JSON object found');
@@ -163,7 +163,7 @@ describe('Project Planner Integration', () => {
 
   it('throws error when JSON fails schema validation', async () => {
     const { extractPlanFromResponse } = await import('../../src/agents/project-planner.js');
-    
+
     const response = '{"summary": "test"}'; // Missing epics and architecturalDecisions
 
     expect(() => extractPlanFromResponse(response)).toThrow('Invalid plan format');
@@ -179,7 +179,7 @@ describe('Plan File Writing', () => {
 
   it('creates WorkItems directory and writes overview', async () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
-    
+
     const plan: ProjectPlan = {
       summary: 'Test project',
       epics: [],
@@ -204,7 +204,7 @@ describe('Plan File Writing', () => {
 
   it('writes epic files with correct naming', async () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
-    
+
     const plan: ProjectPlan = {
       summary: 'Test',
       epics: [
@@ -218,7 +218,7 @@ describe('Plan File Writing', () => {
               title: 'Login form',
               description: 'Create login',
               acceptance: ['Submits correctly'],
-              tests: [],
+              tests: ['Should send POST to /login'],
             },
           ],
         },
@@ -245,9 +245,9 @@ describe('Plan File Writing', () => {
     expect(epicFiles[1][0]).toContain('epic-02-user-profile.md');
   });
 
-  it('verifies files were created correctly', async () => {
+  it('writes files', async () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
-    
+
     const plan: ProjectPlan = {
       summary: 'Test',
       epics: [
@@ -266,6 +266,7 @@ describe('Plan File Writing', () => {
 
     await expect(writePlanFiles(plan, '/tmp/test')).resolves.not.toThrow();
   });
+
 });
 
 describe('Architectural Decisions Appending', () => {
@@ -277,10 +278,10 @@ describe('Architectural Decisions Appending', () => {
 
   it('appends decisions to agents.md', async () => {
     const { appendArchitecturalDecisions } = await import('../../src/agents/project-planner.js');
-    
+
     mockFs.existsSync.mockReturnValue(true);
     mockFs.readFileSync = vi.fn().mockReturnValue('# Agents File\n\n## Existing Content');
-    
+
     await appendArchitecturalDecisions(
       ['Decision 1', 'Decision 2'],
       '/tmp/test',
@@ -296,9 +297,9 @@ describe('Architectural Decisions Appending', () => {
 
   it('creates agents.md if it does not exist', async () => {
     const { appendArchitecturalDecisions } = await import('../../src/agents/project-planner.js');
-    
+
     mockFs.existsSync.mockReturnValue(false);
-    
+
     await appendArchitecturalDecisions(
       ['Decision 1'],
       '/tmp/test',
@@ -313,12 +314,12 @@ describe('Architectural Decisions Appending', () => {
 
   it('does not duplicate decisions section if it already exists', async () => {
     const { appendArchitecturalDecisions } = await import('../../src/agents/project-planner.js');
-    
+
     mockFs.existsSync.mockReturnValue(true);
     mockFs.readFileSync = vi.fn().mockReturnValue(
       '# Agents File\n\n## Architectural Decisions (Auto-generated)\n\n- Old Decision'
     );
-    
+
     await appendArchitecturalDecisions(
       ['New Decision'],
       '/tmp/test',

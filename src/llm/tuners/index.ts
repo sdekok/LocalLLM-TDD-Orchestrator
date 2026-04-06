@@ -2,7 +2,7 @@ import { ModelProfile, SamplingParams } from '../model-router.js';
 
 export interface TunerResult {
   systemPrompt: string;
-  sampling: SamplingParams;
+  sampling?: SamplingParams;
 }
 
 export interface ModelTuner {

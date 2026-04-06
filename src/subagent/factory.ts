@@ -50,7 +50,7 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     samplingParams
   );
   
-  logger.info(`[SUBAGENT FACTORY] Tuning applied. Sampling params: temperature=${sampling.temperature}, top_p=${sampling.top_p}`);
+  logger.info(`[SUBAGENT FACTORY] Tuning applied.`);
 
   // Inject feedback Context if provided
   const feedbackContext = options.feedback
