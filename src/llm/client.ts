@@ -54,7 +54,7 @@ export class LLMClient {
         { role: 'system', content: finalPrompt },
         { role: 'user', content: userPrompt },
       ],
-      ...sampling,
+      ...(sampling || {}),
       max_tokens: profile.maxOutputTokens,
       response_format: { type: 'json_object' }
     });

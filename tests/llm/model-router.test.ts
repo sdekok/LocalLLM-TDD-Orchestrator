@@ -104,12 +104,12 @@ describe('ModelRouter', () => {
     expect(params.top_p).toBe(0.9);
   });
 
-  it('returns default sampling params when none configured', () => {
+  it('returns empty sampling params when none configured', () => {
     const config = makeTestConfig();
     delete (config.models['fast-moe'] as any).samplingParams;
     const router = new ModelRouter(config);
     const params = router.getSamplingParams('implement');
-    expect(params.temperature).toBe(0.2);
+    expect(params.temperature).toBeUndefined();
   });
 
   it('has ggufFilename on local profiles', () => {

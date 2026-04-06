@@ -3,9 +3,7 @@ import { ModelTuner, TunerResult } from './index.js';
 
 export class GenericTuner implements ModelTuner {
   getDefaultSampling(profile: ModelProfile): Partial<SamplingParams> {
-    return {
-      temperature: 0.2, // standard safe default for orchestrator tasks
-    };
+    return {};
   }
 
   applyTweaks(profile: ModelProfile, systemPrompt: string, currentSampling: SamplingParams): TunerResult {
