@@ -170,6 +170,12 @@ export class WorkflowExecutor {
 
         try {
           // 4. Sub-refinement check (Plan the HOW if we only have the WHAT)
+          this.events.emit('taskProgress', { 
+            id: task.id, 
+            attempt, 
+            phase: 'refining',
+            message: 'Refining technical plan for implementation...'
+          });
           let technicalDescription = await this.refineTaskIntoSubtasks(task.id, attempt);
 
           // 1. Create/Reset sandbox branch
@@ -180,7 +186,9 @@ export class WorkflowExecutor {
             id: task.id, 
             attempt, 
             phase: 'implementing',
-            message: 'Agent is implementing (Read -> Test -> Code)...'
+            message: feedback 
+              ? `Addressing feedback from previous attempt (Build -> Test -> Fix)...` 
+              : `Agent is building implementation (Read -> Test -> Code)...`
           });
 
           const implementerSession = await createSubAgentSession({
@@ -285,6 +293,12 @@ export class WorkflowExecutor {
 
           // 7. Approved! Merge and Cleanup.
           approved = true;
+          this.events.emit('taskProgress', { 
+            id: task.id, 
+            attempt, 
+            phase: 'merging',
+            message: 'Review approved! Merging changes into main branch...'
+          });
           await this.sandbox.mergeAndCleanup(branchName, originalBranch);
           this.state.updateSubtask(task.id, {
             status: 'completed',

@@ -29,3 +29,7 @@
 - Use GitHub Actions for CI/CD.
 - Standardize on Node.js 20 for the CI environment.
 - Utilize npm cache in GitHub Actions to speed up dependency installation.
+- Use GitHub Actions for all CI/CD orchestration.
+- Use Vitest with the `v8` coverage provider for high-performance coverage measurement.
+- Target NPM (or GitHub Packages) as the primary distribution mechanism to satisfy `pi install` requirements.
+- Automated publishing will be tied to Git Tags/Releases to prevent accidental production releases.
