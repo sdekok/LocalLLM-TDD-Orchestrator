@@ -381,12 +381,4 @@ export class WorkflowExecutor {
     return technicalDescription;
   }
 
-  /**
-   * Manually rollback a failed task's changes.
-   */
-  public async rollbackTask(originalBranch: string): Promise<void> {
-    const logger = getLogger();
-    logger.info(`Performing manual rollback to branch: ${originalBranch}`);
-    await this.sandbox.rollback(originalBranch);
-  }
 }
