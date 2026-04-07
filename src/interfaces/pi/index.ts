@@ -39,8 +39,20 @@ export default function(pi: ExtensionAPI) {
           ctx.ui.notify(`✅ [TDD] Task completed: ${data.id}`, 'info');
         });
 
-        executor.events.on('taskFailed', (data: { id: string, feedback: string, isCircuitBroken: boolean }) => {
+        executor.events.on('taskFailed', async (data: { id: string, feedback: string, isCircuitBroken: boolean, canRollback?: boolean, originalBranch?: string }) => {
           ctx.ui.notify(`❌ [TDD] Task failed: ${data.id}. Feedback:\n${data.feedback}`, 'error');
+          
+          if (data.canRollback && data.originalBranch && executor) {
+            const shouldRollback = await ctx.ui.confirm(
+              'Discard changes and rollback?',
+              `The task failed. Do you want to rollback to branch: ${data.originalBranch}? (Default is NO, keeping changes for inspection)`
+            );
+            if (shouldRollback) {
+              await executor.rollbackTask(data.originalBranch);
+              ctx.ui.notify(`✅ Rolled back to ${data.originalBranch}`, 'info');
+            }
+          }
+
           if (data.isCircuitBroken) {
             ctx.ui.setStatus('tdd', undefined);
             ctx.ui.notify('Circuit breaker tripped. Workflow paused.', 'warning');

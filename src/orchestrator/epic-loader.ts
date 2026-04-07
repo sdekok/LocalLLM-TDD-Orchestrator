@@ -5,6 +5,10 @@ export interface EpicWorkItem {
   id: string;
   title: string;
   description: string;
+  acceptance: string[];
+  security?: string;
+  tests?: string[];
+  devNotes?: string;
 }
 
 export interface EpicPlan {
@@ -73,13 +77,42 @@ export class EpicLoader {
       const id = match[1]!;
       const title = match[2]!;
       
-      // Get description until next header or end of file
+      // Get block until next ### header or --- divider
       const startIdx = match.index + match[0].length;
-      let nextHeaderIdx = content.indexOf('\n#', startIdx);
-      if (nextHeaderIdx === -1) nextHeaderIdx = content.length;
+      let nextHeaderIdx = content.indexOf('\n### ', startIdx);
+      const dividerIdx = content.indexOf('\n---', startIdx);
       
-      const description = content.substring(startIdx, nextHeaderIdx).trim();
-      workItems.push({ id, title, description });
+      if (nextHeaderIdx === -1) nextHeaderIdx = content.length;
+      const endIdx = dividerIdx !== -1 && dividerIdx < nextHeaderIdx ? dividerIdx : nextHeaderIdx;
+      
+      const blockContent = content.substring(startIdx, endIdx).trim();
+      
+      // Extract sub-fields
+      const descriptionMatch = blockContent.match(/\*\*Description\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const securityMatch = blockContent.match(/\*\*Security Considerations\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const devNotesMatch = blockContent.match(/\*\*Developer Notes\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      
+      // Extract lists
+      const acceptanceMatch = blockContent.match(/\*\*Acceptance Criteria\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const testsMatch = blockContent.match(/\*\*Recommended Tests\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      
+      const acceptance = acceptanceMatch 
+        ? acceptanceMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
+        : [];
+        
+      const tests = testsMatch
+        ? testsMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
+        : [];
+      
+      workItems.push({ 
+        id, 
+        title, 
+        description: descriptionMatch ? descriptionMatch[1]!.trim() : blockContent,
+        acceptance,
+        security: securityMatch ? securityMatch[1]!.trim() : undefined,
+        tests: tests.length > 0 ? tests : undefined,
+        devNotes: devNotesMatch ? devNotesMatch[1]!.trim() : undefined
+      });
     }
 
     return {
