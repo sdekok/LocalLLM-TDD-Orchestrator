@@ -11,11 +11,21 @@ vi.mock('fs', () => ({
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
     readdirSync: vi.fn(),
+    createWriteStream: vi.fn().mockReturnValue({
+      write: vi.fn(),
+      end: vi.fn(),
+      on: vi.fn(),
+    }),
   },
   existsSync: vi.fn(),
   mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
   readdirSync: vi.fn(),
+  createWriteStream: vi.fn().mockReturnValue({
+    write: vi.fn(),
+    end: vi.fn(),
+    on: vi.fn(),
+  }),
 }));
 
 vi.mock('fs/promises', () => ({
@@ -23,6 +33,16 @@ vi.mock('fs/promises', () => ({
   mkdir: vi.fn(),
   writeFile: vi.fn(),
   readdir: vi.fn(),
+}));
+
+const mockPrompt = vi.fn();
+const mockDispose = vi.fn();
+vi.mock('../../src/subagent/factory.js', () => ({
+  createSubAgentSession: vi.fn().mockImplementation(async () => ({
+    prompt: mockPrompt,
+    dispose: mockDispose,
+    messages: [],
+  })),
 }));
 
 describe('ProjectPlanSchema', () => {
@@ -332,5 +352,143 @@ describe('Architectural Decisions Appending', () => {
     expect(sectionCount).toBe(1);
     expect(writtenContent).toContain('Old Decision');
     expect(writtenContent).toContain('New Decision');
+  });
+});
+
+describe('planProject', () => {
+  const mockFs = fs as any;
+  const mockModelRouter = new ModelRouter({
+    models: {
+      'test-model': {
+        name: 'Test Model',
+        ggufFilename: 'test.gguf',
+        provider: 'local',
+        contextWindow: 8192,
+        maxOutputTokens: 1024,
+        architecture: 'dense',
+        speed: 'fast',
+        modelFamily: 'generic',
+        enableThinking: false,
+      }
+    },
+    routing: { 'project-plan': 'test-model' }
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('runs the full planning flow without UI context', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    
+    const mockSession = {
+      prompt: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'text',
+              text: 'Here is the plan: ```json\n{\n  "summary": "Test project",\n  "epics": [],\n  "architecturalDecisions": ["Dec 1"]\n}\n```'
+            }
+          ]
+        }
+      ]
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const result = await planProject('Help me build a web app', mockModelRouter, '/tmp/test');
+
+    expect(result.summary).toContain('planning complete');
+    expect(result.plan?.summary).toBe('Test project');
+    expect(mockSession.prompt).toHaveBeenCalled();
+    expect(mockFs.writeFileSync).toHaveBeenCalled(); // Should write _overview.md
+    expect(mockSession.dispose).toHaveBeenCalled();
+  });
+
+  it('runs the full planning flow with UI context and approval', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    const mockSession = {
+      prompt: vi.fn(),
+      dispose: vi.fn(),
+      messages: [
+        {
+          role: 'assistant',
+          content: '```json\n{"summary": "Test UI", "epics": [], "architecturalDecisions": []}\n```'
+        }
+      ]
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+    
+    const uiContext = {
+      input: vi.fn(),
+      notify: vi.fn(),
+      editor: vi.fn().mockResolvedValue('Edited Plan Markdown'),
+      confirm: vi.fn().mockResolvedValue(true),
+    };
+
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const result = await planProject('UI Plan', mockModelRouter, '/tmp/test', uiContext);
+
+    expect(result.plan?.summary).toBe('Test UI');
+    expect(uiContext.editor).toHaveBeenCalled();
+    expect(uiContext.confirm).toHaveBeenCalled();
+    expect(mockFs.writeFileSync).toHaveBeenCalled();
+  });
+
+  it('cancels planning if user rejects the editor review', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    const mockSession = {
+      prompt: vi.fn(),
+      dispose: vi.fn(),
+      messages: [{ role: 'assistant', content: '{"summary": "Test", "epics": [], "architecturalDecisions": []}' }]
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+    
+    const uiContext = {
+      input: vi.fn(),
+      notify: vi.fn(),
+      editor: vi.fn().mockResolvedValue(null), // Cancelled
+      confirm: vi.fn(),
+    };
+
+    const result = await planProject('UI Plan', mockModelRouter, '/tmp/test', uiContext);
+
+    expect(result.summary).toBe('Plan review cancelled by user.');
+    expect(mockFs.writeFileSync).not.toHaveBeenCalled();
+  });
+});
+
+describe('generatePlanMarkdown', () => {
+  it('generates correct markdown for a plan', async () => {
+    const { generatePlanMarkdown } = await import('../../src/agents/project-planner.js');
+    const plan: ProjectPlan = {
+      summary: 'Test Summary',
+      epics: [
+        {
+          title: 'Epic Title',
+          slug: 'slug',
+          description: 'Desc',
+          workItems: [{ id: 'WI-1', title: 'WI Title', description: 'WI Desc', acceptance: [], tests: [] }]
+        }
+      ],
+      architecturalDecisions: ['Dec 1']
+    };
+
+    const md = generatePlanMarkdown(plan);
+    expect(md).toContain('# Plan Summary: Test Summary');
+    expect(md).toContain('Epic Title');
+    expect(md).toContain('WI-1: WI Title');
+    expect(md).toContain('Dec 1');
   });
 });

@@ -93,4 +93,64 @@ describe('Researcher Agent', () => {
     expect(uiContext.notify).toHaveBeenCalledWith(expect.stringContaining('Saved to'), 'info');
     expect(mockDispose).toHaveBeenCalled();
   });
+
+  it('adds searxng_search tool if searchClient is provided', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const mockSearchClient = { search: vi.fn() };
+    
+    await performDeepResearch('Test', '/tmp', modelRouter, mockSearchClient as any, {
+      background: false,
+      uiContext
+    });
+
+    const callArgs = (createSubAgentSession as any).mock.calls[0][0];
+    const searchTool = callArgs.customTools.find((t: any) => t.name === 'searxng_search');
+    expect(searchTool).toBeDefined();
+    
+    // Test the tool execution
+    mockSearchClient.search.mockResolvedValue([{ title: 'Result' }]);
+    const toolResult = await searchTool.execute('id', { query: 'query' });
+    expect(toolResult.content[0].text).toContain('Result');
+  });
+
+  it('handles foreground errors', async () => {
+    mockPrompt.mockRejectedValue(new Error('Prompt failed'));
+    
+    await performDeepResearch('Test', '/tmp', modelRouter, null, {
+      background: false,
+      uiContext
+    });
+
+    expect(uiContext.notify).toHaveBeenCalledWith(expect.stringContaining('Research failed'), 'error');
+  });
+
+  it('triggers setStatus on tool execution events', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    let capturedCallback: any;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => ({
+      prompt: vi.fn(),
+      dispose: vi.fn(),
+      subscribe: (cb: any) => { capturedCallback = cb; }
+    }));
+
+    await performDeepResearch('Test', '/tmp', modelRouter, null, {
+      background: false,
+      uiContext
+    });
+
+    capturedCallback({ type: 'tool_execution_start', toolName: 'test-tool' });
+    expect(uiContext.setStatus).toHaveBeenCalledWith('research', expect.stringContaining('test-tool'));
+  });
+
+  it('creates Research directory if it does not exist', async () => {
+    const mockFs = fs as any;
+    mockFs.existsSync.mockReturnValueOnce(false); // first call for researchDir
+
+    await performDeepResearch('Test', '/tmp', modelRouter, null, {
+      background: false,
+      uiContext
+    });
+
+    expect(mockFs.mkdirSync).toHaveBeenCalledWith(expect.stringContaining('Research'), expect.any(Object));
+  });
 });
