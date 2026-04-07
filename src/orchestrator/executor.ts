@@ -243,9 +243,26 @@ export class WorkflowExecutor {
             });
             const qualityReport = await runQualityGates(this.state.projectDir);
 
+            // Parse and format coverage results if available
+            let coverageInfo = '';
+            if (qualityReport.coverageMetrics) {
+              const m = qualityReport.coverageMetrics;
+              coverageInfo = `Coverage: ${m.lines}% lines, ${m.functions}% functions, ${m.branches}% branches`;
+            }
+
             if (!qualityReport.allBlockingPassed) {
               feedback = formatGateFailures(qualityReport);
               logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
+              
+              // Emit detailed feedback for TUI
+              this.events.emit('taskProgress', {
+                id: task.id,
+                attempt,
+                phase: 'quality-gates',
+                message: `❌ Quality gates failed. Feedback sent to agent.\n${feedback}`,
+                isError: true
+              });
+
               this.state.updateSubtask(task.id, { phase: undefined });
               break;
             }
@@ -256,6 +273,13 @@ export class WorkflowExecutor {
               gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
               testMetrics: qualityReport.testMetrics,
               coverageMetrics: qualityReport.coverageMetrics,
+            });
+
+            this.events.emit('taskProgress', {
+              id: task.id,
+              attempt,
+              phase: 'quality-gates',
+              message: `✅ Quality gates passed! ${coverageInfo}`
             });
           }
 
@@ -300,6 +324,16 @@ export class WorkflowExecutor {
             if (!isApproved) {
               logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
               feedback = reviewerFeedback;
+
+              // Emit detailed feedback for TUI
+              this.events.emit('taskProgress', {
+                id: task.id,
+                attempt,
+                phase: 'reviewing',
+                message: `❌ Review rejected. Feedback sent to agent.\n\n${feedback}`,
+                isError: true
+              });
+
               this.state.updateSubtask(task.id, { phase: undefined });
               break;
             }

@@ -3,7 +3,7 @@ import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
-import { detectTestFramework } from '../context/gatherer.js';
+import { getTestRunner, type TestMetrics, type CoverageMetrics, type TestResult } from './test-runner.js';
 
 const execAsync = promisify(exec);
 
@@ -14,19 +14,8 @@ export interface GateResult {
   blocking: boolean;
 }
 
-export interface TestMetrics {
-  total: number;
-  passed: number;
-  failed: number;
-  skipped: number;
-}
-
-export interface CoverageMetrics {
-  lines: number;       // percentage
-  branches: number;    // percentage
-  functions: number;   // percentage
-  statements: number;  // percentage
-}
+// Test and Coverage metrics are now imported from test-runner.ts
+export type { TestMetrics, CoverageMetrics };
 
 export interface QualityReport {
   gates: GateResult[];
@@ -48,24 +37,46 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
   }
 
   // Gate 2: Tests pass (BLOCKING)
-  const testCmd = await detectTestCommand(projectDir);
-  if (testCmd) {
-    // Determine if we should run with coverage
-    const coverageCmd = await detectCoverageCommand(projectDir, testCmd);
-    const cmdToRun = coverageCmd || testCmd;
+  const runner = getTestRunner(projectDir);
+  if (runner) {
+    const pkgJsonPath = path.join(projectDir, 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+    
+    // Check if we should run with coverage
+    const hasCoverageScript = pkg.scripts?.['test:coverage'] || pkg.scripts?.coverage;
+    const isVitest = runner.name === 'vitest' && (pkg.devDependencies?.['@vitest/coverage-v8'] || pkg.devDependencies?.['@vitest/coverage-istanbul']);
+    
+    let result: TestResult;
+    if (hasCoverageScript || isVitest) {
+      result = await runner.runCoverage(projectDir, 120_000);
+      coverageMetrics = result.coverage;
+    } else {
+      result = await runner.runTests(projectDir, 120_000);
+    }
 
-    const testResult = await runGate('tests', cmdToRun, projectDir, true, 120_000);
-    gates.push(testResult);
+    gates.push({
+      gate: 'tests',
+      passed: result.passed,
+      output: result.output,
+      blocking: true,
+    });
 
-    // Parse test metrics from output
-    testMetrics = parseTestMetrics(testResult.output);
+    testMetrics = result.metrics;
 
-    // Parse coverage if we ran with coverage
-    if (coverageCmd) {
-      coverageMetrics = await parseCoverageMetrics(projectDir, testResult.output);
+    // Gate 2b: Coverage Threshold (BLOCKING)
+    if (coverageMetrics) {
+      const thresholds = pkg.tddConfig?.coverageThresholds || { lines: 80, functions: 80, branches: 70 };
+      const coveragePass = checkCoverageThresholds(coverageMetrics, thresholds);
+      
+      gates.push({
+        gate: 'coverage',
+        passed: coveragePass.passed,
+        output: coveragePass.message,
+        blocking: true,
+      });
     }
   } else {
-    logger.warn('No test command detected — skipping test gate');
+    logger.warn('No test runner detected — skipping test gate');
   }
 
   // Gate 3: Lint (NON-BLOCKING)
@@ -112,187 +123,25 @@ async function runGate(
   }
 }
 
-// ─── Test Metrics Parsing ────────────────────────────────────────
-
 /**
- * Parse test count from runner output. Supports vitest, jest, mocha, and node:test.
+ * Check metrics against thresholds
  */
-export function parseTestMetrics(output: string): TestMetrics | undefined {
-  // Vitest: look for the "Tests" line (NOT "Test Files")
-  // "      Tests  85 passed | 2 failed (87)"
-  // "      Tests  94 passed (94)"
-  const testsLineMatch = output.match(/^\s*Tests\s+(.+\(\d+\))\s*$/m);
-  if (testsLineMatch) {
-    const line = testsLineMatch[1]!;
-    const totalMatch = line.match(/\((\d+)\)/);
-    const total = totalMatch ? parseInt(totalMatch[1]!, 10) : 0;
-    const passedMatch = line.match(/(\d+)\s+passed/i);
-    const failedMatch = line.match(/(\d+)\s+failed/i);
-    const skippedMatch = line.match(/(\d+)\s+skipped/i);
-    return {
-      total,
-      passed: passedMatch ? parseInt(passedMatch[1]!, 10) : 0,
-      failed: failedMatch ? parseInt(failedMatch[1]!, 10) : 0,
-      skipped: skippedMatch ? parseInt(skippedMatch[1]!, 10) : 0,
-    };
+function checkCoverageThresholds(metrics: CoverageMetrics, thresholds: Partial<CoverageMetrics>): { passed: boolean; message: string } {
+  const failures: string[] = [];
+  if (thresholds.lines && metrics.lines < thresholds.lines) failures.push(`Lines: ${metrics.lines}% < ${thresholds.lines}%`);
+  if (thresholds.functions && metrics.functions < thresholds.functions) failures.push(`Functions: ${metrics.functions}% < ${thresholds.functions}%`);
+  if (thresholds.branches && metrics.branches < thresholds.branches) failures.push(`Branches: ${metrics.branches}% < ${thresholds.branches}%`);
+  if (thresholds.statements && metrics.statements < thresholds.statements) failures.push(`Statements: ${metrics.statements}% < ${thresholds.statements}%`);
+
+  if (failures.length > 0) {
+    return { passed: false, message: `Coverage thresholds NOT met:\n${failures.join('\n')}` };
   }
-
-  // Jest: "Tests: 2 failed, 10 passed, 12 total"
-  const jestMatch = output.match(/Tests:\s*(?:(\d+)\s+failed,\s*)?(\d+)\s+passed,\s*(\d+)\s+total/i);
-  if (jestMatch) {
-    return {
-      failed: parseInt(jestMatch[1] || '0', 10),
-      passed: parseInt(jestMatch[2]!, 10),
-      total: parseInt(jestMatch[3]!, 10),
-      skipped: 0,
-    };
-  }
-
-  // Mocha: "10 passing" / "2 failing"
-  const mochaPass = output.match(/(\d+)\s+passing/i);
-  const mochaFail = output.match(/(\d+)\s+failing/i);
-  const mochaPend = output.match(/(\d+)\s+pending/i);
-  if (mochaPass) {
-    const passed = parseInt(mochaPass[1]!, 10);
-    const failed = mochaFail ? parseInt(mochaFail[1]!, 10) : 0;
-    const skipped = mochaPend ? parseInt(mochaPend[1]!, 10) : 0;
-    return { passed, failed, skipped, total: passed + failed + skipped };
-  }
-
-  // node:test: "# tests 5" / "# pass 4" / "# fail 1"
-  const nodeTotal = output.match(/# tests (\d+)/);
-  const nodePass = output.match(/# pass (\d+)/);
-  const nodeFail = output.match(/# fail (\d+)/);
-  if (nodeTotal) {
-    return {
-      total: parseInt(nodeTotal[1]!, 10),
-      passed: nodePass ? parseInt(nodePass[1]!, 10) : 0,
-      failed: nodeFail ? parseInt(nodeFail[1]!, 10) : 0,
-      skipped: 0,
-    };
-  }
-
-  return undefined;
-}
-
-// ─── Coverage Support ────────────────────────────────────────────
-
-/**
- * Detect if a coverage command can be constructed for this test framework.
- */
-export async function detectCoverageCommand(projectDir: string, testCmd: string): Promise<string | null> {
-  const pkgJsonPath = path.join(projectDir, 'package.json');
-  if (!fs.existsSync(pkgJsonPath)) return null;
-
-  try {
-    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
-
-    // Check for existing coverage script
-    if (pkg.scripts?.['test:coverage']) return 'npm run test:coverage';
-    if (pkg.scripts?.coverage) return 'npm run coverage';
-
-    // Vitest has built-in coverage via --coverage
-    if (allDeps.vitest && (allDeps['@vitest/coverage-v8'] || allDeps['@vitest/coverage-istanbul'])) {
-      return 'npx vitest run --coverage --reporter=json';
-    }
-
-    // Jest has built-in coverage
-    if (allDeps.jest) {
-      return 'npx jest --passWithNoTests --coverage --coverageReporters=json-summary';
-    }
-
-    // c8 (Node.js coverage tool)
-    if (allDeps.c8) {
-      return `npx c8 --reporter=json-summary ${testCmd}`;
-    }
-
-    // nyc/istanbul
-    if (allDeps.nyc || allDeps.istanbul) {
-      return `npx nyc --reporter=json-summary ${testCmd}`;
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Parse coverage metrics from coverage output or JSON report files.
- */
-export async function parseCoverageMetrics(projectDir: string, testOutput: string): Promise<CoverageMetrics | undefined> {
-  // Try JSON summary file first (most tools write this)
-  const coveragePaths = [
-    path.join(projectDir, 'coverage', 'coverage-summary.json'),
-    path.join(projectDir, 'coverage', 'coverage-final.json'),
-  ];
-
-  for (const coveragePath of coveragePaths) {
-    if (fs.existsSync(coveragePath)) {
-      try {
-        const data = JSON.parse(fs.readFileSync(coveragePath, 'utf-8'));
-        const total = data.total;
-        if (total) {
-          return {
-            lines: total.lines?.pct ?? 0,
-            branches: total.branches?.pct ?? 0,
-            functions: total.functions?.pct ?? 0,
-            statements: total.statements?.pct ?? 0,
-          };
-        }
-      } catch {
-        // Malformed coverage file
-      }
-    }
-  }
-
-  // Fallback: parse text output
-  // Vitest/Jest text reporter: "All files  |   85.7 |   72.3 |    90  |   85.7"
-  //                     or:    "Statements : 85.7%"
-  const stmtMatch = testOutput.match(/Statements?\s*[:|]\s*([\d.]+)%?/i);
-  const branchMatch = testOutput.match(/Branches?\s*[:|]\s*([\d.]+)%?/i);
-  const funcMatch = testOutput.match(/Functions?\s*[:|]\s*([\d.]+)%?/i);
-  const lineMatch = testOutput.match(/Lines?\s*[:|]\s*([\d.]+)%?/i);
-
-  if (stmtMatch || lineMatch) {
-    return {
-      statements: stmtMatch ? parseFloat(stmtMatch[1]!) : 0,
-      branches: branchMatch ? parseFloat(branchMatch[1]!) : 0,
-      functions: funcMatch ? parseFloat(funcMatch[1]!) : 0,
-      lines: lineMatch ? parseFloat(lineMatch[1]!) : 0,
-    };
-  }
-
-  return undefined;
+  return { passed: true, message: 'All coverage thresholds met.' };
 }
 
 // ─── Test Command Detection ──────────────────────────────────────
 
-export async function detectTestCommand(projectDir: string): Promise<string | null> {
-  const pkgJsonPath = path.join(projectDir, 'package.json');
-  if (!fs.existsSync(pkgJsonPath)) return null;
-
-  try {
-    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
-    const framework = detectTestFramework(allDeps);
-
-    switch (framework) {
-      case 'vitest': return 'npx vitest run';
-      case 'jest': return 'npx jest --passWithNoTests';
-      case 'mocha': return 'npx mocha';
-      case 'ava': return 'npx ava';
-      default:
-        if (pkg.scripts?.test && !pkg.scripts.test.includes('no test specified')) {
-          return 'npm test';
-        }
-        return null;
-    }
-  } catch {
-    return null;
-  }
-}
+// Removed manual test detection — handled by test-runner.ts
 
 // ─── File Safety ─────────────────────────────────────────────────
 
