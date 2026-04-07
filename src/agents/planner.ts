@@ -8,6 +8,7 @@ import { PLANNER_PROMPT } from '../subagent/prompts.js';
 const PLANNER_SCHEMA = {
   type: 'object',
   properties: {
+    reasoning: { type: 'string', description: 'Step-by-step reasoning for the proposed task list' },
     refinedRequest: { type: 'string' },
     subtasks: {
       type: 'array',
@@ -15,17 +16,19 @@ const PLANNER_SCHEMA = {
         type: 'object',
         properties: {
           description: { type: 'string' },
+          affectedFiles: { type: 'array', items: { type: 'string' }, description: 'List of files likely to be modified by this task' },
         },
         required: ['description'],
       },
     },
   },
-  required: ['refinedRequest', 'subtasks'],
+  required: ['reasoning', 'refinedRequest', 'subtasks'],
 };
 
 export interface PlanResult {
+  reasoning: string;
   refinedRequest: string;
-  subtasks: { id: string; description: string }[];
+  subtasks: { id: string; description: string; affectedFiles?: string[] }[];
 }
 
 export async function planAndBreakdown(
@@ -53,15 +56,17 @@ export async function planAndBreakdown(
   }
 
   const result = await llm.askStructured<{
+    reasoning: string;
     refinedRequest: string;
-    subtasks: { description: string }[];
+    subtasks: { description: string; affectedFiles?: string[] }[];
   }>(PLANNER_PROMPT, `${request}${researchContext}`, PLANNER_SCHEMA, 'plan', 0.3);
 
   const subtasks = result.subtasks.map((t) => ({
     id: uuidv4(),
     description: t.description,
+    affectedFiles: t.affectedFiles,
   }));
 
   logger.info(`Created ${subtasks.length} subtasks`);
-  return { refinedRequest: result.refinedRequest, subtasks };
+  return { reasoning: result.reasoning, refinedRequest: result.refinedRequest, subtasks };
 }

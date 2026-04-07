@@ -46,8 +46,9 @@ describe('Planner Agent', () => {
 
   it('plans and breaks down a request without search', async () => {
     mockAskStructured.mockResolvedValue({
+      reasoning: 'Detailed reasoning',
       refinedRequest: 'Refined Request',
-      subtasks: [{ description: 'Task 1' }],
+      subtasks: [{ description: 'Task 1', affectedFiles: ['file.ts'] }],
     });
 
     const result = await planAndBreakdown('Original Request', mockModelRouter);
@@ -64,6 +65,7 @@ describe('Planner Agent', () => {
     (shouldSearch as any).mockReturnValue(true);
     mockSearchAndSummarize.mockResolvedValue('Research Summary');
     mockAskStructured.mockResolvedValue({
+      reasoning: 'Test reasoning',
       refinedRequest: 'Refined',
       subtasks: [],
     });
@@ -91,6 +93,7 @@ describe('Planner Agent', () => {
     (shouldSearch as any).mockReturnValue(true);
     mockSearchAndSummarize.mockRejectedValue(new Error('Search failed'));
     mockAskStructured.mockResolvedValue({
+      reasoning: 'Test reasoning',
       refinedRequest: 'Refined',
       subtasks: [],
     });

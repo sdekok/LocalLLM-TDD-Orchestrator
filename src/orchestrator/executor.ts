@@ -405,7 +405,10 @@ export class WorkflowExecutor {
     if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
       logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
       const subPlan = await planAndBreakdown(
-        `Implement this specific work item: ${task.description}\n\nExisting architectural context:\n${this.state.getState().refined_request}`,
+        `Implement this specific work item: ${task.description}\n\n` +
+        `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
+        `IMPORTANT: Break this down into high-granularity technical tasks. Each task should ideally add or modify 1 or 2 methods. ` +
+        `This granularity ensures quality in small models.`,
         this.modelRouter,
         this.searchClient || undefined
       );

@@ -73,10 +73,10 @@ The system includes built-in "Tuners" that automatically adjust sampling and pro
 
 For complex features, we recommend the following lifecycle:
 
-1.  **Plan**: Run `/plan "Feature description"` to generate epics.
+1.  **Plan**: Run `/plan "Feature description"` to generate epics. The planner will use Chain-of-Thought reasoning to break the request into "Small Slices" (less than a day of work).
 2.  **Review**: Open the generated `WorkItems/epic-XX.md` files. Edit them if the plan isn't quite right.
 3.  **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
-4.  **Execute**: Run `/tdd 1`. The orchestrator will **parse the rich metadata** from the markdown and inject it directly into the sub-agent's prompt, ensuring the generated code hits every requirement (Security, Acceptance, Tests).
+4.  **Execute**: Run `/tdd 1`. The orchestrator will **parse the rich metadata** (including `reasoning`) and inject it directly into the sub-agent's prompt.
 
 ## Under the Hood: Agentic Sessions
 
@@ -85,7 +85,8 @@ Unlike legacy MCP servers, this orchestrator uses **ephemeral agent sessions** (
 - **Statefulness**: Within a single "attempt", the Implementer agent can freely read files, run tests, and fix its own errors multiple times before submitting for validation.
 - **Tool Access**: Agents have access to the same native tools as you: `read`, `write`, `edit`, and `bash`.
 - **MCP Tool Inheritance**: Sub-agents inherit tools from the parent Pi session (via `pi-mcp-adapter`). If you have `context-mode` or `search` installed, the implementer can use them.
-- **Wait/Initialization**: When spawning a sub-agent, the system waits for 2 seconds to allow async extensions (like MCP servers) to establish their RPC bounds before the agent starts its work.
+### Context Mode (MANDATORY)
+For maximum reliability on small LLMs, the orchestrator enforces **Context Mode**. Sub-agents are strictly instructed to use `ctx_execute` and `ctx_execute_file` for any operations involving significant data (reading files, running tests, analyzing code). This prevents "Context Flooding" and ensures the agent always has the most narrow, relevant information.
 
 ## Quality Gates & Coverage
 
@@ -94,15 +95,26 @@ The orchestrator does **not** ask an AI if the code is good enough. Instead, it 
 | Gate | Type | What It Checks |
 |---|---|---|
 | **TypeScript** | Blocking | `npx tsc --noEmit` — any type errors fail the gate |
-| **Tests** | Blocking | Auto-detects test framework (vitest, jest, mocha, ava, node:test) and runs the suite |
+| **Tests** | Blocking | Auto-detects test framework and runs the suite |
+| **Coverage** | Blocking | Enforces line/function/branch thresholds defined in `package.json` |
 | **Lint** | Non-blocking | ESLint warnings are logged but don't block |
-| **File Safety** | Blocking | Ensures files were only written to expected directories (src/, tests/) |
+| **File Safety** | Blocking | Ensures files were only written to expected directories |
 
-### Code Coverage Detection
-If you have a coverage tool installed, coverage is **automatically** detected and included in the merge commit message:
-- **Vitest**: Install `@vitest/coverage-v8` for automatic support.
-- **Jest**: Built-in `--coverage` flag is utilized.
-- **Custom**: If you have a `test:coverage` or `coverage` script in `package.json`, it's used instead.
+### Code Coverage & Thresholds
+The orchestrator automatically detects coverage for Vitest and Jest. You can enforce blocking coverage gates by adding `tddConfig` to your `package.json`:
+
+```json
+{
+  "tddConfig": {
+    "coverageThresholds": {
+      "lines": 85,
+      "functions": 80,
+      "branches": 75
+    }
+  }
+}
+```
+If coverage falls below these levels, the workflow will halt before moving to the Reviewer.
 
 ## Safety & Controls
 

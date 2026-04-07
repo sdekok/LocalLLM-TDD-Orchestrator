@@ -100,20 +100,22 @@ Your goal is to take a high-level request and break it down into a sequence of s
 ## Context Mode (MANDATORY)
 Default to context-mode (\`ctx_execute_file\`) for analyzing codebase state.
 
-Each subtask should:
-1. Have a clear, actionable description.
-2. Be small enough to be implemented in a single TDD cycle.
-3. Be logically ordered to build the feature incrementally.
+### Granularity & Quality
+- **Technical Tasks**: Break work into granular technical tasks. Each task should ideally only add or modify 1 or 2 methods (excluding boilerplate).
+- **Atomic Operations**: Ensure each task is small enough to be understood and executed perfectly by a small LLM.
+- **Verification**: This granularity prevents tool-calling degradation and ensures high quality.
 
 **Always check \`.tdd-workflow/analysis/\` if available to ensure subtasks respect the existing codebase structure.**
 
 ### Output Format
 You must return only a JSON object matching this schema:
 {
+  "reasoning": "Step-by-step reasoning for this breakdown, identifying potential blockers or method-level changes",
   "refinedRequest": "Summarized overall goal",
   "subtasks": [
     {
-      "description": "Specific subtask description for TDD"
+      "description": "Specific subtask description for TDD",
+      "affectedFiles": ["path/to/file.ts"]
     }
   ]
 }`;
@@ -132,8 +134,8 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 
 ### Your Objectives
 1. **Understand Context**: Use \`ctx_execute_file\` and \`bash\` to understand the current project structure. **Examine \`.tdd-workflow/analysis/\` for deep architectural insights before planning.**
-2. **Decompose into Epics**: Break the project into 2-5 logically ordered "Epics".
-3. **Decompose into Work Items**: Break each Epic into 3-8 "Work Items".
+2. **Decompose into Epics**: Break the project into as many small, logical Epics as needed for extreme clarity. More small epics are better than few large ones.
+3. **Decompose into Work Items**: Break each Epic into "Small Slices". A human should ideally be able to complete a work item in less than a day. They must be atomic, verifiable, and manageable for a small model.
 4. **Define Architecture**: Identify cross-cutting architectural decisions.
 5. **Return Structured Plan**: You must return your entire plan as a single, valid JSON object.
 
@@ -141,6 +143,6 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 If you encounter ambiguity, call the \`ask_user_for_clarification\` tool.
 
 ### Output Format
-Your final response must be a single JSON object (Summary, Epics, Decisions).
+Your final response must be a single JSON object (Reasoning, Summary, Epics, Decisions).
 
 Begin by exploring the project to understand where the new request fits.`;

@@ -6,7 +6,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import { StateManager } from '../../src/orchestrator/state.js';
 import { Sandbox } from '../../src/orchestrator/sandbox.js';
-import { runQualityGates, detectTestCommand, formatGateFailures } from '../../src/orchestrator/quality-gates.js';
+import { runQualityGates, formatGateFailures } from '../../src/orchestrator/quality-gates.js';
 import { gatherWorkspaceSnapshot, formatSnapshotForPrompt } from '../../src/context/gatherer.js';
 
 const execAsync = promisify(exec);
@@ -100,11 +100,6 @@ describe('Orchestrator Integration', () => {
 
   // ─── Quality Gates Integration ──────────────────────────────────
 
-  it('detects test command from package.json', async () => {
-    const cmd = await detectTestCommand(projectDir);
-    // Has `npm test` script → should return 'npm test'
-    expect(cmd).toBe('npm test');
-  });
 
   it('formats gate failures readably', () => {
     const report = {

@@ -5,6 +5,7 @@ import { z } from 'zod';
  * This ensures the agent returns a structured, valid plan.
  */
 export const ProjectPlanSchema = z.object({
+  reasoning: z.string().describe("Step-by-step reasoning for the proposed architecture and task breakdown."),
   summary: z.string().describe("A high-level summary of the project or request."),
   epics: z.array(
     z.object({
@@ -22,6 +23,7 @@ export const ProjectPlanSchema = z.object({
           security: z.string().optional().describe("Specific security considerations for this work item."),
           tests: z.array(z.string()).describe("A list of specific test cases to be implemented (e.g. 'Should throw Error when input is negative')."),
           devNotes: z.string().optional().describe("Implementation notes, technical gotchas, or library recommendations."),
+          filesAffected: z.array(z.string()).optional().describe("List of files likely to be touched by this work item."),
         })
       ).describe("The sequence of small, atomic TDD tasks within this epic."),
     })

@@ -48,6 +48,7 @@ vi.mock('../../src/subagent/factory.js', () => ({
 describe('ProjectPlanSchema', () => {
   it('validates a correct project plan', () => {
     const validPlan: ProjectPlan = {
+      reasoning: 'Reasoning for test plan',
       summary: 'Test project summary',
       epics: [
         {
@@ -85,6 +86,7 @@ describe('ProjectPlanSchema', () => {
 
   it('rejects a plan with empty work items array in epic', () => {
     const invalidPlan: ProjectPlan = {
+      reasoning: 'Reasoning',
       summary: 'Test',
       epics: [
         {
@@ -158,7 +160,7 @@ describe('Project Planner Integration', () => {
   it('extracts JSON from agent response with conversational text', async () => {
     const { extractPlanFromResponse } = await import('../../src/agents/project-planner.js');
     
-    const response = "Here's the plan you requested:\n\n```json\n{\n  \"summary\": \"Test project\",\n  \"epics\": [],\n  \"architecturalDecisions\": []\n}\n```\n\nLet me know if you need any changes!";
+    const response = "Here's the plan you requested:\n\n```json\n{\n  \"reasoning\": \"Test reasoning\",\n  \"summary\": \"Test project\",\n  \"epics\": [],\n  \"architecturalDecisions\": []\n}\n```\n\nLet me know if you need any changes!";
 
     const result = extractPlanFromResponse(response);
     expect(result).toBeDefined();
@@ -201,6 +203,7 @@ describe('Plan File Writing', () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
     
     const plan: ProjectPlan = {
+      reasoning: 'Test reasoning',
       summary: 'Test project',
       epics: [],
       architecturalDecisions: ['Decision 1'],
@@ -226,6 +229,7 @@ describe('Plan File Writing', () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
     
     const plan: ProjectPlan = {
+      reasoning: 'Test reasoning',
       summary: 'Test',
       epics: [
         {
@@ -269,6 +273,7 @@ describe('Plan File Writing', () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
     
     const plan: ProjectPlan = {
+      reasoning: 'Test reasoning',
       summary: 'Test',
       epics: [
         {
@@ -391,7 +396,7 @@ describe('planProject', () => {
           content: [
             {
               type: 'text',
-              text: 'Here is the plan: ```json\n{\n  "summary": "Test project",\n  "epics": [],\n  "architecturalDecisions": ["Dec 1"]\n}\n```'
+              text: 'Here is the plan: ```json\n{\n  "reasoning": "Test reasoning",\n  "summary": "Test project",\n  "epics": [],\n  "architecturalDecisions": ["Dec 1"]\n}\n```'
             }
           ]
         }
@@ -420,7 +425,7 @@ describe('planProject', () => {
       messages: [
         {
           role: 'assistant',
-          content: '```json\n{"summary": "Test UI", "epics": [], "architecturalDecisions": []}\n```'
+          content: '```json\n{"reasoning": "Test reasoning", "summary": "Test UI", "epics": [], "architecturalDecisions": []}\n```'
         }
       ]
     };
@@ -451,7 +456,7 @@ describe('planProject', () => {
     const mockSession = {
       prompt: vi.fn(),
       dispose: vi.fn(),
-      messages: [{ role: 'assistant', content: '{"summary": "Test", "epics": [], "architecturalDecisions": []}' }]
+      messages: [{ role: 'assistant', content: '{"reasoning": "Test reasoning", "summary": "Test", "epics": [], "architecturalDecisions": []}' }]
     };
     (createSubAgentSession as any).mockResolvedValue(mockSession);
     
@@ -473,6 +478,7 @@ describe('generatePlanMarkdown', () => {
   it('generates correct markdown for a plan', async () => {
     const { generatePlanMarkdown } = await import('../../src/agents/project-planner.js');
     const plan: ProjectPlan = {
+      reasoning: 'Test reasoning',
       summary: 'Test Summary',
       epics: [
         {
