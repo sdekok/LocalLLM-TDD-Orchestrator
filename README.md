@@ -68,6 +68,7 @@ Inside any project, simply use the slash commands:
 
 - **Plan**: `/plan "Build a secure login system"` (Decomposes into Epics/WorkItems with rich metadata)
 - **Implement**: `/tdd 1` (Loads from `WorkItems/`, parses all metadata, and executes)
+- **Research**: `/research "Best practices for React state 2026"` (Deep web + video research agent)
 - **Status**: `/status` (Check progress of the current workflow)
 - **Analyze**: `/analyze` (Deep architectural blueprinting)
 

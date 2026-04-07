@@ -42,10 +42,16 @@ Decomposes a project into "World-Class" Epics and WorkItems.
 - **Output**: Creates a `WorkItems/` directory at the project root.
 - **Analysis Integration**: Automatically runs `/analyze` first to ensure the architect has a fresh blueprint of the codebase.
 
-### `/analyze`
-Performs a deep architectural analysis of the current repository.
-- **Supported Languages**: TypeScript, JavaScript, C#, C++.
 - **Benefit**: Caches a "blueprint" of the repository that the Planner and Architect use to generate more accurate tasks.
+- **Output**: Stores analysis in `analysis-report.json`.
+
+### `/research <topic> [--bg]`
+Launches an autonomous Deep Research agent to browse the web and watch videos.
+- **Tools**: The agent uses `fetch_and_convert_html` (Readability + Turndown) for clean reading and `parse_youtube_transcript` for lightning-fast transcript fetching.
+- **Loop**: It searches, identifies missing info, and repeats up to 3 times before synthesizing a final report.
+- **Background Mode**: Use `--bg` to run the researcher in the background if it's a long task.
+- **Output**: Generates a structured markdown file in results to `Research/<Topic>.md`.
+- **TUI Integration**: Automatically opens the research report in your editor once finished.
 
 ## Model Configuration
 
