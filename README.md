@@ -2,8 +2,10 @@
 
 A deeply integrated, agentic TDD workflow engine for the **Pi Coding Agent**. It replaces rigid JSON-based orchestration with native Pi sub-agent sessions, providing surgical file editing and self-correcting development loops using local or cloud LLMs.
 
-### NEW: Project-Level Planning
-The orchestrator now features a dedicated `/plan` command for long-term project decomposition. This creates human-readable `WorkItems/*.md` files that subsequent `/tdd` runs consume, enabling a "Plan → Review → Execute" cycle.
+### NEW: MCP & Project-Level Planning
+- **MCP Server Support**: The orchestrator now exposes its core workflows as **Model Context Protocol (MCP)** tools, allowing integration with any MCP-capable IDE or client.
+- **Project Planning**: A dedicated `/plan` command decomposes large features into a `WorkItems/` directory, enabling a structured "Plan → Review → Execute" cycle.
+- **Tool Inheritance**: Sub-agents now automatically inherit all installed Pi extensions and MCP tools (like `context-mode`), allowing them to use high-level contextual discovery tools.
 
 ## How It Works (Agentic Mode)
 
@@ -34,8 +36,9 @@ Pi says "/tdd implement JWT auth"
 
 The orchestrator spawns **ephemeral, headless sub-agent sessions** for implementation and review. These agents use Pi's native `read`, `write`, `edit`, and `bash` tools directly on your filesystem. 
 
-- **Self-Healing**: If quality gates fail, the executor rolls back changes and injects feedback into the *next* attempt's system prompt.
+- **Self-Healing**: If quality gates fail, the executor rolls back changes and injects deterministic failure logs into the *next* attempt's system prompt.
 - **Git Sandboxing**: Every subtask runs in an isolated git branch. Only proven, reviewed code is merged.
+- **MCP Tool Discovery**: Sub-agents use the `pi-mcp-adapter` to access external tools, making them capable of using the latest context-gathering libraries.
 - **Deterministic Quality**: While the implementation is agentic, the gates (TSC, Vitest, etc.) are 100% deterministic.
 
 ## Quick Start
@@ -65,7 +68,20 @@ Inside any project, simply use the slash commands:
 
 - **Plan**: `/plan Build a secure login system` (Decomposes into Epics/WorkItems)
 - **Implement**: `/tdd Implement Epic 1` (Loads from `WorkItems/` and executes)
-- **Direct**: `/tdd Add a secure login endpoint` (On-the-fly planning)
+- **Direct**: `/tdd Add a secure login endpoint` (On-the-fly planning with sub-refinement)
+- **Status**: `/status` (Check progress of the current workflow)
+
+### 4. MCP Server Mode
+
+You can also run the orchestrator as a standalone MCP server:
+```bash
+node dist/interfaces/mcp/index.js
+```
+This exposes the following tools to your MCP client:
+- `start_tdd_workflow`: Start a background implementation loop.
+- `resume_tdd_workflow`: Resume from a pause or failure.
+- `check_workflow_status`: Get structured JSON status of all tasks.
+- `analyze_project`: Run the deep architectural analyzer.
 
 ## Safety & Runaway Protection
 

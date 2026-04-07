@@ -4,11 +4,12 @@
 
 The TDD Agentic Workflow orchestrator is a native **Pi Extension** that automates feature implementation through ephemeral sub-agent sessions. You describe what you want, and the system:
 
-1. **Plans** — Breaks your request into testable subtasks, researching best practices via web search.
-2. **Implements** — Spawns a headless Pi sub-agent that writes tests and code natively using `read`, `edit`, and `bash` tools.
-3. **Validates** — Runs deterministic quality gates (TypeScript compilation, test suite, linting) on the sub-agent's work.
-4. **Reviews** — Spawns a reviewer sub-agent to score the implementation on test coverage and code quality.
-5. **Merges or Retries** — If gates pass, code is merged. If not, the implementer gets feedback and tries again (up to 3 attempts).
+1. **Analysis** — Automatically runs `/analyze` to build a fresh blueprint of your codebase (exports, types, patterns).
+2. **Planning** — Decomposes your request into high-level Epics and WorkItems, creating a `WorkItems/` directory.
+3. **Execution (`/tdd`)** — Swims through the workitems, implementing each one via an ephemeral sub-agent.
+4. **Sub-Refinement** — If a workitem is too broad, the orchestrator sub-refines it into granular TDD technical steps before implementation.
+5. **Validation & Review** — Deterministic quality gates (TSC, Tests) followed by an LLM-powered review.
+6. **MCP Discovery** — Sub-agents now automatically inherit and use your installed MCP tools (e.g., `context-mode`) for enhanced discovery.
 
 ## Installation
 
@@ -64,7 +65,8 @@ For complex features, we recommend the following lifecycle:
 1.  **Plan**: Run `/plan "Feature description"` to generate epics.
 2.  **Review**: Open the generated `WorkItems/epic-XX.md` files. Edit them if the plan isn't quite right.
 3.  **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
-4.  **Execute**: Run `/tdd Implement Epic 01`. The system will load the work items and sub-refine them into TDD steps.
+4.  **Execute**: Run `/tdd Implement Epic 01`. The system will load the work items and sub-refine them into technical TDD steps.
+5.  **Monitor**: Use `/status` or the MCP `check_workflow_status` tool to see exactly where the agent is in the process.
 
 ## Under the Hood: Agentic Sessions
 
@@ -72,7 +74,8 @@ Unlike legacy MCP servers, this orchestrator uses **ephemeral agent sessions** (
 
 - **Statefulness**: Within a single "attempt", the Implementer agent can freely read files, run tests, and fix its own errors multiple times before submitting for validation.
 - **Tool Access**: Agents have access to the same native tools as you: `read`, `write`, `edit`, and `bash`.
-- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the error/feedback into the *next* session's system prompt.
+- **MCP Tool Inheritance**: Sub-agents inherit tools from the parent Pi session (via `pi-mcp-adapter`). If you have `context-mode` or `search` installed, the implementer can use them.
+- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the failure logs into the *next* session's system prompt.
 
 ## Quality Gates & Coverage
 
