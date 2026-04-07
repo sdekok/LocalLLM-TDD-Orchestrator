@@ -41,17 +41,21 @@ Decomposes a project into "World-Class" Epics and WorkItems.
 - **Enhanced Planning**: Generates structured markdown files including per-task **Security Considerations**, **Dev Notes**, and **Mock/Test Case suggestions**.
 - **Output**: Creates a `WorkItems/` directory at the project root.
 - **Analysis Integration**: Automatically runs `/analyze` first to ensure the architect has a fresh blueprint of the codebase.
-
-- **Benefit**: Caches a "blueprint" of the repository that the Planner and Architect use to generate more accurate tasks.
-- **Output**: Stores analysis in `analysis-report.json`.
+- **Context Awareness**: The planner reads existing `agents.md` and `README-tech.md` to ensure any new epics follow your project's architectural standards.
 
 ### `/research <topic> [--bg]`
 Launches an autonomous Deep Research agent to browse the web and watch videos.
 - **Tools**: The agent uses `fetch_and_convert_html` (Readability + Turndown) for clean reading and `parse_youtube_transcript` for lightning-fast transcript fetching.
+- **Tool Inheritance**: Inherits all your Pi extensions (including `context-mode` for memory management and `searxng` for web search).
 - **Loop**: It searches, identifies missing info, and repeats up to 3 times before synthesizing a final report.
 - **Background Mode**: Use `--bg` to run the researcher in the background if it's a long task.
 - **Output**: Generates a structured markdown file in results to `Research/<Topic>.md`.
 - **TUI Integration**: Automatically opens the research report in your editor once finished.
+
+### `/analyze`
+- **Benefit**: Caches a "blueprint" of the repository that the Planner and Architect use to generate more accurate tasks.
+- **Output**: Stores analysis in `.tdd-workflow/analysis/`.
+- **Languages**: Supports TypeScript (AST), C# (Roslyn), and C++ (Tree-Sitter).
 
 ## Model Configuration
 
@@ -81,7 +85,7 @@ Unlike legacy MCP servers, this orchestrator uses **ephemeral agent sessions** (
 - **Statefulness**: Within a single "attempt", the Implementer agent can freely read files, run tests, and fix its own errors multiple times before submitting for validation.
 - **Tool Access**: Agents have access to the same native tools as you: `read`, `write`, `edit`, and `bash`.
 - **MCP Tool Inheritance**: Sub-agents inherit tools from the parent Pi session (via `pi-mcp-adapter`). If you have `context-mode` or `search` installed, the implementer can use them.
-- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the failure logs into the *next* session's system prompt.
+- **Wait/Initialization**: When spawning a sub-agent, the system waits for 2 seconds to allow async extensions (like MCP servers) to establish their RPC bounds before the agent starts its work.
 
 ## Quality Gates & Coverage
 
@@ -106,6 +110,10 @@ If you have a coverage tool installed, coverage is **automatically** detected an
 - **Circuit Breaker**: If 3 consecutive subtasks fail completely (exhausted retries), the entire workflow stops to prevent wasting tokens/compute.
 - **Loop Detection**: If an agent produces nearly identical changes (>90% similarity) across attempts, the system bails early and flags the task for manual intervention.
 
+## Agent Prompts Reference
+
+For developers looking to tune their models, the exact system prompts are provided in the [README.md#core-agents--prompts](file:///home/stephen/dev/tdd-pi-plugin/README.md#core-agents--prompts) for reference.
+
 ## Troubleshooting
 
 | Issue | Solution |
@@ -114,3 +122,4 @@ If you have a coverage tool installed, coverage is **automatically** detected an
 | Model "X" not found | Check `models.config.json` and ensure your llama.cpp server is running in "Router Mode". |
 | Workflow hangs | Check `.tdd-workflow/logs/` for details. Usually means the LLM is stuck or local VRAM is exhausted. |
 | Quality gates always fail | Verify your `package.json` scripts (`test`, `build`) work manually first. |
+| JSON parsing failure | Some models struggle with the structured output of `/plan`. Use a more capable model (like Gemma 2 27B or Claude 3.5 Sonnet) for the `project-plan` role. |
