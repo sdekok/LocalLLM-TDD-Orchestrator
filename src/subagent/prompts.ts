@@ -19,6 +19,19 @@ Your objective is to implement a feature or fix a bug following strict Test-Driv
 5. **Verify Success**: Run tests again to ensure they pass (green).
 6. **Refactor**: Clean up the code and ensure all tests continue to pass.
 
+### Requirements & Context
+**Acceptance Criteria**:
+{acceptance}
+
+**Security Requirements**:
+{security}
+
+**Recommended Tests**:
+{tests}
+
+**Dev Notes**:
+{devNotes}
+
 ### Feedback Handling
 {feedbackContext}
 
@@ -111,9 +124,9 @@ Your final response must be a single JSON object matching this structure:
           "id": "e.g. CORE-01",
           "title": "string",
           "description": "Exhaustive description of the change required.",
-          "acceptance": "Specific, verifiable bullet points for user/reviewer sign-off.",
-          "security": "Workitem level threat model or sanitization requirements.",
-          "tests": ["List of specific unit/integration test cases to write (Given/When/Then style preferred)"],
+          "acceptance": ["List of specific, verifiable bullet points for user/reviewer sign-off."],
+          "security": "Specific security considerations (RBAC, sanitization, threat model)",
+          "tests": ["Detailed unit/integration test cases (Given/When/Then)"],
           "devNotes": "Technical implementation guidance, library references, or known pitfalls."
         }
       ]

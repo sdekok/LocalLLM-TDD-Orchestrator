@@ -29,3 +29,6 @@
 - Use GitHub Actions for CI/CD.
 - Standardize on Node.js 20 for the CI environment.
 - Utilize npm cache in GitHub Actions to speed up dependency installation.
+- Use a single monolithic CI workflow for simplicity as the project size is currently manageable.
+- Target Ubuntu-latest as the standard runner to match local development environments.
+- Strictly follow the existing `package.json` scripts to ensure the CI environment exactly matches the developer's local build/test process.

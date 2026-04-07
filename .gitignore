@@ -11,3 +11,6 @@ src/analysis/tools/CsharpAstAnalyzer/obj/
 
 # Native addon build artifacts (tree-sitter)
 build/
+
+# Coverage reports
+coverage/

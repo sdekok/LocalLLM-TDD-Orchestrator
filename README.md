@@ -2,10 +2,10 @@
 
 A deeply integrated, agentic TDD workflow engine for the **Pi Coding Agent**. It replaces rigid JSON-based orchestration with native Pi sub-agent sessions, providing surgical file editing and self-correcting development loops using local or cloud LLMs.
 
-### NEW: MCP & Project-Level Planning
-- **MCP Server Support**: The orchestrator now exposes its core workflows as **Model Context Protocol (MCP)** tools, allowing integration with any MCP-capable IDE or client.
-- **Project Planning**: A dedicated `/plan` command decomposes large features into a `WorkItems/` directory, enabling a structured "Plan → Review → Execute" cycle.
-- **Tool Inheritance**: Sub-agents now automatically inherit all installed Pi extensions and MCP tools (like `context-mode`), allowing them to use high-level contextual discovery tools.
+### NEW: World-Class Project Planning & MCP
+- **World-Class Planning**: The orchestrator now features a `/plan` command for deep project decomposition. This generates rich, multi-dimensional `WorkItems/*.md` files including **Acceptance Criteria**, **Security Strategies**, and **Specific Test Cases**. Subsequent `/tdd` runs automatically parse and inject this metadata into the implementation sub-agent.
+- **MCP Server Support**: The orchestrator now acts as a standalone **Model Context Protocol (MCP)** server, allowing integration with any MCP IDE.
+- **Tool Discovery**: Sub-agents now automatically inherit and use your installed Pi extensions (like `context-mode`) via the `pi-mcp-adapter`.
 
 ## How It Works (Agentic Mode)
 
@@ -66,22 +66,18 @@ pi install local:.
 
 Inside any project, simply use the slash commands:
 
-- **Plan**: `/plan Build a secure login system` (Decomposes into Epics/WorkItems)
-- **Implement**: `/tdd Implement Epic 1` (Loads from `WorkItems/` and executes)
-- **Direct**: `/tdd Add a secure login endpoint` (On-the-fly planning with sub-refinement)
+- **Plan**: `/plan "Build a secure login system"` (Decomposes into Epics/WorkItems with rich metadata)
+- **Implement**: `/tdd 1` (Loads from `WorkItems/`, parses all metadata, and executes)
 - **Status**: `/status` (Check progress of the current workflow)
+- **Analyze**: `/analyze` (Deep architectural blueprinting)
 
 ### 4. MCP Server Mode
 
-You can also run the orchestrator as a standalone MCP server:
+The orchestrator can also run as a standalone MCP server:
 ```bash
 node dist/interfaces/mcp/index.js
 ```
-This exposes the following tools to your MCP client:
-- `start_tdd_workflow`: Start a background implementation loop.
-- `resume_tdd_workflow`: Resume from a pause or failure.
-- `check_workflow_status`: Get structured JSON status of all tasks.
-- `analyze_project`: Run the deep architectural analyzer.
+This exposes the core workflows (start, resume, status, analyze) to your MCP client.
 
 ## Safety & Runaway Protection
 
