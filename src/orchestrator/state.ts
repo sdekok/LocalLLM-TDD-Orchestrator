@@ -3,10 +3,13 @@ import * as path from 'path';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
 
+export type TaskPhase = 'refining' | 'implementing' | 'quality_gates' | 'reviewing' | 'merging';
+
 export interface Subtask {
   id: string;
   description: string;
   status: TaskStatus;
+  phase?: TaskPhase;
   tests_written: boolean;
   code_implemented: boolean;
   attempts: number;
