@@ -37,12 +37,14 @@ Build an authentication system.
 ## Work Items
 
 ### WI-1: Login Route
-The login route should handle POST requests.
-- Acceptance: 200 on success.
+**Description**: The login route should handle POST requests.
+**Acceptance Criteria**:
+- 200 on success.
 
 ### WI-2: Register Route
-The register route should handle POST requests.
-- Acceptance: 201 on success.
+**Description**: The register route should handle POST requests.
+**Acceptance Criteria**:
+- 210 on success.
 
 ## Status
 - [ ] WI-1
@@ -79,14 +81,15 @@ The register route should handle POST requests.
     
     expect(plan.workItems[0]?.id).toBe('WI-1');
     expect(plan.workItems[0]?.title).toBe('Login Route');
-    expect(plan.workItems[0]?.description).toContain('Acceptance: 200 on success.');
+    expect(plan.workItems[0]?.description).toContain('The login route should handle POST requests.');
+    expect(plan.workItems[0]?.acceptance).toContain('200 on success.');
     
     expect(plan.workItems[1]?.id).toBe('WI-2');
     expect(plan.workItems[1]?.title).toBe('Register Route');
   });
 
   it('should handle missing sections gracefully', () => {
-    const minimalEpic = '# Epic: Minimal\n### WI-1: Task\nDescription';
+    const minimalEpic = '# Epic: Minimal\n### WI-1: Task\n**Description**: Description';
     const filePath = path.join(workItemsDir, 'minimal.md');
     fs.writeFileSync(filePath, minimalEpic);
 
