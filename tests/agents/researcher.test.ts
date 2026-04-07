@@ -31,7 +31,7 @@ vi.mock('fs', async (importOriginal) => {
   };
 });
 
-vi.mock('youtube-transcript', () => ({
+vi.mock('youtube-transcript/dist/youtube-transcript.esm.js', () => ({
   YoutubeTranscript: {
     fetchTranscript: vi.fn().mockResolvedValue([{ text: 'mock' }])
   }

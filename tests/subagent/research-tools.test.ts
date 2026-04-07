@@ -3,7 +3,7 @@ import { createResearchTools } from '../../src/subagent/research-tools.js';
 
 // Mock dependencies
 const mockFetchUrl = vi.fn();
-vi.mock('youtube-transcript', () => ({
+vi.mock('youtube-transcript/dist/youtube-transcript.esm.js', () => ({
   YoutubeTranscript: {
     fetchTranscript: vi.fn().mockResolvedValue([
       { text: 'Hello' },
