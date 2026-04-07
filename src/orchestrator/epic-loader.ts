@@ -37,8 +37,14 @@ export class EpicLoader {
     if (files.includes(`${query}.md`)) return path.join(workItemsDir, `${query}.md`);
 
     // Fuzzy match on filename (e.g., "epic-01" or "auth-system")
-    const cleanQuery = query.toLowerCase().replace(/\s+/g, '-');
-    const fileMatch = files.find(f => f.toLowerCase().includes(cleanQuery));
+    const cleanQuery = query.toLowerCase().replace(/[^a-z0-9]/g, '-');
+    const fileMatch = files.find(f => {
+      const cleanFile = f.toLowerCase().replace(/[^a-z0-9]/g, '-');
+      // match "01" in "epic-01-foo.md" for query "1" or "01"
+      const idMatch = f.match(/^epic-(\d+)-/);
+      if (idMatch && (idMatch[1] === query || parseInt(idMatch[1]!, 10) === parseInt(query, 10))) return true;
+      return cleanFile.includes(cleanQuery);
+    });
     if (fileMatch) return path.join(workItemsDir, fileMatch);
 
     // Deep search inside files for titles
