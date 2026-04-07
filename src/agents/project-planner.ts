@@ -45,7 +45,7 @@ export async function planProject(
     systemPrompt: PROJECT_PLANNER_PROMPT,
     cwd,
     modelRouter,
-    tools: 'coding', // Agent can still read files, but won't write the plan files
+    tools: 'readonly', // Planning agent should only explore, not modify code.
     uiContext: uiContext ? {
       input: uiContext.input,
       notify: uiContext.notify,
