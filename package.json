@@ -15,7 +15,8 @@
     "deploylocal": "npm run build && rm -rf ~/.pi/extensions/tdd-workflow && ln -sf $(pwd) ~/.pi/extensions/tdd-workflow",
     "start": "node dist/interfaces/mcp/index.js",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "tdd",
