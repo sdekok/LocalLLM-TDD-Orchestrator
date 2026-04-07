@@ -28,6 +28,7 @@ export interface SubAgentOptions {
     input: (prompt: string) => Promise<string | null>;
     notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
   };
+  customTools?: ToolDefinition[];
 }
 
 /**
@@ -106,6 +107,10 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
       },
     };
     customTools = [toolDef];
+  }
+  
+  if (options.customTools) {
+    customTools = [...(customTools || []), ...options.customTools];
   }
 
   // Create the resource loader for the custom prompt.

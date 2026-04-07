@@ -5,6 +5,7 @@ import { ModelRouter } from '../../llm/model-router.js';
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { planProject } from '../../agents/project-planner.js';
+import { performDeepResearch } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
 import * as path from 'path';
 
@@ -150,6 +151,40 @@ export default function(pi: ExtensionAPI) {
         const e = err as Error;
         ctx.ui.notify(`Analysis failed: ${e.message}`, 'error');
       }
+    }
+  });
+
+  pi.registerCommand('research', {
+    description: 'Launch a Deep Research Agent to browse the web and distill knowledge',
+    handler: async (args: string, ctx) => {
+      // Parse background flag
+      let isBackground = false;
+      let topic = args.trim();
+      
+      const bgMatch = topic.match(/\s+(--bg|--background)$/i);
+      if (bgMatch) {
+        isBackground = true;
+        topic = topic.replace(bgMatch[0], '').trim();
+      }
+
+      if (!topic) {
+        topic = await ctx.ui.input('Enter research topic or query (append --bg for background):') || '';
+        if (!topic) return;
+        
+        const lateBgMatch = topic.match(/\s+(--bg|--background)$/i);
+        if (lateBgMatch) {
+          isBackground = true;
+          topic = topic.replace(lateBgMatch[0], '').trim();
+        }
+      }
+
+      const modelRouter = new ModelRouter();
+      const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+
+      await performDeepResearch(topic, ctx.cwd, modelRouter, searchClient, {
+        background: isBackground,
+        uiContext: ctx.ui
+      });
     }
   });
 
