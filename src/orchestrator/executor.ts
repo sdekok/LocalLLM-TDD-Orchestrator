@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { StateManager, WorkflowState } from './state.js';
+import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
 import { runQualityGates, formatGateFailures } from './quality-gates.js';
@@ -170,6 +170,12 @@ export class WorkflowExecutor {
 
         try {
           // 4. Sub-refinement check (Plan the HOW if we only have the WHAT)
+          this.events.emit('taskProgress', { 
+            id: task.id, 
+            attempt, 
+            phase: 'refining',
+            message: 'Refining technical plan for implementation...'
+          });
           let technicalDescription = await this.refineTaskIntoSubtasks(task.id, attempt);
 
           // 1. Create/Reset sandbox branch
@@ -180,7 +186,9 @@ export class WorkflowExecutor {
             id: task.id, 
             attempt, 
             phase: 'implementing',
-            message: 'Agent is implementing (Read -> Test -> Code)...'
+            message: feedback 
+              ? `Addressing feedback from previous attempt (Build -> Test -> Fix)...` 
+              : `Agent is building implementation (Read -> Test -> Code)...`
           });
 
           const implementerSession = await createSubAgentSession({
@@ -211,6 +219,10 @@ export class WorkflowExecutor {
             // Agent finished — it has already modified files in options.cwd via tools
           } finally {
             implementerSession.dispose();
+            // Llama.cpp Slot Cooldown: Give the server time to free the slot and memory
+            // This prevents concurrent memory peaks which can crash large models.
+            logger.info('[EXECUTOR] Implementer disposed. Cooldown for slot recovery...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
           }
 
           // 3. Run Quality Gates (DETERMINISTIC)
@@ -225,10 +237,8 @@ export class WorkflowExecutor {
           if (!qualityReport.allBlockingPassed) {
             feedback = formatGateFailures(qualityReport);
             logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
-            if (originalBranch) {
-              await this.sandbox.rollback(originalBranch);
-            }
-            continue;
+            // Stop and leave code for inspection as requested
+            break; 
           }
 
           // 4. Commit passing code
@@ -267,6 +277,9 @@ export class WorkflowExecutor {
             await reviewerSession.prompt(`Review the implementation for task: ${task.description}`);
           } finally {
             reviewerSession.dispose();
+            // Reviewer slot cooldown
+            logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
+            await new Promise(resolve => setTimeout(resolve, 5000));
           }
 
           // 6. Parse Reviewer Verdict
@@ -277,14 +290,18 @@ export class WorkflowExecutor {
           if (!isApproved) {
             logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
             feedback = reviewerFeedback;
-            if (originalBranch) {
-              await this.sandbox.rollback(originalBranch);
-            }
-            continue;
+            // Stop and leave code for inspection
+            break;
           }
 
           // 7. Approved! Merge and Cleanup.
           approved = true;
+          this.events.emit('taskProgress', { 
+            id: task.id, 
+            attempt, 
+            phase: 'merging',
+            message: 'Review approved! Merging changes into main branch...'
+          });
           await this.sandbox.mergeAndCleanup(branchName, originalBranch);
           this.state.updateSubtask(task.id, {
             status: 'completed',
@@ -300,25 +317,32 @@ export class WorkflowExecutor {
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
-          try { await this.sandbox.rollback(originalBranch); } catch {}
+          break;
         }
       }
 
       if (approved) {
         consecutiveFailures = 0;
       } else {
-        consecutiveFailures++;
+        // Stop all work and notify
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+        const branchName = `tdd-workflow/${task.id.substring(0, 8)}`;
+        const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
+        
         this.events.emit('taskFailed', { 
           id: task.id, 
           task: failedTask,
-          feedback,
-          isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES 
+          feedback: failureMessage,
+          isCircuitBroken: true, // Force stop
+          canRollback: true,
+          originalBranch
         });
+        return; // Exit processQueue immediately
       }
     }
   }
+
 
   /**
    * Refines a task into more granular technical subtasks if it's too high-level.
@@ -346,5 +370,14 @@ export class WorkflowExecutor {
     }
 
     return technicalDescription;
+  }
+
+  /**
+   * Manually rollback a failed task's changes.
+   */
+  public async rollbackTask(originalBranch: string): Promise<void> {
+    const logger = getLogger();
+    logger.info(`Performing manual rollback to branch: ${originalBranch}`);
+    await this.sandbox.rollback(originalBranch);
   }
 }

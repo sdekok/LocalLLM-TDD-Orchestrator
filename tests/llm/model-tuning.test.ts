@@ -48,27 +48,20 @@ function makeTestConfig(): ModelRouterConfig {
 }
 
 describe('Model Tuning and Family Defaults', () => {
-  it('supplies gemma4 defaults when samplingParams is omitted', () => {
+  it('returns empty when samplingParams is omitted', () => {
     const router = new ModelRouter(makeTestConfig());
     const params = router.getSamplingParams('plan');
-    expect(params.temperature).toBe(1.0);
-    expect(params.top_p).toBe(0.95);
-    expect(params.top_k).toBe(64);
+    expect(params.temperature).toBeUndefined();
+    expect(params.top_p).toBeUndefined();
+    expect(params.top_k).toBeUndefined();
   });
 
-  it('supplies qwen thinking defaults', () => {
+  it('preserves empty sampling across families', () => {
     const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('implement');
-    expect(params.temperature).toBe(0.6);
-    expect(params.top_p).toBe(0.95);
-    expect(params.top_k).toBe(20);
-  });
-
-  it('supplies qwen instruct defaults', () => {
-    const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('review');
-    expect(params.temperature).toBe(0.7);
-    expect(params.top_p).toBe(0.8);
+    const thinkParams = router.getSamplingParams('implement');
+    const instructParams = router.getSamplingParams('review');
+    expect(thinkParams.temperature).toBeUndefined();
+    expect(instructParams.temperature).toBeUndefined();
   });
 });
 
@@ -93,27 +86,10 @@ vi.mock('openai', () => {
 });
 
 describe('Model Tuning and Family Defaults', () => {
-  it('supplies gemma4 defaults when samplingParams is omitted', () => {
+  it('returns empty when samplingParams is omitted', () => {
     const router = new ModelRouter(makeTestConfig());
     const params = router.getSamplingParams('plan');
-    expect(params.temperature).toBe(1.0);
-    expect(params.top_p).toBe(0.95);
-    expect(params.top_k).toBe(64);
-  });
-
-  it('supplies qwen thinking defaults', () => {
-    const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('implement');
-    expect(params.temperature).toBe(0.6);
-    expect(params.top_p).toBe(0.95);
-    expect(params.top_k).toBe(20);
-  });
-
-  it('supplies qwen instruct defaults', () => {
-    const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('review');
-    expect(params.temperature).toBe(0.7);
-    expect(params.top_p).toBe(0.8);
+    expect(params.temperature).toBeUndefined();
   });
 });
 
@@ -138,14 +114,14 @@ describe('LLMClient Prompt Mutations', () => {
     expect(args.messages[0].content).toContain('<|think|>\nYou are a helpful assistant.');
   });
 
-  it('floors temperature to 0.6 for qwen thinking models', async () => {
+  it('does NOT floor temperature for qwen thinking models (trusting server)', async () => {
     const router = new ModelRouter(makeTestConfig());
     const client = new LLMClient(router);
     
     await client.askStructured('System', 'User', { type: 'object' }, 'implement', 0.1);
     
     const args = mockCreate.mock.calls[0][0];
-    expect(args.temperature).toBe(0.6); // Should be floored!
+    expect(args.temperature).toBe(0.1); 
   });
 
   it('allows temperature lower than 0.6 for qwen instruct models', async () => {

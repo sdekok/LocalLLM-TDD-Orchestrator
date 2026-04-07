@@ -40,7 +40,7 @@ describe('ProjectPlanSchema', () => {
               title: 'Create login form',
               description: 'Build a login form component',
               acceptance: ['Form submits successfully'],
-              tests: ['Should render login form', 'Should call login API on submit'],
+              tests: ['Should render login form'],
             },
           ],
         },
@@ -218,7 +218,7 @@ describe('Plan File Writing', () => {
               title: 'Login form',
               description: 'Create login',
               acceptance: ['Submits correctly'],
-              tests: [],
+              tests: ['Should send POST to /login'],
             },
           ],
         },
@@ -245,7 +245,7 @@ describe('Plan File Writing', () => {
     expect(epicFiles[1][0]).toContain('epic-02-user-profile.md');
   });
 
-  it('verifies files were created correctly', async () => {
+  it('writes files', async () => {
     const { writePlanFiles } = await import('../../src/agents/project-planner.js');
     
     const plan: ProjectPlan = {
@@ -266,6 +266,7 @@ describe('Plan File Writing', () => {
 
     await expect(writePlanFiles(plan, '/tmp/test')).resolves.not.toThrow();
   });
+
 });
 
 describe('Architectural Decisions Appending', () => {

@@ -189,21 +189,7 @@ export class ModelRouter {
 
   getSamplingParams(taskType: TaskType): SamplingParams {
     const profile = this.selectModel(taskType);
-    const configured = profile.samplingParams || {};
-    
-    // Get family-specific defaults from the tuner registry
-    const tuner = getTuner(profile.modelFamily);
-    const defaults = tuner.getDefaultSampling(profile);
-
-    return {
-      temperature: configured.temperature ?? defaults.temperature,
-      top_p: configured.top_p ?? defaults.top_p,
-      top_k: configured.top_k ?? defaults.top_k,
-      min_p: configured.min_p ?? defaults.min_p,
-      repeat_penalty: configured.repeat_penalty ?? defaults.repeat_penalty,
-      frequency_penalty: configured.frequency_penalty ?? defaults.frequency_penalty,
-      presence_penalty: configured.presence_penalty ?? defaults.presence_penalty
-    };
+    return profile.samplingParams || {};
   }
 
   listModels(): ModelProfile[] {

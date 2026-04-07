@@ -7,7 +7,7 @@ export interface EpicWorkItem {
   description: string;
   acceptance: string[];
   security?: string;
-  tests: string[];
+  tests?: string[];
   devNotes?: string;
 }
 
@@ -83,36 +83,42 @@ export class EpicLoader {
       const id = match[1]!;
       const title = match[2]!;
       
-      // Get block until next header or end of file
+      // Get block until next ### header or --- divider
       const startIdx = match.index + match[0].length;
-      let nextHeaderIdx = content.indexOf('\n###', startIdx);
-      if (nextHeaderIdx === -1) nextHeaderIdx = content.indexOf('\n--', startIdx); // Check for separator
+      let nextHeaderIdx = content.indexOf('\n### ', startIdx);
+      const dividerIdx = content.indexOf('\n---', startIdx);
+      
       if (nextHeaderIdx === -1) nextHeaderIdx = content.length;
+      const endIdx = dividerIdx !== -1 && dividerIdx < nextHeaderIdx ? dividerIdx : nextHeaderIdx;
       
-      const block = content.substring(startIdx, nextHeaderIdx).trim();
+      const blockContent = content.substring(startIdx, endIdx).trim();
       
-      // Breakdown the block
-      const description = block.match(/^\*\*Description\*\*:\s*(.*)/m)?.[1] || "";
+      // Extract sub-fields
+      const descriptionMatch = blockContent.match(/\*\*Description\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const securityMatch = blockContent.match(/\*\*Security Considerations\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const devNotesMatch = blockContent.match(/\*\*Developer Notes\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
       
-      const acceptanceHeader = block.indexOf('**Acceptance Criteria**:');
-      const acceptanceEnd = block.indexOf('**', acceptanceHeader + 24);
-      const acceptanceBlock = acceptanceHeader !== -1 
-        ? block.substring(acceptanceHeader + 24, acceptanceEnd !== -1 ? acceptanceEnd : block.length).trim()
-        : "";
-      const acceptance = acceptanceBlock.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0);
-
-      const security = block.match(/^\*\*Security Considerations\*\*:\s*(.*)/m)?.[1];
+      // Extract lists
+      const acceptanceMatch = blockContent.match(/\*\*Acceptance Criteria\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+      const testsMatch = blockContent.match(/\*\*Recommended Tests\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
       
-      const testsHeader = block.indexOf('**Recommended Tests**:');
-      const testsEnd = block.indexOf('**', testsHeader + 22);
-      const testsBlock = testsHeader !== -1
-        ? block.substring(testsHeader + 22, testsEnd !== -1 ? testsEnd : block.length).trim()
-        : "";
-      const tests = testsBlock.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0);
-
-      const devNotes = block.match(/^\*\*Developer Notes\*\*:\s*(.*)/m)?.[1];
-
-      workItems.push({ id, title, description, acceptance, security, tests, devNotes });
+      const acceptance = acceptanceMatch 
+        ? acceptanceMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
+        : [];
+        
+      const tests = testsMatch
+        ? testsMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
+        : [];
+      
+      workItems.push({ 
+        id, 
+        title, 
+        description: descriptionMatch ? descriptionMatch[1]!.trim() : blockContent,
+        acceptance,
+        security: securityMatch ? securityMatch[1]!.trim() : undefined,
+        tests: tests.length > 0 ? tests : undefined,
+        devNotes: devNotesMatch ? devNotesMatch[1]!.trim() : undefined
+      });
     }
 
     return {
