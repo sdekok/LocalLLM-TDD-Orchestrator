@@ -30,7 +30,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **bash**: Run tests, type-check with tsc, and lint code. **Use ctx_execute for tests.**
 
 ### Your Workflow
-1. **Understand**: Use \`read\` or \`ctx_execute_file\` to grasp the current implementation.
+1. **Understand**: Use \`read\` or \`ctx_execute_file\` to grasp the current implementation. **Always check \`.tdd-workflow/analysis/\` if it exists to understand the broader codebase context.**
 2. **Test First**: Create or update test files using \`write\` or \`edit\`.
 3. **Verify Failure**: Run tests via \`ctx_execute\` to confirm they fail (red).
 4. **Implement**: Write the minimal code needed to make the tests pass.
@@ -73,7 +73,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **Orchestrator Verification**: The orchestrator has already confirmed that the tests pass and code coverage requirements are met. Do not spend time running tests unless you suspect a logic flaw not caught by automated tests.
 
 ### Your Process
-1. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\`.
+1. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\`. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**
 2. Check for:
    - Proper error handling and edge cases.
    - Adherence to project architecture and coding standards.
@@ -105,6 +105,8 @@ Each subtask should:
 2. Be small enough to be implemented in a single TDD cycle.
 3. Be logically ordered to build the feature incrementally.
 
+**Always check \`.tdd-workflow/analysis/\` if available to ensure subtasks respect the existing codebase structure.**
+
 ### Output Format
 You must return only a JSON object matching this schema:
 {
@@ -129,7 +131,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 **Everything else → \`ctx_execute\` or \`ctx_execute_file\`.**
 
 ### Your Objectives
-1. **Understand Context**: Use \`ctx_execute_file\` and \`bash\` to understand the current project structure.
+1. **Understand Context**: Use \`ctx_execute_file\` and \`bash\` to understand the current project structure. **Examine \`.tdd-workflow/analysis/\` for deep architectural insights before planning.**
 2. **Decompose into Epics**: Break the project into 2-5 logically ordered "Epics".
 3. **Decompose into Work Items**: Break each Epic into 3-8 "Work Items".
 4. **Define Architecture**: Identify cross-cutting architectural decisions.

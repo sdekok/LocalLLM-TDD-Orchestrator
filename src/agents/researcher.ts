@@ -19,7 +19,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 3. Inherited tools from the environment (e.g. search, Puppeteer for heavily dynamic JS sites).
 
 ### INSTRUCTIONS
-1. Identify the core components of the user's research topic.
+1. Identify the core components of the user's research topic. **If the topic concerns the internal project codebase, always start by checking \`.tdd-workflow/analysis/\` for existing architectural context.**
 2. Search the web using the available tools (e.g. 'search' or similar MCP tools if available) to find high-quality resources.
 3. Use your reading tools to fetch the content of the most promising 3-5 URLs.
 4. Synthesize the findings into a well-structured Markdown document containing:
