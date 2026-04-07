@@ -74,7 +74,8 @@ Unlike legacy MCP servers, this orchestrator uses **ephemeral agent sessions** (
 
 - **Statefulness**: Within a single "attempt", the Implementer agent can freely read files, run tests, and fix its own errors multiple times before submitting for validation.
 - **Tool Access**: Agents have access to the same native tools as you: `read`, `write`, `edit`, and `bash`.
-- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the error/feedback into the *next* session's system prompt.
+- **MCP Tool Inheritance**: Sub-agents inherit tools from the parent Pi session (via `pi-mcp-adapter`). If you have `context-mode` or `search` installed, the implementer can use them.
+- **Feedback Loop**: If a Reviewer rejects a PR or a Quality Gate fails, the Orchestrator algorithmically templates the failure logs into the *next* session's system prompt.
 
 ## Quality Gates & Coverage
 

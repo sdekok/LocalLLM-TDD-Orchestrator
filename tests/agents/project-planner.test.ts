@@ -218,7 +218,11 @@ describe('Plan File Writing', () => {
               title: 'Login form',
               description: 'Create login',
               acceptance: ['Submits correctly'],
+<<<<<<< HEAD
               tests: ['Should post to /login'],
+=======
+              tests: ['Should send POST to /login'],
+>>>>>>> main
             },
           ],
         },

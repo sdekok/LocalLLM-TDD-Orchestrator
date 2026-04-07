@@ -3,11 +3,7 @@ import { ModelTuner, TunerResult } from './index.js';
 
 export class Gemma4Tuner implements ModelTuner {
   getDefaultSampling(profile: ModelProfile): Partial<SamplingParams> {
-    return {
-      temperature: 1.0,
-      top_p: 0.95,
-      top_k: 64,
-    };
+    return {};
   }
 
   applyTweaks(profile: ModelProfile, systemPrompt: string, currentSampling: SamplingParams): TunerResult {

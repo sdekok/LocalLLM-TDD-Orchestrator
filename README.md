@@ -2,8 +2,10 @@
 
 A deeply integrated, agentic TDD workflow engine for the **Pi Coding Agent**. It replaces rigid JSON-based orchestration with native Pi sub-agent sessions, providing surgical file editing and self-correcting development loops using local or cloud LLMs.
 
-### NEW: World-Class Project Planning
-The orchestrator now features a "World-Class" `/plan` command for deep project decomposition. This generates rich, multi-dimensional `WorkItems/*.md` files including **Acceptance Criteria**, **Security Strategies**, and **Specific Test Cases**. Subsequent `/tdd` runs automatically parse and inject this metadata into the implementation sub-agent, ensuring code adheres to the full scope of the planned requirements.
+### NEW: World-Class Project Planning & MCP
+- **World-Class Planning**: The orchestrator now features a `/plan` command for deep project decomposition. This generates rich, multi-dimensional `WorkItems/*.md` files including **Acceptance Criteria**, **Security Strategies**, and **Specific Test Cases**. Subsequent `/tdd` runs automatically parse and inject this metadata into the implementation sub-agent.
+- **MCP Server Support**: The orchestrator now acts as a standalone **Model Context Protocol (MCP)** server, allowing integration with any MCP IDE.
+- **Tool Discovery**: Sub-agents now automatically inherit and use your installed Pi extensions (like `context-mode`) via the `pi-mcp-adapter`.
 
 ## How It Works (Agentic Mode)
 
@@ -34,8 +36,9 @@ Pi says "/tdd implement JWT auth"
 
 The orchestrator spawns **ephemeral, headless sub-agent sessions** for implementation and review. These agents use Pi's native `read`, `write`, `edit`, and `bash` tools directly on your filesystem. 
 
-- **Self-Healing**: If quality gates fail, the executor rolls back changes and injects feedback into the *next* attempt's system prompt.
+- **Self-Healing**: If quality gates fail, the executor rolls back changes and injects deterministic failure logs into the *next* attempt's system prompt.
 - **Git Sandboxing**: Every subtask runs in an isolated git branch. Only proven, reviewed code is merged.
+- **MCP Tool Discovery**: Sub-agents use the `pi-mcp-adapter` to access external tools, making them capable of using the latest context-gathering libraries.
 - **Deterministic Quality**: While the implementation is agentic, the gates (TSC, Vitest, etc.) are 100% deterministic.
 
 ## Quick Start
@@ -63,9 +66,18 @@ pi install local:.
 
 Inside any project, simply use the slash commands:
 
-- **Plan**: `/plan "Build a secure login system"` (Generates rich Epics with security and test strategies)
-- **Implement**: `/tdd 1` (Loads Epic 01 from `WorkItems/`, parses all metadata, and executes)
-- **Direct**: `/tdd "Add a secure login endpoint"` (On-the-fly planning for simple tasks)
+- **Plan**: `/plan "Build a secure login system"` (Decomposes into Epics/WorkItems with rich metadata)
+- **Implement**: `/tdd 1` (Loads from `WorkItems/`, parses all metadata, and executes)
+- **Status**: `/status` (Check progress of the current workflow)
+- **Analyze**: `/analyze` (Deep architectural blueprinting)
+
+### 4. MCP Server Mode
+
+The orchestrator can also run as a standalone MCP server:
+```bash
+node dist/interfaces/mcp/index.js
+```
+This exposes the core workflows (start, resume, status, analyze) to your MCP client.
 
 ## Safety & Runaway Protection
 

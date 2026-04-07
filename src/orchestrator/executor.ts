@@ -1,5 +1,5 @@
 import { EventEmitter } from 'events';
-import { StateManager, WorkflowState } from './state.js';
+import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
 import { runQualityGates, formatGateFailures } from './quality-gates.js';
@@ -122,7 +122,7 @@ export class WorkflowExecutor {
 
     const resetInterrupted = this.state.resetInterruptedTasks();
     if (resetInterrupted > 0) {
-      logger.info(`Reset ${resetInterrupted} interrupted tasks to pending`);
+      logger.info(`Resume check: Found ${resetInterrupted} tasks already in progress.`);
     }
 
     if (retryFailed) {
@@ -147,8 +147,12 @@ export class WorkflowExecutor {
       if (!task) break;
 
       logger.info(`\n--- Task ${task.id}: ${task.description.substring(0, 80)} ---`);
-      this.state.updateSubtask(task.id, { status: 'in_progress' });
-      this.events.emit('taskStarted', { id: task.id, description: task.description });
+
+      // Only emit taskStarted if we are actually starting fresh
+      if (task.status !== 'in_progress') {
+        this.state.updateSubtask(task.id, { status: 'in_progress' });
+        this.events.emit('taskStarted', { id: task.id, description: task.description });
+      }
 
       const taskStartTime = Date.now();
       const originalBranch = await this.sandbox.getCurrentBranch();
@@ -156,8 +160,8 @@ export class WorkflowExecutor {
       let approved = false;
       let feedback = '';
 
-      // Ephemeral feedback for current task attempts
-      for (let attempt = 1; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
+      const startAttempt = task.attempts || 1;
+      for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
         const elapsed = Date.now() - taskStartTime;
         if (elapsed > 15 * 60 * 1000) { // 15 min total budget per subtask
           logger.error(`Task ${task.id} timed out.`);
@@ -169,163 +173,201 @@ export class WorkflowExecutor {
         this.state.updateSubtask(task.id, { attempts: attempt });
 
         try {
-          // 4. Sub-refinement check (Plan the HOW if we only have the WHAT)
-          let technicalDescription = await this.refineTaskIntoSubtasks(task.id, attempt);
+          let technicalDescription = task.description;
 
-          // 1. Create/Reset sandbox branch
-          await this.sandbox.createBranch(branchName);
-
-          // 2. Implement via Sub-Agent
-          this.events.emit('taskProgress', { 
-            id: task.id, 
-            attempt, 
-            phase: 'implementing',
-            message: 'Agent is implementing (Read -> Test -> Code)...'
-          });
-
-          const finalPrompt = IMPLEMENTER_PROMPT
-            .replace('{acceptance}', task.acceptance?.map(a => `- ${a}`).join('\n') || 'None')
-            .replace('{security}', task.security || 'None')
-            .replace('{tests}', task.tests?.map(t => `- ${t}`).join('\n') || 'None')
-            .replace('{devNotes}', task.devNotes || 'None');
-
-          const implementerSession = await createSubAgentSession({
-            taskType: 'implement',
-            systemPrompt: finalPrompt,
-            cwd: this.state.projectDir,
-            modelRouter: this.modelRouter,
-            feedback: feedback || undefined, // Inject feedback from previous attempt
-          });
-
-          try {
-            await implementerSession.prompt(technicalDescription);
-            // Agent finished — it has already modified files in options.cwd via tools
-          } finally {
-            implementerSession.dispose();
-          }
-
-          // 3. Run Quality Gates (DETERMINISTIC)
-          this.events.emit('taskProgress', { 
-            id: task.id, 
-            attempt, 
-            phase: 'quality-gates',
-            message: 'Verifying implementation (TSC, Tests, Lint)...'
-          });
-          const qualityReport = await runQualityGates(this.state.projectDir);
-
-          if (!qualityReport.allBlockingPassed) {
-            feedback = formatGateFailures(qualityReport);
-            logger.warn(`Quality gates failed for task ${task.id} (Attempt ${attempt}/${MAX_ATTEMPTS}). Retrying with feedback...`);
-            // We NO LONGER rollback here. We stay on the branch so the next attempt can fix the code.
-            continue;
-          }
-
-          // 4. Commit passing code
-          await this.sandbox.commit(`TDD [Attempt ${attempt}]: ${task.description.substring(0, 50)}`, {
-            attempt,
-            gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
-            testMetrics: qualityReport.testMetrics,
-            coverageMetrics: qualityReport.coverageMetrics,
-          });
-
-          // 5. Adversarial Review via Sub-Agent
-          const subtask = task!; // Use ! to satisfy TSC since we know task is not null
-          this.events.emit('taskProgress', { 
-            id: subtask.id, 
-            attempt, 
-            phase: 'review',
-            message: 'Waiting for hostile code review...'
-          });
-
-          const reviewerSession = await createSubAgentSession({
-            taskType: 'review',
-            systemPrompt: REVIEWER_PROMPT,
-            cwd: this.state.projectDir,
-            modelRouter: this.modelRouter,
-            tools: 'readonly'
-          });
-
-          let reviewText = '';
-          try {
-            // Re-subscribe to capture the final message
-            reviewerSession.subscribe((event) => {
-              if (event.type === 'message_end' && event.message.role === 'assistant') {
-                reviewText = event.message.content.find(c => c.type === 'text')?.text || '';
-              }
+          // Phase 1: Refining
+          if (!task.phase || task.phase === 'refining') {
+            this.state.updateSubtask(task.id, { phase: 'refining' });
+            this.events.emit('taskProgress', {
+              id: task.id,
+              attempt,
+              phase: 'refining',
+              message: 'Refining technical plan for implementation...'
             });
-            await reviewerSession.prompt(`Review the implementation for task: ${task.description}`);
-          } finally {
-            reviewerSession.dispose();
+            technicalDescription = await this.refineTaskIntoSubtasks(task.id, attempt);
           }
 
-          // 6. Parse Reviewer Verdict
-          const isApproved = reviewText.includes('APPROVED: true');
-          const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-          const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
+          // Phase 2: Implementing
+          if (!task.phase || task.phase === 'refining' || task.phase === 'implementing') {
+            await this.sandbox.createBranch(branchName);
+            this.state.updateSubtask(task.id, { phase: 'implementing' });
+            this.events.emit('taskProgress', {
+              id: task.id,
+              attempt,
+              phase: 'implementing',
+              message: feedback
+                ? `Addressing feedback from previous attempt (Build -> Test -> Fix)...`
+                : `Agent is building implementation (Read -> Test -> Code)...`
+            });
 
-          if (!isApproved) {
-            logger.info(`Review rejected for task ${task.id}: ${reviewerFeedback.substring(0, 200)}`);
-            feedback = reviewerFeedback;
-            // Again, no rollback. Let the agent fix its current branch.
-            continue;
+            const implementerSession = await createSubAgentSession({
+              taskType: 'implement',
+              systemPrompt: IMPLEMENTER_PROMPT,
+              cwd: this.state.projectDir,
+              modelRouter: this.modelRouter,
+              feedback: feedback || undefined,
+            });
+
+            // Enrich the prompt
+            let implementerPrompt = technicalDescription;
+            if (task.acceptance && task.acceptance.length > 0) {
+              implementerPrompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
+            }
+            if (task.security) {
+              implementerPrompt += `\n\n### Security Requirements\n${task.security}`;
+            }
+            if (task.tests && task.tests.length > 0) {
+              implementerPrompt += `\n\n### Required Tests\n- ${task.tests.join('\n- ')}`;
+            }
+            if (task.devNotes) {
+              implementerPrompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
+            }
+
+            try {
+              await implementerSession.prompt(implementerPrompt);
+            } finally {
+              implementerSession.dispose();
+              logger.info('[EXECUTOR] Implementer disposed. Cooldown for slot recovery...');
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
           }
 
-          // 7. Approved! Merge and Cleanup.
-          approved = true;
-          await this.sandbox.mergeAndCleanup(branchName, originalBranch);
-          this.state.updateSubtask(task.id, {
-            status: 'completed',
-            tests_written: true,
-            code_implemented: true,
-          });
-          logger.info(`Task ${task.id} completed and merged!`);
-          const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
-          if (completedTask) {
-            this.events.emit('taskCompleted', { id: task.id, task: completedTask });
+          // Phase 3: Quality Gates
+          if (!task.phase || task.phase === 'refining' || task.phase === 'implementing' || task.phase === 'quality_gates') {
+            this.state.updateSubtask(task.id, { phase: 'quality_gates' });
+            this.events.emit('taskProgress', {
+              id: task.id,
+              attempt,
+              phase: 'quality-gates',
+              message: 'Verifying implementation (TSC, Tests, Lint)...'
+            });
+            const qualityReport = await runQualityGates(this.state.projectDir);
+
+            if (!qualityReport.allBlockingPassed) {
+              feedback = formatGateFailures(qualityReport);
+              logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
+              this.state.updateSubtask(task.id, { phase: undefined });
+              break;
+            }
+
+            // Commit passing code
+            await this.sandbox.commit(`TDD [Attempt ${attempt}]: ${task.description.substring(0, 50)}`, {
+              attempt,
+              gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
+              testMetrics: qualityReport.testMetrics,
+              coverageMetrics: qualityReport.coverageMetrics,
+            });
+          }
+
+          // Phase 4: Reviewing
+          if (!task.phase || task.phase !== 'merging') {
+            this.state.updateSubtask(task.id, { phase: 'reviewing' });
+            const subtask = task!;
+            this.events.emit('taskProgress', {
+              id: subtask.id,
+              attempt,
+              phase: 'reviewing',
+              message: 'Waiting for hostile code review...'
+            });
+
+            const reviewerSession = await createSubAgentSession({
+              taskType: 'review',
+              systemPrompt: REVIEWER_PROMPT,
+              cwd: this.state.projectDir,
+              modelRouter: this.modelRouter,
+              tools: 'readonly'
+            });
+
+            let reviewText = '';
+            try {
+              reviewerSession.subscribe((event) => {
+                if (event.type === 'message_end' && event.message.role === 'assistant') {
+                  reviewText = event.message.content.find(c => c.type === 'text')?.text || '';
+                }
+              });
+              await reviewerSession.prompt(`Review the implementation for task: ${task.description}`);
+            } finally {
+              reviewerSession.dispose();
+              logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
+              await new Promise(resolve => setTimeout(resolve, 5000));
+            }
+
+            // Parse Reviewer Verdict
+            const isApproved = reviewText.includes('APPROVED: true');
+            const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
+            const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
+
+            if (!isApproved) {
+              logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
+              feedback = reviewerFeedback;
+              this.state.updateSubtask(task.id, { phase: undefined });
+              break;
+            }
+
+            approved = true;
+            this.state.updateSubtask(task.id, { phase: 'merging' });
+          }
+
+          // Phase 5: Merging
+          if (approved || task.phase === 'merging') {
+            this.events.emit('taskProgress', {
+              id: task.id,
+              attempt,
+              phase: 'merging',
+              message: 'Review approved! Merging changes into main branch...'
+            });
+            await this.sandbox.mergeAndCleanup(branchName, originalBranch);
+            this.state.updateSubtask(task.id, {
+              status: 'completed',
+              tests_written: true,
+              code_implemented: true,
+              phase: undefined
+            });
+            logger.info(`Task ${task.id} completed and merged!`);
+            const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+            if (completedTask) {
+              this.events.emit('taskCompleted', { id: task.id, task: completedTask });
+            }
           }
 
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
-          // Persistence: No rollback here.
+          try { await this.sandbox.rollback(originalBranch); } catch { }
         }
       }
 
       if (approved) {
         consecutiveFailures = 0;
       } else {
-        consecutiveFailures++;
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
-        
-        // Critical: Rollback the entire task since all attempts failed.
-        if (originalBranch) {
-          logger.error(`Task ${task.id} failed after ${MAX_ATTEMPTS} attempts. Rolling back changes.`);
-          await this.sandbox.rollback(originalBranch);
-        }
+        const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
 
-        this.events.emit('taskFailed', { 
-          id: task.id, 
+        this.events.emit('taskFailed', {
+          id: task.id,
           task: failedTask,
-          feedback,
-          isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES 
+          feedback: failureMessage,
+          isCircuitBroken: true,
+          canRollback: true,
+          originalBranch
         });
+        return;
       }
     }
   }
 
-  /**
-   * Refines a task into more granular technical subtasks if it's too high-level.
-   */
+  public async rollbackTask(originalBranch: string): Promise<void> {
+    const logger = getLogger();
+    logger.info(`Performing manual rollback to branch: ${originalBranch}`);
+    await this.sandbox.rollback(originalBranch);
+  }
+
   public async refineTaskIntoSubtasks(taskId: string, attempt: number): Promise<string> {
     const logger = getLogger();
     const task = this.state.getSubtask(taskId);
     if (!task) return '';
-
     let technicalDescription = task.description;
-
-    // If the task description is short or lacks technical detail, we run it through the planner again
-    // specifically to get TDD-granular subtasks.
     if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
       logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
       const subPlan = await planAndBreakdown(
@@ -333,12 +375,18 @@ export class WorkflowExecutor {
         this.modelRouter,
         this.searchClient || undefined
       );
-
-      // We combine the refined subtasks into a prompt for the implementer
       technicalDescription = `Task: ${task.description}\n\nTechnical Plan:\n` +
         subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
     }
-
     return technicalDescription;
+  }
+
+  /**
+   * Manually rollback a failed task's changes.
+   */
+  public async rollbackTask(originalBranch: string): Promise<void> {
+    const logger = getLogger();
+    logger.info(`Performing manual rollback to branch: ${originalBranch}`);
+    await this.sandbox.rollback(originalBranch);
   }
 }

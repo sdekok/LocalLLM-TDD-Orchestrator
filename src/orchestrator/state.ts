@@ -3,16 +3,18 @@ import * as path from 'path';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
 
+export type TaskPhase = 'refining' | 'implementing' | 'quality_gates' | 'reviewing' | 'merging';
+
 export interface Subtask {
   id: string;
   description: string;
   status: TaskStatus;
+  phase?: TaskPhase;
   tests_written: boolean;
   code_implemented: boolean;
   attempts: number;
   feedback?: string;
   test_failures?: string;
-  // World-class metadata from planner
   acceptance?: string[];
   security?: string;
   tests?: string[];
@@ -68,14 +70,7 @@ export class StateManager {
     this.saveState();
   }
 
-  setSubtasks(subtasks: { 
-    id: string; 
-    description: string;
-    acceptance?: string[];
-    security?: string;
-    tests?: string[];
-    devNotes?: string;
-  }[]): void {
+  setSubtasks(subtasks: (Partial<Subtask> & { id: string; description: string })[]): void {
     this.state.subtasks = subtasks.map((t) => ({
       ...t,
       status: 'pending' as const,
