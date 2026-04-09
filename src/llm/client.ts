@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import JSON5 from 'json5';
+import { createHash } from 'crypto';
 import { ModelRouter, type TaskType, type ModelProfile } from './model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { getTuner } from './tuners/registry.js';
@@ -16,8 +17,22 @@ export class LLMClient {
 
   private getClient(profile: ModelProfile): OpenAI {
     const baseURL = this.router.getBaseURL(profile);
-    const apiKey = this.router.getApiKey(profile) || 'sk-no-key-required';
-    const cacheKey = `${baseURL}::${apiKey}`;
+    const rawKey = this.router.getApiKey(profile);
+
+    // Only use the placeholder for local providers — cloud providers must have
+    // a real key or getApiKey() will have already thrown.
+    const apiKey = rawKey ?? (profile.provider === 'local' ? 'sk-no-key-required' : undefined);
+    if (!apiKey) {
+      throw new Error(
+        `No API key for "${profile.name}" (provider: ${profile.provider}). ` +
+        `Set the ${profile.apiKeyEnvVar ?? `${profile.provider.toUpperCase()}_API_KEY`} environment variable.`
+      );
+    }
+
+    // Hash the key so the raw secret never lives inside the Map key
+    // (prevents accidental leakage if the Map is logged or inspected).
+    const keyHash = createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+    const cacheKey = `${baseURL}::${keyHash}`;
 
     if (!this.clients.has(cacheKey)) {
       this.clients.set(cacheKey, new OpenAI({ baseURL, apiKey }));
@@ -62,6 +77,12 @@ export class LLMClient {
     const content = response.choices[0]?.message?.content || '';
     return extractJSON<T>(content);
   }
+}
+
+/** Build a Map cache key for an OpenAI client. Exported for unit testing. */
+export function makeCacheKey(baseURL: string, apiKey: string): string {
+  const keyHash = createHash('sha256').update(apiKey).digest('hex').slice(0, 16);
+  return `${baseURL}::${keyHash}`;
 }
 
 export function extractJSON<T>(raw: string): T {

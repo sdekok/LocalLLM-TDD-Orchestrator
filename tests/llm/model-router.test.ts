@@ -153,12 +153,38 @@ describe('Provider-aware routing', () => {
     expect(router.getBaseURL(profile)).toBe('https://custom.api.com/v1');
   });
 
-  it('reads API key from profile', () => {
+  it('reads API key from env var when apiKeyEnvVar is set', () => {
+    const saved = process.env.OPENROUTER_API_KEY;
+    process.env.OPENROUTER_API_KEY = 'sk-env-key';
+    try {
+      const router = new ModelRouter(makeTestConfig());
+      const profile = router.selectModel('research'); // cloud-model → apiKeyEnvVar: 'OPENROUTER_API_KEY'
+      expect(router.getApiKey(profile)).toBe('sk-env-key');
+    } finally {
+      if (saved !== undefined) process.env.OPENROUTER_API_KEY = saved;
+      else delete process.env.OPENROUTER_API_KEY;
+    }
+  });
+
+  it('throws when apiKeyEnvVar is set but the env var is missing', () => {
+    const saved = process.env.OPENROUTER_API_KEY;
+    delete process.env.OPENROUTER_API_KEY;
+    try {
+      const router = new ModelRouter(makeTestConfig());
+      const profile = router.selectModel('research');
+      expect(() => router.getApiKey(profile)).toThrow('OPENROUTER_API_KEY');
+    } finally {
+      if (saved !== undefined) process.env.OPENROUTER_API_KEY = saved;
+    }
+  });
+
+  it('throws for a custom provider with no apiKeyEnvVar configured', () => {
     const config = makeTestConfig();
-    config.models['cloud-model']!.apiKey = 'sk-test-key';
+    config.models['cloud-model']!.provider = 'custom' as any;
+    delete config.models['cloud-model']!.apiKeyEnvVar;
     const router = new ModelRouter(config);
     const profile = router.selectModel('research');
-    expect(router.getApiKey(profile)).toBe('sk-test-key');
+    expect(() => router.getApiKey(profile)).toThrow('apiKeyEnvVar');
   });
 
   it('returns undefined API key for local models', () => {

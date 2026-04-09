@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractJSON } from '../../src/llm/client.js';
+import { extractJSON, makeCacheKey } from '../../src/llm/client.js';
 
 describe('extractJSON', () => {
   it('parses clean JSON directly', () => {
@@ -58,5 +58,39 @@ describe('extractJSON', () => {
 
   it('throws on truncated JSON', () => {
     expect(() => extractJSON('{"name": "test')).toThrow('Could not extract valid JSON');
+  });
+});
+
+// ─── makeCacheKey ──────────────────────────────────────────────────
+
+describe('makeCacheKey', () => {
+  it('does not include the raw API key in the cache key', () => {
+    const key = makeCacheKey('http://localhost:8080/v1', 'sk-my-secret-api-key');
+    expect(key).not.toContain('sk-my-secret-api-key');
+    expect(key).toContain('http://localhost:8080/v1::');
+  });
+
+  it('produces the same key for identical inputs (deterministic)', () => {
+    const k1 = makeCacheKey('http://localhost', 'sk-test');
+    const k2 = makeCacheKey('http://localhost', 'sk-test');
+    expect(k1).toBe(k2);
+  });
+
+  it('produces different keys for different API keys', () => {
+    const k1 = makeCacheKey('http://localhost', 'sk-key1');
+    const k2 = makeCacheKey('http://localhost', 'sk-key2');
+    expect(k1).not.toBe(k2);
+  });
+
+  it('produces different keys for different base URLs', () => {
+    const k1 = makeCacheKey('http://host-a', 'sk-same');
+    const k2 = makeCacheKey('http://host-b', 'sk-same');
+    expect(k1).not.toBe(k2);
+  });
+
+  it('hash segment is exactly 16 hex characters', () => {
+    const key = makeCacheKey('http://localhost', 'sk-test');
+    const hashPart = key.split('::')[1];
+    expect(hashPart).toMatch(/^[0-9a-f]{16}$/);
   });
 });

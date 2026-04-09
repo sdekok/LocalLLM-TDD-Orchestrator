@@ -22,7 +22,8 @@ export interface ModelProfile {
   modelId?: string;              // For cloud providers (e.g., 'google/gemma-3-27b-it')
   provider: ModelProvider;       // 'local' for llama.cpp, 'openrouter' for cloud
   baseURL?: string;              // Override per-model (e.g., 'https://openrouter.ai/api/v1')
-  apiKey?: string;               // API key for cloud providers (or use env var)
+  // apiKey intentionally removed — store secrets only in environment variables.
+  // Use apiKeyEnvVar to name the env var, e.g. 'OPENROUTER_API_KEY'.
   apiKeyEnvVar?: string;         // Environment variable name for API key
   modelFamily?: ModelFamily;     // Model family for auto-tuning defaults and prompt handling
   enableThinking?: boolean;      // Whether to attempt to activate reasoning/thinking mode
@@ -166,15 +167,35 @@ export class ModelRouter {
   }
 
   /**
-   * Get the API key for a cloud model, checking the profile and env vars.
+   * Get the API key for a model.
+   *
+   * Lookup order:
+   * 1. The env var named by `apiKeyEnvVar` (throws if set but variable is unset)
+   * 2. Well-known provider defaults (OPENROUTER_API_KEY, OPENAI_API_KEY)
+   * 3. undefined for local providers
+   *
+   * Throws for non-local providers that have no key configured at all, so
+   * callers get an actionable error instead of a confusing 401.
    */
   getApiKey(profile: ModelProfile): string | undefined {
-    if (profile.apiKey) return profile.apiKey;
-    if (profile.apiKeyEnvVar) return process.env[profile.apiKeyEnvVar];
+    if (profile.apiKeyEnvVar) {
+      const key = process.env[profile.apiKeyEnvVar];
+      if (!key) {
+        throw new Error(
+          `Environment variable "${profile.apiKeyEnvVar}" is not set (required for ${profile.name}). ` +
+          `Set this variable to your API key.`
+        );
+      }
+      return key;
+    }
     // Default env vars per provider
     if (profile.provider === 'openrouter') return process.env['OPENROUTER_API_KEY'];
     if (profile.provider === 'openai') return process.env['OPENAI_API_KEY'];
-    return undefined;
+    if (profile.provider === 'local') return undefined;
+    throw new Error(
+      `No apiKeyEnvVar configured for "${profile.name}" (provider: ${profile.provider}). ` +
+      `Add apiKeyEnvVar to this model profile.`
+    );
   }
 
   /**

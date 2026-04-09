@@ -5,6 +5,19 @@ workflow-state.json
 build_output.txt
 *.log
 
+# Config files that may contain API keys — use env vars (apiKeyEnvVar) instead
+models.config.json
+models.config.local.json
+
+# Environment files
+.env
+.env.*
+.env.local
+
+# Scratch/debug artifacts
+git_status.txt
+merge_results.txt
+
 # .NET build artifacts (CsharpAstAnalyzer)
 src/analysis/tools/CsharpAstAnalyzer/bin/
 src/analysis/tools/CsharpAstAnalyzer/obj/
