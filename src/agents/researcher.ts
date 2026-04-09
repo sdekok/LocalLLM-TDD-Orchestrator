@@ -69,6 +69,18 @@ function formatElapsed(ms: number): string {
   return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 }
 
+/**
+ * Post a progress message to chat history (if available) AND as a notification.
+ * This ensures progress is visible in the scrollable conversation, not just as
+ * ephemeral notifications or status bar updates.
+ */
+function postProgress(options: ResearchOptions, message: string, type: 'info' | 'warning' | 'error' = 'info') {
+  if (options.chatMessage) {
+    options.chatMessage(message);
+  }
+  options.uiContext.notify(message, type);
+}
+
 // ─── Prompts ────────────────────────────────────────────────────────────────
 
 /**
@@ -415,6 +427,11 @@ export interface ResearchOptions {
     setStatus: (id: string, text?: string) => void;
     editor: (label: string, initialText: string) => Promise<string | undefined | null>;
   };
+  /**
+   * Optional callback to post a message into the Pi chat history.
+   * If not provided, messages are only shown via notify/setStatus.
+   */
+  chatMessage?: (content: string) => void;
   /** Use the legacy single-prompt research mode instead of multi-phase deep research. */
   shallow?: boolean;
   /** Time limit for iterative research in minutes (default: 30). */
@@ -591,7 +608,7 @@ async function performMultiPhaseResearch(
 
     logger.info('[RESEARCHER] Round 1, Phase 1: Decomposing topic into research questions');
     options.uiContext.setStatus('research', '📋 Round 1: Decomposing topic into research questions...');
-    options.uiContext.notify('🔬 Deep Research started — Round 1: Identifying research questions...', 'info');
+    postProgress(options, '🔬 Deep Research started — Round 1: Identifying research questions...');
 
     await session.prompt(buildDecompositionPrompt(topic, questionsFile));
 
@@ -619,15 +636,12 @@ async function performMultiPhaseResearch(
       // Check time budget before starting a new round of question research
       if (timeRemaining <= 0) {
         logger.info(`[RESEARCHER] Time limit reached after ${formatElapsed(elapsed)}. Moving to synthesis.`);
-        options.uiContext.notify(`⏰ Time limit reached (${formatElapsed(elapsed)}). Synthesizing findings...`, 'info');
+        postProgress(options, `⏰ Time limit reached (${formatElapsed(elapsed)}). Synthesizing findings...`);
         break;
       }
 
       logger.info(`[RESEARCHER] Round ${round}: ${currentQuestions.length} questions to research (${formatElapsed(timeRemaining)} remaining)`);
-      options.uiContext.notify(
-        `🔄 Round ${round}: Researching ${currentQuestions.length} questions (${formatElapsed(timeRemaining)} remaining)...`,
-        'info'
-      );
+      postProgress(options, `🔄 Round ${round}: Researching ${currentQuestions.length} questions (${formatElapsed(timeRemaining)} remaining)...`);
 
       // Track note files created in this round (for the round summary)
       const roundNoteFiles: string[] = [];
@@ -639,7 +653,7 @@ async function performMultiPhaseResearch(
         const questionElapsed = Date.now() - startTime;
         if (questionElapsed >= timeLimitMs) {
           logger.info(`[RESEARCHER] Time limit reached mid-round at question ${i + 1}/${currentQuestions.length}`);
-          options.uiContext.notify(`⏰ Time limit reached. Stopping at question ${i + 1}/${currentQuestions.length}.`, 'info');
+          postProgress(options, `⏰ Time limit reached. Stopping at question ${i + 1}/${currentQuestions.length}.`);
           break;
         }
 
@@ -653,6 +667,7 @@ async function performMultiPhaseResearch(
           'research',
           `🔍 Round ${round}, Q${i + 1}/${currentQuestions.length}: Researching...`
         );
+        postProgress(options, `📖 Round ${round}, Q${i + 1}/${currentQuestions.length}: Researching — ${question.substring(0, 120)}`);
 
         await session.prompt(
           buildQuestionResearchPrompt(
@@ -699,7 +714,7 @@ async function performMultiPhaseResearch(
 
         logger.info(`[RESEARCHER] Round ${round}: Writing round summary...`);
         options.uiContext.setStatus('research', `📄 Round ${round}: Writing summary of findings...`);
-        options.uiContext.notify(`📄 Round ${round}: Summarizing ${roundQuestionsResearched.length} questions into round summary...`, 'info');
+        postProgress(options, `📄 Round ${round}: Summarizing ${roundQuestionsResearched.length} questions into round summary...`);
 
         await session.prompt(
           buildRoundSummaryPrompt(
@@ -740,7 +755,7 @@ async function performMultiPhaseResearch(
 
       logger.info(`[RESEARCHER] Round ${round}: Reflecting on gaps...`);
       options.uiContext.setStatus('research', `🤔 Round ${round}: Reflecting on research gaps...`);
-      options.uiContext.notify(`🤔 Round ${round} complete. Reflecting on gaps and new leads...`, 'info');
+      postProgress(options, `🤔 Round ${round} complete. Reflecting on gaps and new leads...`);
 
       await session.prompt(
         buildReflectionPrompt(
@@ -762,7 +777,7 @@ async function performMultiPhaseResearch(
         // Check for the "research complete" signal
         if (content.includes('RESEARCH_COMPLETE')) {
           logger.info(`[RESEARCHER] Agent signaled research is complete after round ${round}.`);
-          options.uiContext.notify(`✅ Research complete after round ${round} — no significant gaps found.`, 'info');
+          postProgress(options, `✅ Research complete after round ${round} — no significant gaps found.`);
           break;
         }
         newQuestions = parseResearchQuestions(content);
@@ -770,15 +785,12 @@ async function performMultiPhaseResearch(
 
       if (newQuestions.length === 0) {
         logger.info(`[RESEARCHER] No new questions generated after round ${round}. Moving to synthesis.`);
-        options.uiContext.notify(`✅ No new research leads after round ${round}. Moving to synthesis.`, 'info');
+        postProgress(options, `✅ No new research leads after round ${round}. Moving to synthesis.`);
         break;
       }
 
       logger.info(`[RESEARCHER] ${newQuestions.length} new questions identified for round ${round + 1}`);
-      options.uiContext.notify(
-        `🔍 ${newQuestions.length} new questions identified — starting round ${round + 1}...`,
-        'info'
-      );
+      postProgress(options, `🔍 ${newQuestions.length} new questions identified — starting round ${round + 1}...`);
 
       currentQuestions = newQuestions;
       round++;
@@ -792,10 +804,7 @@ async function performMultiPhaseResearch(
     const totalElapsed = Date.now() - startTime;
     logger.info(`[RESEARCHER] Synthesis phase: ${allNoteFiles.length} note files, ${roundSummaryFiles.length} round summaries from ${round} round(s), elapsed ${formatElapsed(totalElapsed)}`);
     options.uiContext.setStatus('research', '📝 Synthesizing comprehensive final report...');
-    options.uiContext.notify(
-      `📝 Synthesizing ${allQuestionsResearched.length} researched questions from ${round} round(s) into final report...`,
-      'info'
-    );
+    postProgress(options, `📝 Synthesizing ${allQuestionsResearched.length} researched questions from ${round} round(s) into final report...`);
 
     await session.prompt(
       buildSynthesisPrompt(topic, allNoteFiles, roundSummaryFiles, finalReportFile, round, totalElapsed)
@@ -806,19 +815,16 @@ async function performMultiPhaseResearch(
   };
 
   if (options.background) {
-    options.uiContext.notify(
-      `🔬 Deep Research started in the background (time limit: ${options.timeLimitMinutes ?? DEFAULT_TIME_LIMIT_MINUTES}min). You will be notified at each phase.`,
-      'info'
-    );
+    postProgress(options, `🔬 Deep Research started in the background (time limit: ${options.timeLimitMinutes ?? DEFAULT_TIME_LIMIT_MINUTES}min). Progress will appear in chat.`);
 
     runResearch()
       .then(() => {
-        options.uiContext.notify(`🎉 Deep Research on "${topic}" completed! Report saved to ${finalReportFile}.`, 'info');
+        postProgress(options, `🎉 Deep Research on "${topic}" completed! Report saved to ${finalReportFile}.`);
       })
       .catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error(`[RESEARCHER] Deep research failed: ${msg}`);
-        options.uiContext.notify(`Deep Research failed: ${msg}`, 'error');
+        postProgress(options, `Deep Research failed: ${msg}`, 'error');
       })
       .finally(() => {
         options.uiContext.setStatus('research', undefined);
@@ -835,7 +841,7 @@ async function performMultiPhaseResearch(
     await runResearch();
 
     options.uiContext.setStatus('research', undefined);
-    options.uiContext.notify('🎉 Deep Research completed!', 'info');
+    postProgress(options, '🎉 Deep Research completed!');
 
     // Open the final report in editor
     const absPath = path.join(cwd, finalReportFile);
@@ -845,7 +851,7 @@ async function performMultiPhaseResearch(
     }
   } catch (err) {
     options.uiContext.setStatus('research', undefined);
-    options.uiContext.notify(`Deep Research failed: ${(err as Error).message}`, 'error');
+    postProgress(options, `Deep Research failed: ${(err as Error).message}`, 'error');
   } finally {
     session.dispose();
   }

@@ -207,6 +207,12 @@ export default function(pi: ExtensionAPI) {
         shallow: isShallow,
         timeLimitMinutes,
         uiContext: ctx.ui,
+        chatMessage: (content: string) => {
+          pi.sendMessage(
+            { customType: 'research-progress', content, display: true, details: {} },
+            { triggerTurn: false }
+          );
+        },
       });
     }
   });
