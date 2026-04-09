@@ -20,6 +20,13 @@ export default function(pi: ExtensionAPI) {
       if (!stateManager) {
         stateManager = new StateManager(ctx.cwd);
         const modelRouter = new ModelRouter();
+        if (modelRouter.isPassthrough) {
+          ctx.ui.notify(
+            "⚠️  No models.config.json found — using Pi's active model for all TDD sub-agents. " +
+            'Create models.config.json to enable model routing.',
+            'warning'
+          );
+        }
 
         const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
 
@@ -104,6 +111,12 @@ export default function(pi: ExtensionAPI) {
         }
 
         const modelRouter = new ModelRouter();
+        if (modelRouter.isPassthrough) {
+          ctx.ui.notify(
+            "⚠️  No models.config.json found — using Pi's active model for planning.",
+            'warning'
+          );
+        }
         const result = await planProject(args, modelRouter, ctx.cwd, {
           input: async (prompt: string) => {
             const result = await ctx.ui.input(prompt);
@@ -179,6 +192,12 @@ export default function(pi: ExtensionAPI) {
       }
 
       const modelRouter = new ModelRouter();
+      if (modelRouter.isPassthrough) {
+        ctx.ui.notify(
+          "⚠️  No models.config.json found — using Pi's active model for research.",
+          'warning'
+        );
+      }
       const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
 
       await performDeepResearch(topic, ctx.cwd, modelRouter, searchClient, {

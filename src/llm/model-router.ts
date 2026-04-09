@@ -117,26 +117,54 @@ export async function discoverModels(baseURL: string): Promise<string[]> {
   }
 }
 
+/**
+ * Fallback profile used when no models.config.json is present.
+ * In this mode the Pi SDK chooses the active model; the router acts as a no-op.
+ */
+const PASSTHROUGH_PROFILE: ModelProfile = {
+  name: 'Pi Default (passthrough)',
+  ggufFilename: '',
+  provider: 'local',
+  contextWindow: 128_000,
+  maxOutputTokens: 8_192,
+  architecture: 'unknown',
+  speed: 'medium',
+  modelFamily: 'generic',
+  enableThinking: false,
+};
+
 export class ModelRouter {
   private config: ModelRouterConfig;
+  /** True when operating without a models.config.json — defers model selection to Pi. */
+  readonly isPassthrough: boolean;
 
   constructor(config?: ModelRouterConfig | null) {
     if (config) {
       this.config = config;
+      this.isPassthrough = false;
     } else {
       const loaded = loadConfig();
       if (!loaded) {
-        const expectedPath = path.join(process.cwd(), 'models.config.json');
-        throw new Error(
-          `No model configuration found at ${expectedPath}. Run \`npx tsx scripts/setup-wizard.ts\` to create one, ` +
-          'or copy models.config.example.json to models.config.json and edit it.'
+        getLogger().warn(
+          'No models.config.json found — model routing is disabled. ' +
+          "Pi's currently active model will be used for all sub-agents. " +
+          'Run `npx tsx scripts/setup-wizard.ts` to enable model routing.'
         );
+        this.config = { models: {}, routing: {} };
+        this.isPassthrough = true;
+      } else {
+        this.config = loaded;
+        this.isPassthrough = false;
       }
-      this.config = loaded;
     }
   }
 
   selectModel(taskType: TaskType): ModelProfile {
+    // Passthrough mode: no config available, defer to Pi's default model
+    if (this.isPassthrough) {
+      return PASSTHROUGH_PROFILE;
+    }
+
     const modelKey = this.config.routing[taskType];
     if (!modelKey) {
       // For optional roles (design, design_review), fall back to the plan model
