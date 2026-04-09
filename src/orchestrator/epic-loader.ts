@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveContainedPath } from '../utils/path-safety.js';
 
 export interface EpicWorkItem {
   id: string;
@@ -30,11 +31,17 @@ export class EpicLoader {
     const workItemsDir = path.join(this.projectDir, 'WorkItems');
     if (!fs.existsSync(workItemsDir)) return null;
 
+    // Reject traversal attempts early — query must not contain path separators
+    // or dot-sequences that could escape workItemsDir.
+    if (query.includes('/') || query.includes('\\') || query.includes('\0')) {
+      throw new Error(`Invalid query: "${query}" must not contain path separators`);
+    }
+
     const files = fs.readdirSync(workItemsDir).filter(f => f.endsWith('.md'));
-    
-    // Exact filename match
-    if (files.includes(query)) return path.join(workItemsDir, query);
-    if (files.includes(`${query}.md`)) return path.join(workItemsDir, `${query}.md`);
+
+    // Exact filename match — files come from readdirSync so they are safe bare names.
+    if (files.includes(query)) return resolveContainedPath(workItemsDir, query);
+    if (files.includes(`${query}.md`)) return resolveContainedPath(workItemsDir, `${query}.md`);
 
     // Fuzzy match on filename (e.g., "epic-01" or "auth-system")
     const cleanQuery = query.toLowerCase().replace(/[^a-z0-9]/g, '-');
@@ -45,11 +52,11 @@ export class EpicLoader {
       if (idMatch && (idMatch[1] === query || parseInt(idMatch[1]!, 10) === parseInt(query, 10))) return true;
       return cleanFile.includes(cleanQuery);
     });
-    if (fileMatch) return path.join(workItemsDir, fileMatch);
+    if (fileMatch) return resolveContainedPath(workItemsDir, fileMatch);
 
     // Deep search inside files for titles
     for (const file of files) {
-      const fullPath = path.join(workItemsDir, file);
+      const fullPath = resolveContainedPath(workItemsDir, file);
       const content = fs.readFileSync(fullPath, 'utf-8');
       const titleMatch = content.match(/^# Epic:\s*(.*)$/m);
       if (titleMatch && titleMatch[1]?.toLowerCase().includes(query.toLowerCase())) {
@@ -132,7 +139,8 @@ export class EpicLoader {
   }
 
   private extractSection(content: string, name: string): string {
-    const regex = new RegExp(`## ${name}\\s*([\\s\\S]*?)(?=##|$)`, 'i');
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`## ${escapedName}\\s*([\\s\\S]*?)(?=##|$)`, 'i');
     const match = content.match(regex);
     return match ? match[1]!.trim() : '';
   }

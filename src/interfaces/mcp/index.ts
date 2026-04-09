@@ -1,5 +1,6 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import * as fs from 'fs';
 import * as path from 'path';
 import {
   CallToolRequestSchema,
@@ -21,13 +22,37 @@ const server = new Server(
 // Lazy-initialized per project
 const executors = new Map<string, { state: StateManager; executor: WorkflowExecutor; llm: LLMClient }>();
 
+/** File/directory names that indicate a valid project root. */
+const PROJECT_MARKERS = [
+  'package.json', 'tsconfig.json', 'Cargo.toml', 'go.mod',
+  'pyproject.toml', 'setup.py', 'CMakeLists.txt', '.git',
+];
+
 function resolveProjectDir(projectDirArg: string): string {
   let resolved = projectDirArg;
   if (resolved.startsWith('~')) {
     const home = process.env.HOME || process.env.USERPROFILE || '';
     resolved = path.join(home, resolved.slice(1));
   }
-  return path.resolve(resolved);
+  resolved = path.resolve(resolved);
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`Project directory does not exist: ${resolved}`);
+  }
+
+  if (!fs.statSync(resolved).isDirectory()) {
+    throw new Error(`Project path is not a directory: ${resolved}`);
+  }
+
+  const hasMarker = PROJECT_MARKERS.some((m) => fs.existsSync(path.join(resolved, m)));
+  if (!hasMarker) {
+    throw new Error(
+      `"${resolved}" does not appear to be a project directory. ` +
+      `Expected at least one of: ${PROJECT_MARKERS.join(', ')}`
+    );
+  }
+
+  return resolved;
 }
 
 async function getOrCreate(projectDir: string) {

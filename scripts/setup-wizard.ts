@@ -243,8 +243,26 @@ async function main() {
   console.log('\n─── Saving Configuration ─────────────────────────────\n');
   outputPath = await askWithDefault(rl, 'Output path', outputPath);
 
-  fs.writeFileSync(outputPath, JSON.stringify(config, null, 2), 'utf-8');
-  console.log(`\n✅ Configuration written to: ${outputPath}`);
+  const resolvedOutput = path.resolve(outputPath);
+  const cwd = process.cwd();
+  const isOutsideCwd =
+    resolvedOutput !== cwd &&
+    !resolvedOutput.startsWith(cwd + path.sep);
+
+  if (isOutsideCwd) {
+    const confirm = await ask(
+      rl,
+      `\n⚠️  Output path is outside the current directory:\n   ${resolvedOutput}\nWrite here? (y/N): `
+    );
+    if (confirm.toLowerCase() !== 'y') {
+      console.log('\nAborted. No file written.');
+      rl.close();
+      return;
+    }
+  }
+
+  fs.writeFileSync(resolvedOutput, JSON.stringify(config, null, 2), 'utf-8');
+  console.log(`\n✅ Configuration written to: ${resolvedOutput}`);
   console.log(`\nYou can edit this file manually at any time. To re-run this wizard:`);
   console.log(`  npx tsx scripts/setup-wizard.ts\n`);
 

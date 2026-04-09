@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveContainedPath } from '../utils/path-safety.js';
 import { getLogger } from '../utils/logger.js';
 import { LLMClient } from '../llm/client.js';
 import { AnalyzerRegistry, formatMultiAnalysisForPrompt, type AnalysisResult, type AnalyzeOptions } from './types.js';
@@ -37,7 +38,10 @@ export async function analyzeProject(
   const results = await registry.analyzeProject(projectDir, options);
 
   // 2. Persist analysis results
-  const analysisDir = path.join(projectDir, ANALYSIS_DIR);
+  // Defense-in-depth: verify the analysis output directory stays inside projectDir.
+  // ANALYSIS_DIR is a module constant, but an explicit check prevents surprises
+  // if the constant is ever changed to something unexpected.
+  const analysisDir = resolveContainedPath(path.resolve(projectDir), ANALYSIS_DIR);
   fs.mkdirSync(analysisDir, { recursive: true });
 
   for (const result of results) {

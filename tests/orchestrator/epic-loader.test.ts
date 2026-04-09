@@ -106,4 +106,40 @@ Build an authentication system.
     expect(plan.workItems).toHaveLength(1);
     expect(plan.summary).toBe('');
   });
+
+  // ─── Path traversal prevention ────────────────────────────────────
+
+  it('throws for a query containing ../', () => {
+    expect(() => loader.findEpic('../sibling-dir/evil.md')).toThrow();
+  });
+
+  it('throws for a query containing a forward slash', () => {
+    expect(() => loader.findEpic('sub/dir/evil.md')).toThrow();
+  });
+
+  it('throws for a query containing a backslash', () => {
+    expect(() => loader.findEpic('..\\evil.md')).toThrow();
+  });
+
+  it('throws for a query containing a null byte', () => {
+    expect(() => loader.findEpic('epic\x00.md')).toThrow();
+  });
+
+  it('returns null for a query that looks like an absolute path (no WorkItems match)', () => {
+    // /etc/passwd doesn't contain path sep check but does contain '/'
+    expect(() => loader.findEpic('/etc/passwd')).toThrow();
+  });
+
+  it('still finds epics by ID after the traversal guard', () => {
+    const filePath = path.join(workItemsDir, 'epic-01-auth.md');
+    fs.writeFileSync(filePath, sampleEpic);
+    // numeric ID match should still work
+    expect(loader.findEpic('1')).toBe(filePath);
+  });
+
+  it('still finds epics by title after the traversal guard', () => {
+    const filePath = path.join(workItemsDir, 'epic-02-payments.md');
+    fs.writeFileSync(filePath, sampleEpic);
+    expect(loader.findEpic('Auth System')).toBe(filePath);
+  });
 });
