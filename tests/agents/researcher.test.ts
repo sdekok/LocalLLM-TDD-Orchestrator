@@ -6,6 +6,7 @@ import {
   buildResearchPrompt,
   buildDecompositionPrompt,
   buildQuestionResearchPrompt,
+  buildRoundSummaryPrompt,
   buildReflectionPrompt,
   buildSynthesisPrompt,
   parseResearchQuestions,
@@ -180,8 +181,8 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
       uiContext
     });
 
-    // decomposition(1) + 3 questions + reflection(1) + synthesis(1) = 6 prompts
-    expect(mockPrompt).toHaveBeenCalledTimes(6);
+    // decomposition(1) + 3 questions + round_summary(1) + reflection(1) + synthesis(1) = 7 prompts
+    expect(mockPrompt).toHaveBeenCalledTimes(7);
 
     // Verify decomposition prompt
     expect(mockPrompt.mock.calls[0][0]).toContain('Phase 1');
@@ -192,11 +193,16 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
     expect(mockPrompt.mock.calls[2][0]).toContain('Question 2 of 3');
     expect(mockPrompt.mock.calls[3][0]).toContain('Question 3 of 3');
 
+    // Verify round summary prompt
+    expect(mockPrompt.mock.calls[4][0]).toContain('Round 1 Summary');
+
     // Verify reflection prompt
-    expect(mockPrompt.mock.calls[4][0]).toContain('Reflection');
+    expect(mockPrompt.mock.calls[5][0]).toContain('Reflection');
 
     // Verify synthesis prompt
-    expect(mockPrompt.mock.calls[5][0]).toContain('Final Phase: Synthesis');
+    expect(mockPrompt.mock.calls[6][0]).toContain('Final Phase: Synthesis');
+    // Synthesis should reference round summaries
+    expect(mockPrompt.mock.calls[6][0]).toContain('Round summaries');
 
     expect(uiContext.notify).toHaveBeenCalledWith(expect.stringContaining('Deep Research completed'), 'info');
     expect(mockDispose).toHaveBeenCalled();
@@ -226,14 +232,20 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
       uiContext
     });
 
-    // Round 1: decomposition(1) + Q-A(1) + reflection(1)
-    // Round 2: Q-B(1) + reflection(1)
+    // Round 1: decomposition(1) + Q-A(1) + summary(1) + reflection(1) = 4
+    // Round 2: Q-B(1) + summary(1) + reflection(1) = 3
     // Synthesis: 1
-    // Total: 6
-    expect(mockPrompt).toHaveBeenCalledTimes(6);
+    // Total: 8
+    expect(mockPrompt).toHaveBeenCalledTimes(8);
 
-    // Check round 2 question
-    expect(mockPrompt.mock.calls[3][0]).toContain('Follow-up Question B');
+    // Check round 1 summary
+    expect(mockPrompt.mock.calls[2][0]).toContain('Round 1 Summary');
+
+    // Check round 2 question (after decomposition, Q-A, summary, reflection)
+    expect(mockPrompt.mock.calls[4][0]).toContain('Follow-up Question B');
+
+    // Check round 2 summary
+    expect(mockPrompt.mock.calls[5][0]).toContain('Round 2 Summary');
   });
 
   it('stops iterating when no new questions are generated', async () => {
@@ -255,8 +267,8 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
       uiContext
     });
 
-    // decomposition(1) + Q(1) + reflection(1) + synthesis(1) = 4
-    expect(mockPrompt).toHaveBeenCalledTimes(4);
+    // decomposition(1) + Q(1) + summary(1) + reflection(1) + synthesis(1) = 5
+    expect(mockPrompt).toHaveBeenCalledTimes(5);
     expect(uiContext.notify).toHaveBeenCalledWith(
       expect.stringContaining('No new research leads'),
       'info'
@@ -474,35 +486,59 @@ describe('buildQuestionResearchPrompt', () => {
   });
 });
 
+describe('buildRoundSummaryPrompt', () => {
+  it('includes round number, questions, note files, and output path', () => {
+    const p = buildRoundSummaryPrompt(
+      'My Topic',
+      2,
+      ['Q1 question', 'Q2 question'],
+      ['notes/01.md', 'notes/02.md'],
+      'round_02_summary.md',
+    );
+    expect(p).toContain('Round 2 Summary');
+    expect(p).toContain('Q1 question');
+    expect(p).toContain('Q2 question');
+    expect(p).toContain('notes/01.md');
+    expect(p).toContain('round_02_summary.md');
+    expect(p).toContain('Key Findings');
+    expect(p).toContain('Knowledge Gaps');
+  });
+});
+
 describe('buildReflectionPrompt', () => {
-  it('includes round info, questions, and time remaining', () => {
+  it('includes round info, summary file reference, and time remaining', () => {
     const p = buildReflectionPrompt(
       'My Topic',
       2,
       ['Q1', 'Q2'],
       ['notes/01.md', 'notes/02.md'],
+      'round_02_summary.md',
       'new_questions.md',
       600_000, // 10 minutes
     );
     expect(p).toContain('Round 2');
-    expect(p).toContain('Q1');
-    expect(p).toContain('Q2');
     expect(p).toContain('10m');
+    expect(p).toContain('round_02_summary.md');
+    expect(p).toContain('Knowledge Gaps');
     expect(p).toContain('new_questions.md');
     expect(p).toContain('RESEARCH_COMPLETE');
   });
 });
 
 describe('buildSynthesisPrompt', () => {
-  it('includes all note files and report structure', () => {
+  it('includes round summaries, note files, and report structure', () => {
     const p = buildSynthesisPrompt(
       'My Topic',
       ['notes/01.md', 'notes/02.md'],
+      ['round_01_summary.md', 'round_02_summary.md'],
       'Research/report.md',
       2,
       300_000, // 5 minutes
     );
     expect(p).toContain('Final Phase: Synthesis');
+    expect(p).toContain('Round summaries');
+    expect(p).toContain('round_01_summary.md');
+    expect(p).toContain('round_02_summary.md');
     expect(p).toContain('notes/01.md');
     expect(p).toContain('notes/02.md');
     expect(p).toContain('Research/report.md');

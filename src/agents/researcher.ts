@@ -178,6 +178,7 @@ export function buildDecompositionPrompt(topic: string, questionsFile: string): 
 
 /**
  * Build a Phase 2 prompt: deep-dive a single research question.
+ * The notes file must be a self-contained, readable markdown document.
  */
 export function buildQuestionResearchPrompt(
   questionNumber: number,
@@ -194,7 +195,7 @@ export function buildQuestionResearchPrompt(
     '',
     `**Current research question:** ${question}`,
     '',
-    '### Instructions',
+    '### Research Instructions',
     '',
     '1. **Search broadly** — Use at least 2-3 different search queries to explore this question from multiple angles',
     '2. **Read deeply** — Fetch and thoroughly read at least 3-5 high-quality sources (official docs, blog posts, papers, GitHub repos)',
@@ -206,25 +207,99 @@ export function buildQuestionResearchPrompt(
     '   - Trade-offs, pros/cons of different approaches',
     '   - Common pitfalls and how to avoid them',
     '',
-    `5. **Write detailed notes** to **${notesFile}** with:`,
-    '   - A summary of findings for this question',
-    '   - All specific details, code examples, and data gathered',
-    '   - Source URLs for every piece of information',
-    '   - Any open sub-questions or areas that need further investigation',
+    '### Documentation Instructions',
     '',
-    'Be thorough — this is the research phase where depth matters most.',
+    `Write a **detailed, self-contained markdown document** to **${notesFile}**.`,
+    '',
+    'The file MUST follow this structure:',
+    '',
+    `# Q${questionNumber}: ${question}`,
+    '',
+    '## Answer Summary',
+    '> 2-3 paragraph summary that directly answers the question with concrete specifics.',
+    '',
+    '## Detailed Findings',
+    '> For each major finding or approach discovered:',
+    '> ### [Finding/Approach Name]',
+    '> - What it is and how it works (with specifics)',
+    '> - Code examples (actual code from sources, not pseudocode)',
+    '> - Configuration or setup steps',
+    '> - Limitations or caveats',
+    '> - Source: [URL]',
+    '',
+    '## Comparison of Approaches (if applicable)',
+    '> Table or structured comparison of different options found.',
+    '',
+    '## Open Questions',
+    '> Any sub-questions or areas that need deeper investigation.',
+    '',
+    '## Sources',
+    '> Numbered list of all URLs consulted, with a one-line description of what each contained.',
+    '',
+    '**IMPORTANT**: The notes file should be detailed enough to stand on its own — someone reading it should understand the complete answer without needing to do further research on this question. Write paragraphs, not bullet-point stubs.',
   ].join('\n');
 }
 
 /**
- * Build the reflection prompt: after researching all questions in a round,
- * ask the agent to identify gaps and generate new follow-up questions.
+ * Build the round summary prompt: after researching all questions in a round,
+ * produce a readable summary markdown file that captures the round's findings.
+ */
+export function buildRoundSummaryPrompt(
+  topic: string,
+  round: number,
+  roundQuestions: string[],
+  roundNoteFiles: string[],
+  summaryFile: string,
+): string {
+  const safeTopic = sanitizeTopic(topic);
+  return [
+    `## Round ${round} Summary`,
+    '',
+    `**Topic:** ${safeTopic}`,
+    '',
+    `You just finished researching the following questions in round ${round}:`,
+    ...roundQuestions.map((q, i) => `${i + 1}. ${q}`),
+    '',
+    `Your per-question notes are in: ${roundNoteFiles.join(', ')}`,
+    '',
+    '### Instructions',
+    '',
+    `**Read each notes file** listed above, then write a round summary to **${summaryFile}**.`,
+    '',
+    'The summary MUST follow this structure:',
+    '',
+    `# Research Round ${round} Summary`,
+    `> Topic: ${safeTopic}`,
+    '',
+    '## Questions Investigated',
+    '> Numbered list of the questions explored in this round.',
+    '',
+    '## Key Findings',
+    '> For EACH question, write 1-2 paragraphs summarizing the detailed answer found.',
+    '> Include the most important specifics: concrete recommendations, code patterns,',
+    '> version numbers, trade-offs. Reference the per-question notes file for full details.',
+    '',
+    '## Emerging Themes',
+    '> Cross-cutting patterns or insights that span multiple questions.',
+    '',
+    '## Knowledge Gaps',
+    '> Areas where the research was thin, contradictory, or incomplete.',
+    '> These may become follow-up questions in the next round.',
+    '',
+    '**IMPORTANT**: This summary should be a complete, readable document. Someone reading only this file should get a solid understanding of what was learned in this round.',
+  ].join('\n');
+}
+
+/**
+ * Build the reflection prompt: after the round summary, identify gaps
+ * and generate new follow-up questions for the next round.
  */
 export function buildReflectionPrompt(
   topic: string,
   round: number,
   questionsResearched: string[],
   noteFiles: string[],
+  roundSummaryFile: string,
   newQuestionsFile: string,
   timeRemainingMs: number,
 ): string {
@@ -236,36 +311,34 @@ export function buildReflectionPrompt(
     `**Topic:** ${safeTopic}`,
     `**Time remaining:** ${timeRemaining}`,
     '',
-    `You have researched the following questions so far:`,
-    ...questionsResearched.map((q, i) => `${i + 1}. ${q}`),
-    '',
-    `Your notes are stored in: ${noteFiles.join(', ')}`,
+    `You have researched ${questionsResearched.length} questions across ${round} round(s).`,
+    `Your round ${round} summary is in **${roundSummaryFile}**.`,
     '',
     '### Instructions',
     '',
-    'Review your research notes and identify **gaps, contradictions, or new areas** that emerged during research:',
+    `Re-read **${roundSummaryFile}** (especially the "Knowledge Gaps" section), then:`,
     '',
-    '1. **Read through all your notes files** to refresh your understanding of what you found',
-    '2. **Identify gaps** — What important aspects of the topic are NOT yet covered?',
-    '3. **Spot contradictions** — Did different sources disagree? What needs clarification?',
-    '4. **Find new leads** — Did your research reveal sub-topics or related areas worth investigating?',
-    '5. **Check depth** — Are there questions where you only found surface-level info and need to dig deeper?',
+    '1. **Identify gaps** — What important aspects of the topic are NOT yet covered?',
+    '2. **Spot contradictions** — Did different sources disagree? What needs clarification?',
+    '3. **Find new leads** — Did your research reveal sub-topics or related areas worth investigating?',
+    '4. **Check depth** — Are there questions where you only found surface-level info and need to dig deeper?',
     '',
     `If you identify new questions worth investigating, write them as a numbered list to **${newQuestionsFile}**.`,
     'Format: `N. [Question text] — [What specifically to investigate]`',
     '',
-    `If you believe the research is comprehensive and no significant gaps remain, write an empty file to **${newQuestionsFile}** with just the text: "RESEARCH_COMPLETE — No significant gaps identified."`,
+    `If you believe the research is comprehensive and no significant gaps remain, write to **${newQuestionsFile}** just the text: "RESEARCH_COMPLETE — No significant gaps identified."`,
     '',
     'Be honest about gaps — it is better to identify them now than to produce a shallow final report.',
   ].join('\n');
 }
 
 /**
- * Build the Phase 3 prompt: synthesize all findings into the final report.
+ * Build the Final Phase prompt: synthesize all findings into the final report.
  */
 export function buildSynthesisPrompt(
   topic: string,
   allNoteFiles: string[],
+  roundSummaryFiles: string[],
   finalReportFile: string,
   totalRounds: number,
   elapsedMs: number,
@@ -279,10 +352,15 @@ export function buildSynthesisPrompt(
     `**Research rounds completed:** ${totalRounds}`,
     `**Total research time:** ${elapsed}`,
     '',
-    `You have completed ${totalRounds} round(s) of iterative deep research. Your detailed per-question notes are in:`,
+    `You have completed ${totalRounds} round(s) of iterative deep research.`,
+    '',
+    '**Round summaries** (read these first for an overview):',
+    ...roundSummaryFiles.map(f => `- **${f}**`),
+    '',
+    '**Detailed per-question notes** (reference these for specifics):',
     ...allNoteFiles.map(f => `- **${f}**`),
     '',
-    '**Read ALL of the note files above**, then synthesize your findings into a comprehensive, implementation-ready report.',
+    '**Read ALL round summary files and per-question note files**, then synthesize your findings into a comprehensive, implementation-ready report.',
     '',
     `**Write the final report to: ${finalReportFile}**`,
     '',
@@ -294,12 +372,13 @@ export function buildSynthesisPrompt(
     '   - Detailed answer with specifics (not vague summaries)',
     '   - Code examples, configuration snippets, API details where relevant',
     '   - Trade-offs and recommendations',
+    '   - Write in full paragraphs — this should read like a technical report, not a bullet list',
     '',
     '3. **Implementation Guide** — Actionable steps to apply the findings:',
     '   - Recommended approach with justification',
     '   - Step-by-step implementation plan',
     '   - Configuration and setup details',
-    '   - Code examples',
+    '   - Code examples (actual working code, not stubs)',
     '',
     '4. **Comparison Matrix** (if applicable) — Table comparing options/approaches across key dimensions',
     '',
@@ -308,9 +387,10 @@ export function buildSynthesisPrompt(
     '6. **References** — All source URLs organized by topic, with brief description of each',
     '',
     '### Quality Standards',
-    '- Every claim must be backed by a specific source',
-    '- Include actual code examples, not pseudocode (where available from sources)',
+    '- Every claim must be backed by a specific source URL',
+    '- Include actual code examples, not pseudocode (copy from sources where available)',
     '- Be specific about versions, configurations, and requirements',
+    '- Write in full paragraphs with detailed explanations, not terse bullet points',
     '- The report should be detailed enough that someone could implement the recommendations without further research',
     '- Integrate findings from ALL rounds — later rounds may refine or correct earlier findings',
   ].join('\n');
@@ -492,6 +572,7 @@ async function performMultiPhaseResearch(
   const runResearch = async () => {
     const allQuestionsResearched: string[] = [];
     const allNoteFiles: string[] = [];
+    const roundSummaryFiles: string[] = [];
     let round = 0;
     let currentQuestions: string[] = [];
 
@@ -539,6 +620,10 @@ async function performMultiPhaseResearch(
         'info'
       );
 
+      // Track note files created in this round (for the round summary)
+      const roundNoteFiles: string[] = [];
+      const roundQuestionsResearched: string[] = [];
+
       // ── Phase 2: Deep-dive each question in this round ──
       for (let i = 0; i < currentQuestions.length; i++) {
         // Check time budget before each question
@@ -571,10 +656,34 @@ async function performMultiPhaseResearch(
         );
 
         allNoteFiles.push(notesFile);
+        roundNoteFiles.push(notesFile);
         allQuestionsResearched.push(question);
+        roundQuestionsResearched.push(question);
       }
 
       logger.info(`[RESEARCHER] Round ${round} research complete. Total questions researched: ${allQuestionsResearched.length}`);
+
+      // ── Round Summary: produce a readable summary of this round's findings ──
+      const summaryElapsed = Date.now() - startTime;
+      if (summaryElapsed < timeLimitMs && roundNoteFiles.length > 0) {
+        const summaryFile = `${baseDir}/round_${String(round).padStart(2, '0')}_summary.md`;
+
+        logger.info(`[RESEARCHER] Round ${round}: Writing round summary...`);
+        options.uiContext.setStatus('research', `📄 Round ${round}: Writing summary of findings...`);
+        options.uiContext.notify(`📄 Round ${round}: Summarizing ${roundQuestionsResearched.length} questions into round summary...`, 'info');
+
+        await session.prompt(
+          buildRoundSummaryPrompt(
+            topic,
+            round,
+            roundQuestionsResearched,
+            roundNoteFiles,
+            summaryFile,
+          )
+        );
+
+        roundSummaryFiles.push(summaryFile);
+      }
 
       // Check time budget before reflection
       const reflectionElapsed = Date.now() - startTime;
@@ -585,6 +694,7 @@ async function performMultiPhaseResearch(
       }
 
       // ── Reflection: identify gaps and new questions ──
+      const roundSummaryFile = roundSummaryFiles[roundSummaryFiles.length - 1] ?? '';
       const newQuestionsFile = `${baseDir}/round_${String(round + 1).padStart(2, '0')}_questions.md`;
 
       logger.info(`[RESEARCHER] Round ${round}: Reflecting on gaps...`);
@@ -597,6 +707,7 @@ async function performMultiPhaseResearch(
           round,
           allQuestionsResearched,
           allNoteFiles,
+          roundSummaryFile,
           newQuestionsFile,
           reflectionTimeRemaining,
         )
@@ -638,7 +749,7 @@ async function performMultiPhaseResearch(
 
     // ── Final Phase: Synthesize into comprehensive report ──
     const totalElapsed = Date.now() - startTime;
-    logger.info(`[RESEARCHER] Synthesis phase: ${allNoteFiles.length} note files from ${round} round(s), elapsed ${formatElapsed(totalElapsed)}`);
+    logger.info(`[RESEARCHER] Synthesis phase: ${allNoteFiles.length} note files, ${roundSummaryFiles.length} round summaries from ${round} round(s), elapsed ${formatElapsed(totalElapsed)}`);
     options.uiContext.setStatus('research', '📝 Synthesizing comprehensive final report...');
     options.uiContext.notify(
       `📝 Synthesizing ${allQuestionsResearched.length} researched questions from ${round} round(s) into final report...`,
@@ -646,7 +757,7 @@ async function performMultiPhaseResearch(
     );
 
     await session.prompt(
-      buildSynthesisPrompt(topic, allNoteFiles, finalReportFile, round, totalElapsed)
+      buildSynthesisPrompt(topic, allNoteFiles, roundSummaryFiles, finalReportFile, round, totalElapsed)
     );
 
     const finalElapsed = Date.now() - startTime;
