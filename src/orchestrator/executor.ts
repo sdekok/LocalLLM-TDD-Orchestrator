@@ -10,6 +10,7 @@ import { EpicLoader, EpicPlan } from './epic-loader.js';
 import { createSubAgentSession } from '../subagent/factory.js';
 import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
+import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 
 export interface ExecutorOptions {
   searchClient?: SearchClient | null;
@@ -22,7 +23,6 @@ const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, i
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
 const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
 
-// TODO: Wire up outputSimilarity for loop detection in the TDD cycle.
 /**
  * Detect if two strings are suspiciously similar (agent is looping).
  * Uses a simple character-level comparison — fast and good enough for code output.
@@ -163,6 +163,7 @@ export class WorkflowExecutor {
       let approved = false;
       let feedback = '';
 
+      let lastAttemptDiff = '';
       const startAttempt = task.attempts || 1;
       for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
         const elapsed = Date.now() - taskStartTime;
@@ -209,6 +210,12 @@ export class WorkflowExecutor {
               cwd: this.state.projectDir,
               modelRouter: this.modelRouter,
               feedback: feedback || undefined,
+              taskMetadata: {
+                acceptance: task.acceptance,
+                security: task.security,
+                tests: task.tests,
+                devNotes: task.devNotes,
+              },
             });
 
             // Enrich the prompt
@@ -233,6 +240,36 @@ export class WorkflowExecutor {
               logger.info('[EXECUTOR] Implementer disposed. Cooldown for slot recovery...');
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
+
+            // Capture diff for loop detection
+            let currentDiff = '';
+            try {
+              const { stdout } = await execFileAsync('git', ['diff', 'HEAD'], {
+                cwd: this.state.projectDir,
+                timeout: 10_000,
+                maxBuffer: DEFAULT_MAX_BUFFER,
+              });
+              currentDiff = stdout;
+            } catch {
+              // Non-fatal — skip loop detection if diff fails
+            }
+
+            if (lastAttemptDiff && currentDiff) {
+              const similarity = outputSimilarity(lastAttemptDiff, currentDiff);
+              if (similarity > SIMILARITY_THRESHOLD) {
+                logger.warn(`Loop detected: attempt ${attempt} output is ${(similarity * 100).toFixed(0)}% similar to previous attempt. Bailing early.`);
+                feedback = `Agent is producing nearly identical output across attempts (${(similarity * 100).toFixed(0)}% similarity). Manual intervention required.`;
+                this.events.emit('taskProgress', {
+                  id: task.id,
+                  attempt,
+                  phase: 'implementing',
+                  message: `⚠️ Loop detected — agent is repeating itself. ${feedback}`,
+                  isError: true,
+                });
+                break;
+              }
+            }
+            lastAttemptDiff = currentDiff;
           }
 
           // Phase 3: Quality Gates

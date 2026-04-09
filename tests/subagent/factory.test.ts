@@ -29,6 +29,10 @@ vi.mock('@mariozechner/pi-coding-agent', () => {
     DefaultResourceLoader,
     createCodingTools: vi.fn().mockReturnValue([]),
     createReadOnlyTools: vi.fn().mockReturnValue([]),
+    createBashTool: vi.fn().mockReturnValue({}),
+    createGrepTool: vi.fn().mockReturnValue({}),
+    createFindTool: vi.fn().mockReturnValue({}),
+    createLsTool: vi.fn().mockReturnValue({}),
   };
 });
 

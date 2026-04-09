@@ -1,9 +1,12 @@
-import { 
-  createAgentSession, 
-  SessionManager, 
+import {
+  createAgentSession,
+  SessionManager,
   createCodingTools,
   createReadOnlyTools,
   createBashTool,
+  createGrepTool,
+  createFindTool,
+  createLsTool,
   DefaultResourceLoader,
   type AgentSession,
   type ToolDefinition,
@@ -24,6 +27,13 @@ export interface SubAgentOptions {
   cwd: string;
   modelRouter: ModelRouter;
   feedback?: string;
+  /** Task metadata from Epic/WorkItem — populates system prompt placeholders */
+  taskMetadata?: {
+    acceptance?: string[];
+    security?: string;
+    tests?: string[];
+    devNotes?: string;
+  };
   tools?: 'coding' | 'review' | 'readonly' | 'none';
   // Optional: UI context for interactive tools (e.g., ask_user_for_clarification)
   uiContext?: {
@@ -62,6 +72,14 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   
   const finalPrompt = tunedPrompt.replace('{feedbackContext}', feedbackContext);
 
+  // Populate task metadata placeholders from Epic/WorkItem context
+  const meta = options.taskMetadata;
+  const populatedPrompt = finalPrompt
+    .replace('{acceptance}', meta?.acceptance?.length ? meta.acceptance.map(a => `- ${a}`).join('\n') : 'None specified')
+    .replace('{security}', meta?.security || 'None specified')
+    .replace('{tests}', meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
+    .replace('{devNotes}', meta?.devNotes || 'None specified');
+
   // Map ModelProfile to Pi's Model format
   // Note: Pi's Model type matches our Profile's provider/id structure
   const piModel: Model<any> = {
@@ -74,8 +92,10 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   } as any;
 
   logger.info(`Spawning sub-agent [${options.taskType}] with model: ${piModel.id}`);
-  logger.info(`[SUBAGENT FACTORY] System prompt length: ${finalPrompt.length} characters`);
-  logger.info(`[SUBAGENT FACTORY] System prompt preview: ${finalPrompt.substring(0, 200)}...`);
+  // Rough token estimate for context budget monitoring (1 token ≈ 4 chars for English)
+  const estimatedTokens = Math.ceil(populatedPrompt.length / 4);
+  logger.info(`[SUBAGENT FACTORY] System prompt: ~${estimatedTokens} tokens (${populatedPrompt.length} chars)`);
+  logger.info(`[SUBAGENT FACTORY] System prompt preview: ${populatedPrompt.substring(0, 200)}...`);
 
   // Build the tools list
   let baseTools: any[];
@@ -87,11 +107,12 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     // Reviewer: read-only tools + bash for running tests/inspecting, but no write/edit
     baseTools = [...createReadOnlyTools(options.cwd), createBashTool(options.cwd)];
   } else {
-    baseTools = createCodingTools(options.cwd);
+    // Coding: full editing tools + search tools for code navigation
+    baseTools = [...createCodingTools(options.cwd), createGrepTool(options.cwd), createFindTool(options.cwd), createLsTool(options.cwd)];
   }
 
   logger.info(`[SUBAGENT FACTORY] Tools loaded: ${options.tools || 'coding'}`);
-  logger.info(`[SUBAGENT FACTORY] Final prompt (first 500 chars):\n${finalPrompt.substring(0, 500)}...`);
+  logger.info(`[SUBAGENT FACTORY] Final prompt (first 500 chars):\n${populatedPrompt.substring(0, 500)}...`);
 
   // Add custom tools if uiContext is provided (for interactive planning)
   let customTools: ToolDefinition[] | undefined;
@@ -127,7 +148,7 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   
   const loader = new DefaultResourceLoader({
     additionalExtensionPaths: extensionPaths,
-    systemPromptOverride: () => finalPrompt,
+    systemPromptOverride: () => populatedPrompt,
     appendSystemPromptOverride: () => [],
     noExtensions: false,
     noSkills: false,

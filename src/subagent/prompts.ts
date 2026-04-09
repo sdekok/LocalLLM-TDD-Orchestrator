@@ -42,6 +42,19 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 5. **Verify Success**: Run tests again using \`ctx_execute\`.
 6. **Refactor**: Clean up and ensure all tests continue to pass.
 
+### Requirements & Context
+**Acceptance Criteria**:
+{acceptance}
+
+**Security Requirements**:
+{security}
+
+**Recommended Tests**:
+{tests}
+
+**Dev Notes**:
+{devNotes}
+
 ### Feedback Handling
 {feedbackContext}
 
