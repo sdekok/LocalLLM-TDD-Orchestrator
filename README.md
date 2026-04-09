@@ -21,8 +21,9 @@ Pi says "/tdd implement JWT auth"
           ▼
    ┌─────────────┐     ┌───────────────────┐
    │ Implementer  │ ──▶ │  Quality Gates     │
-   │ (Sub-Agent)  │     │  tsc → tests       │
-   └──────┬──────┘     │  → lint            │
+   │ (Sub-Agent)  │     │  lens (Type/AST)   │
+   └──────┬──────┘     │  tsc → tests       │
+          │             │  → lint            │
           │             │  + test metrics     │
           │             │  + coverage         │
           │             └──────┬────────────┘
@@ -116,7 +117,7 @@ Every merge commit includes quality gate results, test counts, and reviewer feed
 TDD: Create JWT token generation
 
 ---
-Quality Gates: ✅ typescript, ✅ tests, ⚠️ lint
+Quality Gates: ✅ lens, ✅ typescript, ✅ tests, ⚠️ lint
 Tests: 47/47 passed
 Coverage: 87.3% lines, 72.1% branches, 91.0% functions
 Reviewer Score: 17/20

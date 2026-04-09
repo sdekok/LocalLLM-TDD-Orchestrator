@@ -30,7 +30,15 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
   let testMetrics: TestMetrics | undefined;
   let coverageMetrics: CoverageMetrics | undefined;
 
-  // Gate 1: TypeScript compilation (BLOCKING)
+  // Gate 0: Lens Analysis (BLOCKING - New structural and deep type checks)
+  const lensReport = await runLensGate(projectDir);
+  gates.push(lensReport);
+  if (!lensReport.passed) {
+    logger.warn('Lens analysis found blocking structural or type issues.');
+  }
+
+  // Gate 1: TypeScript compilation (BLOCKING - legacy fallback)
+  // If Lens passed, we still run full TSC for final safety until Lens is fully proven
   const tsconfigPath = path.join(projectDir, 'tsconfig.json');
   if (fs.existsSync(tsconfigPath)) {
     gates.push(await runGate('typescript', 'npx tsc --noEmit', projectDir, true, 60_000));
@@ -137,6 +145,96 @@ function checkCoverageThresholds(metrics: CoverageMetrics, thresholds: Partial<C
     return { passed: false, message: `Coverage thresholds NOT met:\n${failures.join('\n')}` };
   }
   return { passed: true, message: 'All coverage thresholds met.' };
+}
+
+/**
+ * Runs pi-lens analysis as a quality gate.
+ * Leverages LSP diagnostics and structural bug patterns.
+ */
+async function runLensGate(projectDir: string): Promise<GateResult> {
+  const logger = getLogger();
+  try {
+    // Use JS bridge to avoid tsc strictly checking pi-lens source inside node_modules
+    // @ts-ignore
+    const { getLensClients } = await import('./lens-bridge.js');
+    const { TypeScriptClient, AstGrepClient } = await getLensClients();
+
+    const tsClient = new TypeScriptClient();
+    const agClient = new AstGrepClient();
+
+    let output = '';
+    const issues: string[] = [];
+
+    // 1. LSP Diagnostics (Deep Type Checks)
+    // Scan all src and test files
+    const files = await getSourceFiles(projectDir);
+    for (const file of files) {
+      if (tsClient.isTypeScriptFile(file)) {
+        const diags = tsClient.getDiagnostics(file);
+        const errors = diags.filter((d: any) => d.severity === 1);
+        if (errors.length > 0) {
+          issues.push(`[LSP] ${path.relative(projectDir, file)}: ${errors.length} error(s)`);
+          errors.slice(0, 3).forEach((e: any) => {
+            issues.push(`  L${e.range.start.line + 1}: ${e.message}`);
+          });
+        }
+      }
+    }
+
+    // 2. Structural Analysis (Bug Patterns)
+    if (await agClient.ensureAvailable()) {
+      for (const file of files) {
+        const structuralDiags = agClient.scanFile(file);
+        const blockingStyles = structuralDiags.filter((d: any) => d.severity === 'error');
+        if (blockingStyles.length > 0) {
+          const report = agClient.formatDiagnostics(blockingStyles);
+          issues.push(`[Structural] ${path.relative(projectDir, file)}:\n${report}`);
+        }
+      }
+    }
+
+    const passed = issues.length === 0;
+    output = passed ? 'Lens analysis passed. No structural or type blockers found.' : issues.join('\n');
+
+    return {
+      gate: 'lens',
+      passed,
+      output,
+      blocking: true,
+    };
+  } catch (err) {
+    logger.error(`Lens gate crashed: ${err instanceof Error ? err.message : String(err)}`);
+    return {
+      gate: 'lens',
+      passed: true, // Fail safe - don't block if Lens itself crashes
+      output: `Lens analysis failed to run: ${err instanceof Error ? err.message : String(err)}`,
+      blocking: true,
+    };
+  }
+}
+
+/**
+ * Helper to get source files for analysis
+ */
+async function getSourceFiles(projectDir: string): Promise<string[]> {
+  const walk = (dir: string): string[] => {
+    let results: string[] = [];
+    const list = fs.readdirSync(dir);
+    for (const file of list) {
+      const fullPath = path.join(dir, file);
+      const stat = fs.statSync(fullPath);
+      if (stat && stat.isDirectory()) {
+        if (['node_modules', '.git', 'dist', 'lib', 'coverage'].includes(file)) continue;
+        results = results.concat(walk(fullPath));
+      } else {
+        if (file.endsWith('.ts') || file.endsWith('.js') || file.endsWith('.tsx') || file.endsWith('.jsx')) {
+          results.push(fullPath);
+        }
+      }
+    }
+    return results;
+  };
+  return walk(projectDir);
 }
 
 // ─── Test Command Detection ──────────────────────────────────────

@@ -94,6 +94,7 @@ The orchestrator does **not** ask an AI if the code is good enough. Instead, it 
 
 | Gate | Type | What It Checks |
 |---|---|---|
+| **Lens Analysis** | Blocking | structural bugs (ast-grep) + deep type errors (LSP) |
 | **TypeScript** | Blocking | `npx tsc --noEmit` — any type errors fail the gate |
 | **Tests** | Blocking | Auto-detects test framework and runs the suite |
 | **Coverage** | Blocking | Enforces line/function/branch thresholds defined in `package.json` |

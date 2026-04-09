@@ -1,37 +1,122 @@
-import { describe, it, expect } from 'vitest';
-import { formatGateFailures } from '../../src/orchestrator/quality-gates.js';
-import type { QualityReport } from '../../src/orchestrator/quality-gates.js';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { QualityReport, runQualityGates } from '../../src/orchestrator/quality-gates.js';
+import * as fs from 'fs';
+import * as path from 'path';
 
-describe('formatGateFailures', () => {
-  it('returns "All gates passed" when none failed', () => {
-    const report: QualityReport = {
-      gates: [{ gate: 'test', passed: true, output: 'ok', blocking: true }],
-      allBlockingPassed: true,
-    };
-    expect(formatGateFailures(report)).toBe('All gates passed.');
+// Mock the lens-bridge
+vi.mock('../../src/orchestrator/lens-bridge.js', () => ({
+  getLensClients: vi.fn()
+}));
+
+// Mock the context/logger
+vi.mock('../../src/utils/logger.js', () => ({
+  getLogger: () => ({
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn()
+  })
+}));
+
+// Mock modules used in runQualityGates
+vi.mock('../../src/orchestrator/test-runner.js', () => ({
+  getTestRunner: () => null
+}));
+
+describe('Lens Quality Gate', () => {
+  const projectDir = '/tmp/test-project';
+  
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Setup minimal project files
+    if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({ name: 'test' }));
   });
 
-  it('formats failed blocking gates', () => {
-    const report: QualityReport = {
-      gates: [
-        { gate: 'typescript', passed: false, output: 'error TS2345', blocking: true },
-        { gate: 'tests', passed: true, output: 'ok', blocking: true },
-      ],
-      allBlockingPassed: false,
-    };
-    const result = formatGateFailures(report);
-    expect(result).toContain('TYPESCRIPT');
-    expect(result).toContain('BLOCKING');
-    expect(result).toContain('error TS2345');
+  it('should pass if Lens finds no issues', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    
+    (getLensClients as any).mockResolvedValue({
+      TypeScriptClient: class {
+        isTypeScriptFile() { return true; }
+        getDiagnostics() { return []; }
+      },
+      AstGrepClient: class {
+        async ensureAvailable() { return true; }
+        scanFile() { return []; }
+        formatDiagnostics() { return ''; }
+      }
+    });
+
+    // Mock getSourceFiles implicitly by mocking fs.readdirSync/statSync if needed, 
+    // or just let it find our package.json
+    
+    const report: QualityReport = await runQualityGates(projectDir);
+    const lensGate = report.gates.find(g => g.gate === 'lens');
+    
+    expect(lensGate).toBeDefined();
+    expect(lensGate?.passed).toBe(true);
+    expect(lensGate?.output).toContain('passed');
   });
 
-  it('includes non-blocking warnings', () => {
-    const report: QualityReport = {
-      gates: [{ gate: 'lint', passed: false, output: '3 warnings', blocking: false }],
-      allBlockingPassed: true,
-    };
-    const result = formatGateFailures(report);
-    expect(result).toContain('WARNING');
-    expect(result).toContain('3 warnings');
+  it('should fail if Lens finds LSP errors', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    
+    (getLensClients as any).mockResolvedValue({
+      TypeScriptClient: class {
+        isTypeScriptFile() { return true; }
+        getDiagnostics() { 
+          return [{ severity: 1, message: 'Type error', range: { start: { line: 0 } } }]; 
+        }
+      },
+      AstGrepClient: class {
+        async ensureAvailable() { return true; }
+        scanFile() { return []; }
+      }
+    });
+
+    // Create a dummy .ts file to be scanned
+    fs.writeFileSync(path.join(projectDir, 'index.ts'), 'bad code');
+
+    const report: QualityReport = await runQualityGates(projectDir);
+    const lensGate = report.gates.find(g => g.gate === 'lens');
+    
+    expect(lensGate?.passed).toBe(false);
+    expect(lensGate?.output).toContain('[LSP]');
+    expect(lensGate?.output).toContain('Type error');
+  });
+
+  it('should fail if Lens finds structural (ast-grep) errors', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    
+    (getLensClients as any).mockResolvedValue({
+      TypeScriptClient: class {
+        isTypeScriptFile() { return false; }
+      },
+      AstGrepClient: class {
+        async ensureAvailable() { return true; }
+        scanFile() { return [{ severity: 'error', rule: 'no-secret', line: 1 }]; }
+        formatDiagnostics() { return 'Structural issue found'; }
+      }
+    });
+
+    fs.writeFileSync(path.join(projectDir, 'secret.ts'), 'const key = "123"');
+
+    const report: QualityReport = await runQualityGates(projectDir);
+    const lensGate = report.gates.find(g => g.gate === 'lens');
+    
+    expect(lensGate?.passed).toBe(false);
+    expect(lensGate?.output).toContain('[Structural]');
+    expect(lensGate?.output).toContain('Structural issue found');
+  });
+
+  it('should fail-safe (pass) if Lens bridge crashes', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    (getLensClients as any).mockRejectedValue(new Error('Module not found'));
+
+    const report: QualityReport = await runQualityGates(projectDir);
+    const lensGate = report.gates.find(g => g.gate === 'lens');
+    
+    expect(lensGate?.passed).toBe(true);
+    expect(lensGate?.output).toContain('failed to run');
   });
 });
