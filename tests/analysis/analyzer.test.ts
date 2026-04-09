@@ -247,3 +247,56 @@ describe('Analysis persistence', () => {
     expect(loadCachedAnalysis(projectDir)).toBeNull();
   });
 });
+
+describe('TypeScriptAnalyzer — cycle detection DFS', () => {
+  let projectDir: string;
+  let analyzer: TypeScriptAnalyzer;
+
+  beforeEach(() => {
+    projectDir = path.join(os.tmpdir(), `ts-cycle-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(path.join(projectDir, 'src'), { recursive: true });
+    analyzer = new TypeScriptAnalyzer();
+
+    fs.writeFileSync(path.join(projectDir, 'tsconfig.json'), JSON.stringify({
+      compilerOptions: { target: 'ES2022', module: 'ESNext', moduleResolution: 'bundler', strict: true },
+      include: ['src'],
+    }));
+    fs.writeFileSync(path.join(projectDir, 'package.json'), JSON.stringify({ name: 'cycle-test', main: 'src/a.ts' }));
+  });
+
+  afterEach(() => {
+    if (projectDir && fs.existsSync(projectDir)) {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  it('detects a direct circular dependency (A -> B -> A)', async () => {
+    // Use .ts specifiers so the resolved paths match the source file relPaths
+    // (the analyzer keeps extension from import specifier in the `to` field)
+    fs.writeFileSync(path.join(projectDir, 'src', 'a.ts'), [
+      'import { b } from "./b.ts";',
+      'export const a = "a";',
+    ].join('\n'));
+    fs.writeFileSync(path.join(projectDir, 'src', 'b.ts'), [
+      'import { a } from "./a.ts";',
+      'export const b = "b";',
+    ].join('\n'));
+
+    const result = await analyzer.analyze(projectDir);
+    expect(result.circularDependencies.length).toBeGreaterThan(0);
+  });
+
+  it('reports no cycles for acyclic imports', async () => {
+    // A imports B, no cycle
+    fs.writeFileSync(path.join(projectDir, 'src', 'a.ts'), [
+      'import { b } from "./b.ts";',
+      'export const a = b + "a";',
+    ].join('\n'));
+    fs.writeFileSync(path.join(projectDir, 'src', 'b.ts'), [
+      'export const b = "b";',
+    ].join('\n'));
+
+    const result = await analyzer.analyze(projectDir);
+    expect(result.circularDependencies).toHaveLength(0);
+  });
+});

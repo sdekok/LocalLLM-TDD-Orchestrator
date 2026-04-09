@@ -2,6 +2,38 @@ import { ProjectPlanSchema, type ProjectPlan } from '../project-plan-schema.js';
 import { InvalidJsonError, SchemaValidationError, NoResponseError } from '../errors/planner-errors.js';
 
 /**
+ * Scans text character-by-character to extract the outermost valid JSON object.
+ * Skips invalid candidates and returns the first one that parses successfully.
+ * Returns null if no valid JSON object is found.
+ */
+export function extractOutermostJSON(text: string): string | null {
+  let depth = 0;
+  let start = -1;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === '{') {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && start !== -1) {
+        const candidate = text.slice(start, i + 1);
+        try {
+          JSON.parse(candidate);
+          return candidate;
+        } catch {
+          // Not valid JSON, reset and keep scanning
+          start = -1;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
  * Extracts and validates a ProjectPlan from an agent's text response.
  */
 export function extractPlanFromResponse(text: string): ProjectPlan {
@@ -20,24 +52,16 @@ export function extractPlanFromResponse(text: string): ProjectPlan {
     }
   }
 
-  // Fallback: try to find the last large balanced JSON-like string if no blocks worked
+  // Fallback: use bracket-balanced JSON extraction
   if (!parsed) {
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
+    const jsonStr = extractOutermostJSON(text);
+    if (jsonStr) {
       try {
-        parsed = JSON.parse(jsonMatch[0]);
+        parsed = JSON.parse(jsonStr);
       } catch (err) {
         lastParserError = err as Error;
       }
     }
-  }
-
-  // Final fallback: try extracting the first object (non-greedy, but naive)
-  if (!parsed) {
-     const firstMatch = text.match(/\{[\s\S]*?\}/);
-     if (firstMatch) {
-       try { parsed = JSON.parse(firstMatch[0]); } catch(e) {}
-     }
   }
 
   if (!parsed) {

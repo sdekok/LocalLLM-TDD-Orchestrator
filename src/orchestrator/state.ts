@@ -1,5 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
+import { getLogger } from '../utils/logger.js';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
 
@@ -45,19 +47,33 @@ export class StateManager {
       try {
         const raw = fs.readFileSync(this.stateFile, 'utf-8');
         return JSON.parse(raw) as WorkflowState;
-      } catch {
-        // Corrupt file — start fresh
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          return { original_request: '', refined_request: '', subtasks: [] };
+        }
+        // Corrupt file — back it up and start fresh
+        const backupPath = `${this.stateFile}.corrupt.${Date.now()}`;
+        try { fs.renameSync(this.stateFile, backupPath); } catch {}
+        getLogger().warn(`State file was corrupt; backed up to ${backupPath}`);
       }
     }
     return { original_request: '', refined_request: '', subtasks: [] };
   }
 
   saveState(): void {
-    fs.writeFileSync(this.stateFile, JSON.stringify(this.state, null, 2), 'utf-8');
+    const data = JSON.stringify(this.state, null, 2);
+    const tmpPath = `${this.stateFile}.${randomBytes(4).toString('hex')}.tmp`;
+    try {
+      fs.writeFileSync(tmpPath, data, 'utf-8');
+      fs.renameSync(tmpPath, this.stateFile);
+    } catch (err) {
+      try { fs.unlinkSync(tmpPath); } catch {}
+      throw err;
+    }
   }
 
   getState(): WorkflowState {
-    return this.state;
+    return structuredClone(this.state);
   }
 
   initWorkflow(request: string): void {
@@ -94,6 +110,8 @@ export class StateManager {
     if (task) {
       Object.assign(task, updates);
       this.saveState();
+    } else {
+      getLogger().warn(`updateSubtask: unknown task id "${id}"`);
     }
   }
 

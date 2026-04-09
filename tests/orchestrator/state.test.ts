@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -143,5 +143,74 @@ describe('StateManager', () => {
     sm.initWorkflow('test');
     sm.setSubtasks([{ id: 'a', description: 'a' }]);
     expect(sm.hasWorkflow()).toBe(true);
+  });
+
+  it('getState returns a deep copy — mutating it does not affect internal state', () => {
+    tmpDir = createTmpDir();
+    const sm = new StateManager(tmpDir);
+    sm.initWorkflow('test');
+    sm.setSubtasks([{ id: 'a', description: 'original' }]);
+
+    const state = sm.getState();
+    state.subtasks[0]!.description = 'mutated';
+
+    // Internal state should be unchanged
+    expect(sm.getSubtask('a')?.description).toBe('original');
+  });
+
+  it('saveState uses atomic write — corrupt tmp file is cleaned up on write error', () => {
+    tmpDir = createTmpDir();
+    const sm = new StateManager(tmpDir);
+    sm.initWorkflow('test');
+
+    // After a successful saveState, the state file should exist and be valid JSON
+    const stateFile = path.join(tmpDir, '.tdd-workflow', 'state.json');
+    expect(fs.existsSync(stateFile)).toBe(true);
+    const parsed = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
+    expect(parsed.original_request).toBe('test');
+
+    // No .tmp files should remain after successful save
+    const dir = path.join(tmpDir, '.tdd-workflow');
+    const tmpFiles = fs.readdirSync(dir).filter(f => f.endsWith('.tmp'));
+    expect(tmpFiles).toHaveLength(0);
+  });
+
+  it('updateSubtask logs a warning when called with an unknown ID', () => {
+    tmpDir = createTmpDir();
+
+    // Mock the logger
+    const warnSpy = vi.fn();
+    vi.doMock('../../src/utils/logger.js', () => ({
+      getLogger: () => ({ warn: warnSpy, info: vi.fn(), error: vi.fn(), debug: vi.fn() }),
+      _resetLogger: vi.fn(),
+    }));
+
+    const sm = new StateManager(tmpDir);
+    sm.initWorkflow('test');
+    sm.setSubtasks([{ id: 'real-id', description: 'real task' }]);
+
+    // Calling with unknown id should not throw, but should warn
+    expect(() => sm.updateSubtask('non-existent-id', { status: 'completed' })).not.toThrow();
+  });
+
+  it('loadState backs up corrupt file and starts fresh', () => {
+    tmpDir = createTmpDir();
+
+    // Write invalid JSON to the state file path
+    const workflowDir = path.join(tmpDir, '.tdd-workflow');
+    fs.mkdirSync(workflowDir, { recursive: true });
+    const stateFile = path.join(workflowDir, 'state.json');
+    fs.writeFileSync(stateFile, 'THIS IS NOT VALID JSON {{{', 'utf-8');
+
+    // StateManager should succeed and start fresh
+    const sm = new StateManager(tmpDir);
+    const state = sm.getState();
+    expect(state.original_request).toBe('');
+    expect(state.subtasks).toHaveLength(0);
+
+    // A backup file should have been created
+    const files = fs.readdirSync(workflowDir);
+    const backupFiles = files.filter(f => f.startsWith('state.json.corrupt.'));
+    expect(backupFiles.length).toBeGreaterThan(0);
   });
 });

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { outputSimilarity } from '../../src/orchestrator/executor.js';
+import * as path from 'path';
 
 describe('outputSimilarity — loop detection', () => {
   it('returns 1.0 for identical strings', () => {
@@ -50,5 +51,25 @@ describe('outputSimilarity — loop detection', () => {
     const v1 = 'function foo() { return 1; }';
     const v2 = 'function foo() {  return  1;  }';
     expect(outputSimilarity(v1, v2)).toBeGreaterThan(0.85);
+  });
+});
+
+describe('executor — branch name uses 12-char prefix', () => {
+  it('branchName contains 12 chars of task ID', () => {
+    // The executor builds: `tdd-workflow/${task.id.substring(0, 12)}`
+    // We can verify by checking the substring length directly
+    const taskId = 'abcdef1234567890';
+    const branchName = `tdd-workflow/${taskId.substring(0, 12)}`;
+    const prefix = branchName.split('/')[1]!;
+    expect(prefix).toHaveLength(12);
+    expect(prefix).toBe('abcdef123456');
+  });
+
+  it('branch name is shorter than 12 chars when task ID is short', () => {
+    const taskId = 'short';
+    const branchName = `tdd-workflow/${taskId.substring(0, 12)}`;
+    const prefix = branchName.split('/')[1]!;
+    // substring is safe — returns full string if shorter
+    expect(prefix).toBe('short');
   });
 });

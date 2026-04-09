@@ -94,8 +94,8 @@ export class CSharpAnalyzer implements CodeAnalyzer {
 
       const result = JSON.parse(stdout) as AnalysisResult;
       
-      // Calculate circular dependencies algorithmically
-      result.circularDependencies = this.detectCircularDependencies(result);
+      // C# namespace-level circular dep detection not yet implemented
+      result.circularDependencies = [];
       
       return result;
     } catch (err: any) {
@@ -104,21 +104,4 @@ export class CSharpAnalyzer implements CodeAnalyzer {
     }
   }
 
-  private detectCircularDependencies(result: AnalysisResult): string[][] {
-    const graph = new Map<string, Set<string>>();
-    
-    // Build adjacency list
-    for (const edge of result.dependencyGraph) {
-      if (edge.isExternal) continue;
-      
-      const from = edge.from;
-      if (!graph.has(from)) graph.set(from, new Set());
-      
-      // edge.to in C# might contain comma separated namespaces, but we want file-to-file
-      // Since C# imports are namespaces, it's hard to track file-to-file circular deps perfectly without symbol resolution.
-      // We will skip file-to-file circular mapping for C# unless we resolve namespace to file.
-    }
-    
-    return [];
-  }
 }

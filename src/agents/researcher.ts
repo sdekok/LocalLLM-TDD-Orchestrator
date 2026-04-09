@@ -138,17 +138,23 @@ export async function performDeepResearch(
   if (options.background) {
     options.uiContext.notify('Deep Research started in the background. You will be notified when complete.', 'info');
     
-    sessionP.then(async (session) => {
-      try {
-        const outFileName = buildResearchOutputPath(cwd, topic);
-        await session.prompt(buildResearchPrompt(topic, outFileName));
-        options.uiContext.notify(`Deep Research on "${topic}" completed! Saved to ${outFileName}.`, 'info');
-      } catch (err) {
-        options.uiContext.notify(`Deep Research on "${topic}" failed: ${(err as Error).message}`, 'error');
-      } finally {
-        session.dispose();
-      }
-    });
+    sessionP
+      .then(async (session) => {
+        try {
+          const outFileName = buildResearchOutputPath(cwd, topic);
+          await session.prompt(buildResearchPrompt(topic, outFileName));
+          options.uiContext.notify(`Deep Research on "${topic}" completed! Saved to ${outFileName}.`, 'info');
+        } catch (err) {
+          options.uiContext.notify(`Deep Research on "${topic}" failed: ${(err as Error).message}`, 'error');
+        } finally {
+          session.dispose();
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        getLogger().error(`Failed to create research sub-agent session: ${msg}`);
+        options.uiContext.notify(`Research session failed to start: ${msg}`, 'error');
+      });
     
     return;
   }

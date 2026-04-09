@@ -388,7 +388,7 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
   }
 
   /**
-   * Detect circular dependencies using DFS.
+   * Detect circular dependencies using three-state DFS.
    */
   private findCircularDependencies(imports: ImportEdge[]): string[][] {
     const graph = new Map<string, string[]>();
@@ -399,33 +399,30 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
     }
 
     const cycles: string[][] = [];
-    const visited = new Set<string>();
-    const inStack = new Set<string>();
+    const state = new Map<string, 'unvisited' | 'in-progress' | 'done'>();
+    for (const node of graph.keys()) state.set(node, 'unvisited');
 
-    const dfs = (node: string, stack: string[]) => {
-      if (inStack.has(node)) {
-        // Found a cycle
-        const cycleStart = stack.indexOf(node);
-        if (cycleStart !== -1) {
-          cycles.push(stack.slice(cycleStart).concat(node));
-        }
-        return;
-      }
-      if (visited.has(node)) return;
-
-      visited.add(node);
-      inStack.add(node);
+    const dfs = (node: string, stack: string[]): void => {
+      state.set(node, 'in-progress');
       stack.push(node);
 
-      for (const neighbor of graph.get(node) || []) {
-        dfs(neighbor, [...stack]);
+      for (const neighbor of graph.get(node) ?? []) {
+        const ns = state.get(neighbor);
+        if (ns === undefined) continue; // neighbor not in graph
+        if (ns === 'in-progress') {
+          const cycleStart = stack.indexOf(neighbor);
+          cycles.push(stack.slice(cycleStart));
+        } else if (ns === 'unvisited') {
+          dfs(neighbor, stack);
+        }
       }
 
-      inStack.delete(node);
+      stack.pop();
+      state.set(node, 'done');
     };
 
     for (const node of graph.keys()) {
-      dfs(node, []);
+      if (state.get(node) === 'unvisited') dfs(node, []);
     }
 
     return cycles;

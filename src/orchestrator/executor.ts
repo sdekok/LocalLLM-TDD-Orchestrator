@@ -156,16 +156,16 @@ export class WorkflowExecutor {
 
       const taskStartTime = Date.now();
       const originalBranch = await this.sandbox.getCurrentBranch();
-      const branchName = `tdd-workflow/${task.id.substring(0, 8)}`;
+      const branchName = `tdd-workflow/${task.id.substring(0, 12)}`;
       let approved = false;
       let feedback = '';
 
       const startAttempt = task.attempts || 1;
       for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
         const elapsed = Date.now() - taskStartTime;
-        if (elapsed > 15 * 60 * 1000) { // 15 min total budget per subtask
+        if (elapsed > MAX_TASK_DURATION_MS) { // MAX_TASK_DURATION_MS total budget per subtask
           logger.error(`Task ${task.id} timed out.`);
-          feedback = `Task exceeded time budget of 15 minutes`;
+          feedback = `Task exceeded time budget of ${MAX_TASK_DURATION_MS / 60000} minutes`;
           break;
         }
 
@@ -374,6 +374,7 @@ export class WorkflowExecutor {
       if (approved) {
         consecutiveFailures = 0;
       } else {
+        consecutiveFailures++;
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
@@ -386,7 +387,6 @@ export class WorkflowExecutor {
           canRollback: true,
           originalBranch
         });
-        return;
       }
     }
   }
