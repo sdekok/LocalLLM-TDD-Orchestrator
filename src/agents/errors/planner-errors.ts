@@ -10,9 +10,9 @@ export class PlannerError extends Error {
   constructor(
     message: string,
     public readonly code: string,
-    public readonly cause?: Error
+    cause?: Error
   ) {
-    super(message);
+    super(message, { cause });
     this.name = 'PlannerError';
   }
 }

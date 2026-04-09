@@ -72,7 +72,6 @@ export class EpicLoader {
    */
   parseEpic(filePath: string): EpicPlan {
     const content = fs.readFileSync(filePath, 'utf-8');
-    const lines = content.split('\n');
 
     const title = content.match(/^# Epic:\s*(.*)$/m)?.[1] || path.basename(filePath, '.md');
     

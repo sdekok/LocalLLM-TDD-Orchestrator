@@ -6,8 +6,6 @@ import { ModelRouter, type TaskType, type ModelProfile } from './model-router.js
 import { getLogger } from '../utils/logger.js';
 import { getTuner } from './tuners/registry.js';
 
-const DEFAULT_TIMEOUT_MS = 60_000; // 1 minute for planning
-
 export class LLMClient {
   private clients = new Map<string, OpenAI>();
   public router: ModelRouter;

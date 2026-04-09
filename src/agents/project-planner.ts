@@ -3,6 +3,9 @@ import { PROJECT_PLANNER_PROMPT } from '../subagent/prompts.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { ProjectPlanSchema, type ProjectPlan } from './project-plan-schema.js';
+import { generatePlanMarkdown } from './components/markdown-generator.js';
+export { generatePlanMarkdown };
+export { extractPlanFromResponse } from './components/response-extractor.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -112,20 +115,18 @@ export async function planProject(
     logger.info(`Assistant text preview (first 200 chars): ${assistantText.substring(0, 200)}`);
     logger.info(`All message types in session: ${messages.map((m: any) => m.role).join(', ')}`);
     logger.info(`--- END PLANNER DETAILS ---`);
-    console.log(`[DEBUG] Planner session completed. Total messages: ${messages.length}`);
-    console.log(`[DEBUG] Last assistant response length: ${assistantText.length}`);
-    console.log(`[DEBUG] Last assistant raw message content:`, JSON.stringify(lastAssistantMessage.content, null, 2));
-    console.log(`[DEBUG] Checking all assistant messages:`);
+    logger.debug(`[DEBUG] Planner session completed. Total messages: ${messages.length}`);
+    logger.debug(`[DEBUG] Last assistant response length: ${assistantText.length}`);
+    logger.debug(`[DEBUG] Last assistant raw message content: ${JSON.stringify(lastAssistantMessage.content, null, 2)}`);
+    logger.debug(`[DEBUG] Checking all assistant messages:`);
     assistantMessages.forEach((msg, idx) => {
-      console.log(`  Assistant message ${idx}:`);
-      console.log(`    Full message object keys:`, Object.keys(msg));
-      console.log(`    Message JSON:`, JSON.stringify(msg, (key, value) => {
-        // Limit string lengths in output
+      logger.debug(`  Assistant message ${idx}: Full message object keys: ${Object.keys(msg).join(', ')}`);
+      logger.debug(`  Message JSON: ${JSON.stringify(msg, (key, value) => {
         if (typeof value === 'string' && value.length > 500) {
           return value.substring(0, 500) + '... (truncated)';
         }
         return value;
-      }, 2));
+      }, 2)}`);
     });
 
     // Parse and validate the JSON
@@ -140,7 +141,7 @@ export async function planProject(
       plan = ProjectPlanSchema.parse(parsed);
     } catch (err) {
       const e = err as Error;
-      console.error('[DEBUG] Failed to parse plan JSON:', e.message);
+      logger.debug(`[DEBUG] Failed to parse plan JSON: ${e.message}`);
       throw new Error(`Invalid plan format: ${e.message}. Raw output:\n${assistantText.substring(0, 500)}`);
     }
 
@@ -183,28 +184,6 @@ export async function planProject(
   } finally {
     session.dispose();
   }
-}
-
-/**
- * Generates a markdown representation of the plan for user review.
- */
-export function generatePlanMarkdown(plan: ProjectPlan): string {
-  let md = `# Plan Summary: ${plan.summary}\n\n`;
-  md += `The following epics and workitems will be created/updated:\n\n`;
-
-  plan.epics.forEach((epic, idx) => {
-    md += `- **Epic ${idx + 1}: ${epic.title}** (${epic.slug})\n`;
-    epic.workItems.forEach(wi => {
-      md += `  - [ ] ${wi.id}: ${wi.title}\n`;
-    });
-  });
-
-  md += `\n### Architectural Decisions\n`;
-  plan.architecturalDecisions.forEach(dec => {
-    md += `- ${dec}\n`;
-  });
-
-  return md;
 }
 
 /**
@@ -341,27 +320,4 @@ export async function appendArchitecturalDecisions(
   fs.writeFileSync(fullPath, content);
 }
 
-/**
- * Extracts and validates a ProjectPlan from an agent's text response.
- */
-export function extractPlanFromResponse(text: string): ProjectPlan {
-  // Try to find JSON in the response (agent might add conversational text)
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) {
-    throw new Error('No JSON object found in agent response.');
-  }
-  
-  let parsed: any;
-  try {
-    parsed = JSON.parse(jsonMatch[0]);
-  } catch (err) {
-    throw new Error(`Invalid JSON in agent response: ${(err as Error).message}`);
-  }
-  
-  try {
-    return ProjectPlanSchema.parse(parsed);
-  } catch (err) {
-    throw new Error(`Invalid plan format: ${(err as Error).message}`);
-  }
-}
 

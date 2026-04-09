@@ -19,7 +19,10 @@ const MAX_ATTEMPTS = 3;
 const MAX_TASK_DURATION_MS = 10 * 60 * 1000;  // 10 minutes per subtask
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
+/** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
+const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
 
+// TODO: Wire up outputSimilarity for loop detection in the TDD cycle.
 /**
  * Detect if two strings are suspiciously similar (agent is looping).
  * Uses a simple character-level comparison — fast and good enough for code output.
@@ -228,7 +231,7 @@ export class WorkflowExecutor {
             } finally {
               implementerSession.dispose();
               logger.info('[EXECUTOR] Implementer disposed. Cooldown for slot recovery...');
-              await new Promise(resolve => setTimeout(resolve, 5000));
+              await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
           }
 
@@ -313,7 +316,7 @@ export class WorkflowExecutor {
             } finally {
               reviewerSession.dispose();
               logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
-              await new Promise(resolve => setTimeout(resolve, 5000));
+              await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
 
             // Parse Reviewer Verdict

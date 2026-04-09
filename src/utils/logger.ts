@@ -85,3 +85,6 @@ export function _resetLogger(): void {
   _logger = null;
   _configuredDir = null;
 }
+
+process.once('exit', () => { _logger?.close(); });
+process.once('SIGTERM', () => { _logger?.closeAsync().then(() => process.exit(0)); });

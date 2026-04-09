@@ -56,6 +56,8 @@ function resolveProjectDir(projectDirArg: string): string {
   return resolved;
 }
 
+const MAX_CACHED_EXECUTORS = 10;
+
 async function getOrCreate(projectDir: string) {
   if (!executors.has(projectDir)) {
     const state = new StateManager(projectDir);
@@ -64,6 +66,10 @@ async function getOrCreate(projectDir: string) {
     const executor = new WorkflowExecutor(state, llm.router, {
       searchClient,
     });
+    if (executors.size >= MAX_CACHED_EXECUTORS) {
+      const oldest = executors.keys().next().value!;
+      executors.delete(oldest);
+    }
     executors.set(projectDir, { state, executor, llm });
   }
   return executors.get(projectDir)!;

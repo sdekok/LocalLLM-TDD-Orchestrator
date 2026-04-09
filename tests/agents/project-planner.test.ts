@@ -492,7 +492,7 @@ describe('generatePlanMarkdown', () => {
     };
 
     const md = generatePlanMarkdown(plan);
-    expect(md).toContain('# Plan Summary: Test Summary');
+    expect(md).toContain('# Project Plan: Test Summary');
     expect(md).toContain('Epic Title');
     expect(md).toContain('WI-1: WI Title');
     expect(md).toContain('Dec 1');
