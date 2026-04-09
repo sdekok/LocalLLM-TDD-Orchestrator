@@ -55,6 +55,9 @@ export class Sandbox {
         fs.writeFileSync(gitignorePath, 'node_modules/\n.env\n.env.*\n*.key\n*.pem\n', 'utf-8');
       }
       await execFileAsync('git', ['init'], { cwd: this.projectDir, ...EXEC_OPTS });
+      // Set local identity so the commit works in environments with no global git config (e.g. CI)
+      await execFileAsync('git', ['config', 'user.email', 'tdd-workflow@localhost'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['config', 'user.name', 'TDD Workflow'], { cwd: this.projectDir, ...EXEC_OPTS });
       await execFileAsync('git', ['add', '-A'], { cwd: this.projectDir, ...EXEC_OPTS });
       await execFileAsync('git', ['commit', '-m', 'Initial commit', '--allow-empty'], {
         cwd: this.projectDir,
