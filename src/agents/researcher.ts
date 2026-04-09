@@ -53,7 +53,7 @@ export function parseResearchQuestions(content: string): string[] {
   const questions: string[] = [];
   for (const line of lines) {
     const match = line.match(/^\s*\d+\.\s+(.+)/);
-    if (match) {
+    if (match && match[1]) {
       questions.push(match[1].trim());
     }
   }
@@ -552,7 +552,9 @@ async function performMultiPhaseResearch(
         const globalQNum = allNoteFiles.length + 1;
         const notesFile = `${baseDir}/${String(globalQNum).padStart(2, '0')}_notes.md`;
 
-        logger.info(`[RESEARCHER] Round ${round}, Q${i + 1}/${currentQuestions.length}: ${currentQuestions[i].substring(0, 80)}`);
+        const question = currentQuestions[i]!;
+
+        logger.info(`[RESEARCHER] Round ${round}, Q${i + 1}/${currentQuestions.length}: ${question.substring(0, 80)}`);
         options.uiContext.setStatus(
           'research',
           `🔍 Round ${round}, Q${i + 1}/${currentQuestions.length}: Researching...`
@@ -561,7 +563,7 @@ async function performMultiPhaseResearch(
         await session.prompt(
           buildQuestionResearchPrompt(
             i + 1,
-            currentQuestions[i],
+            question,
             currentQuestions.length,
             notesFile,
             topic,
@@ -569,7 +571,7 @@ async function performMultiPhaseResearch(
         );
 
         allNoteFiles.push(notesFile);
-        allQuestionsResearched.push(currentQuestions[i]);
+        allQuestionsResearched.push(question);
       }
 
       logger.info(`[RESEARCHER] Round ${round} research complete. Total questions researched: ${allQuestionsResearched.length}`);
