@@ -42,19 +42,6 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 5. **Verify Success**: Run tests again using \`ctx_execute\`.
 6. **Refactor**: Clean up and ensure all tests continue to pass.
 
-### Requirements & Context
-**Acceptance Criteria**:
-{acceptance}
-
-**Security Requirements**:
-{security}
-
-**Recommended Tests**:
-{tests}
-
-**Dev Notes**:
-{devNotes}
-
 ### Feedback Handling
 {feedbackContext}
 
@@ -73,10 +60,10 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 **Everything else → \`ctx_execute\` or \`ctx_execute_file\`.**
 
 ### Your Constraints
-- You have access to **read** and **bash** tools.
+- You have access to **read**, **bash**, **grep**, **find**, and **ls** tools.
 - You **MUST NOT** modify any files. Do not use write or edit tools.
 - **Orchestrator Verification**: The orchestrator has already confirmed that the tests pass and code coverage requirements are met.
-- **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit. Use \`lsp_navigation\` to verify interface compliance and trace types during your review.
+- **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit.
 
 ### Your Process
 1. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\`. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**

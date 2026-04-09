@@ -12,11 +12,9 @@
       "parameterCount": "26b (4b active)",
       "speed": "fast",
       "samplingParams": {
-        "temperature": 0.2,
-        "top_k": 40,
-        "top_p": 0.95,
-        "repeat_penalty": 1.1,
-        "min_p": 0.05
+        "temperature": 0.8,
+        "top_k": 64,
+        "top_p": 0.95
       }
     },
     "gemma-4-dense": {
@@ -29,11 +27,9 @@
       "parameterCount": "31b",
       "speed": "slow",
       "samplingParams": {
-        "temperature": 0.1,
-        "top_k": 40,
-        "top_p": 0.9,
-        "repeat_penalty": 1.1,
-        "min_p": 0.05
+        "temperature": 0.8,
+        "top_k": 64,
+        "top_p": 0.95
       }
     },
     "qwen-moe": {
@@ -47,9 +43,9 @@
       "speed": "fast",
       "samplingParams": {
         "temperature": 0.6,
-        "top_k": 50,
+        "top_k": 20,
         "top_p": 0.95,
-        "repeat_penalty": 1.05
+        "presence_penalty": 0.0
       }
     },
     "qwen-dense": {
@@ -62,10 +58,10 @@
       "parameterCount": "27b",
       "speed": "medium",
       "samplingParams": {
-        "temperature": 0.6,
-        "top_k": 40,
-        "top_p": 0.9,
-        "repeat_penalty": 1.1
+        "temperature": 0.7,
+        "top_k": 20,
+        "top_p": 0.8,
+        "presence_penalty": 1.5
       }
     },
     "cloud-research": {

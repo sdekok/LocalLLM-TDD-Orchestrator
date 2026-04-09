@@ -7,12 +7,16 @@ export class Qwen35Tuner implements ModelTuner {
   }
 
   applyTweaks(profile: ModelProfile, systemPrompt: string, currentSampling: SamplingParams): TunerResult {
-    // Qwen reasoning heavily degrades with greedy decoding, 
-    // but the user wants to handle this server-side now.
-    
+    const sampling = { ...currentSampling };
+
+    // Vendor recommendation: top_k should be 20 for Qwen 3.5
+    if (!sampling.top_k || sampling.top_k > 20) {
+      sampling.top_k = 20;
+    }
+
     return {
       systemPrompt,
-      sampling: currentSampling,
+      sampling,
     };
   }
 }

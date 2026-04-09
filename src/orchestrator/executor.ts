@@ -302,7 +302,7 @@ export class WorkflowExecutor {
               systemPrompt: REVIEWER_PROMPT,
               cwd: this.state.projectDir,
               modelRouter: this.modelRouter,
-              tools: 'readonly'
+              tools: 'review'
             });
 
             let reviewText = '';
@@ -320,7 +320,7 @@ export class WorkflowExecutor {
             }
 
             // Parse Reviewer Verdict
-            const isApproved = reviewText.includes('APPROVED: true');
+            const isApproved = /APPROVED:\s*true/i.test(reviewText);
             const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
             const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
 

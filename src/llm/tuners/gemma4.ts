@@ -8,16 +8,22 @@ export class Gemma4Tuner implements ModelTuner {
 
   applyTweaks(profile: ModelProfile, systemPrompt: string, currentSampling: SamplingParams): TunerResult {
     let finalSystemPrompt = systemPrompt;
-    
+    const sampling = { ...currentSampling };
+
     if (profile.enableThinking) {
       if (!finalSystemPrompt.startsWith('<|think|>')) {
         finalSystemPrompt = `<|think|>\n${finalSystemPrompt}`;
       }
     }
 
+    // Vendor recommendation: top_k should be 64 for Gemma 4
+    if (!sampling.top_k || sampling.top_k < 64) {
+      sampling.top_k = 64;
+    }
+
     return {
       systemPrompt: finalSystemPrompt,
-      sampling: currentSampling,
+      sampling,
     };
   }
 }

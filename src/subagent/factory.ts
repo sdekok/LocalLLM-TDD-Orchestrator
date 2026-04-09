@@ -3,6 +3,7 @@ import {
   SessionManager, 
   createCodingTools,
   createReadOnlyTools,
+  createBashTool,
   DefaultResourceLoader,
   type AgentSession,
   type ToolDefinition,
@@ -23,7 +24,7 @@ export interface SubAgentOptions {
   cwd: string;
   modelRouter: ModelRouter;
   feedback?: string;
-  tools?: 'coding' | 'readonly' | 'none';
+  tools?: 'coding' | 'review' | 'readonly' | 'none';
   // Optional: UI context for interactive tools (e.g., ask_user_for_clarification)
   uiContext?: {
     input: (prompt: string) => Promise<string | null>;
@@ -77,13 +78,19 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   logger.info(`[SUBAGENT FACTORY] System prompt preview: ${finalPrompt.substring(0, 200)}...`);
 
   // Build the tools list
-  const baseTools = options.tools === 'none'
-    ? []
-    : options.tools === 'readonly' 
-      ? createReadOnlyTools(options.cwd)
-      : createCodingTools(options.cwd);
-  
-  logger.info(`[SUBAGENT FACTORY] Tools loaded: ${options.tools === 'readonly' ? 'readonly' : 'coding'}`);
+  let baseTools: any[];
+  if (options.tools === 'none') {
+    baseTools = [];
+  } else if (options.tools === 'readonly') {
+    baseTools = createReadOnlyTools(options.cwd);
+  } else if (options.tools === 'review') {
+    // Reviewer: read-only tools + bash for running tests/inspecting, but no write/edit
+    baseTools = [...createReadOnlyTools(options.cwd), createBashTool(options.cwd)];
+  } else {
+    baseTools = createCodingTools(options.cwd);
+  }
+
+  logger.info(`[SUBAGENT FACTORY] Tools loaded: ${options.tools || 'coding'}`);
   logger.info(`[SUBAGENT FACTORY] Final prompt (first 500 chars):\n${finalPrompt.substring(0, 500)}...`);
 
   // Add custom tools if uiContext is provided (for interactive planning)
@@ -133,7 +140,8 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     cwd: options.cwd,
     sessionManager: SessionManager.inMemory(), // Ephemeral session
     resourceLoader: loader,
-    // model: piModel,
+    // model: intentionally omitted — use the Pi SDK's default model selection
+    // unless a per-agent override is configured in models.config.json
     tools: baseTools,
     customTools,
   });
@@ -141,6 +149,14 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   // Give async extensions (like pi-mcp-adapter) time to establish their RPC bounds
   // before the LLM fires off its first context exploration tool.
   await new Promise(resolve => setTimeout(resolve, 2000));
+
+  // Log available tools so operators can verify extension tools (ctx_execute, lsp_navigation, etc.) loaded
+  try {
+    const availableTools = session.tools?.map((t: any) => t.name || t.label).filter(Boolean) || [];
+    logger.info(`[SUBAGENT FACTORY] Available tools: ${availableTools.join(', ') || '(none detected)'}`);
+  } catch {
+    logger.info(`[SUBAGENT FACTORY] Could not enumerate session tools`);
+  }
 
   logger.info(`[SUBAGENT FACTORY] Agent session created successfully`);
 
