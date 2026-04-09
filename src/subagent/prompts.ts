@@ -29,10 +29,14 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **write / edit**: Modify files surgically.
 - **bash**: Run tests, type-check with tsc, and lint code. **Use ctx_execute for tests.**
 - **pi-lens (implicit)**: A background engine is monitoring your writes. It will block your progress with real-time feedback if you introduce structural bugs, type errors, or formatting issues.
+- **lsp_navigation**: Use this for semantic exploration. You can find definitions, references, and type information for any symbol. This is much faster and more accurate than recursive grep.
+- **ast_grep_search**: Use this for structural search. You can find code patterns (e.g., all functions taking a certain parameter type) using structural templates.
+- **ast_grep_replace**: Use this for large-scale structural refactoring (e.g., renaming a property across many files or changing a function signature).
 
 ### Your Workflow
-1. **Understand**: Use \`read\` or \`ctx_execute_file\` to grasp the current implementation. **Always check \`.tdd-workflow/analysis/\` if it exists to understand the broader codebase context.**
-2. **Test First**: Create or update test files using \`write\` or \`edit\`.
+1. **Understand**: Use \`read\`, \`lsp_navigation\`, or \`ctx_execute_file\` to grasp the current implementation. **Always check \`.tdd-workflow/analysis/\` if it exists.**
+2. **Explore**: Use \`lsp_navigation\` to trace symbol definitions and usages to map out the impact of your changes.
+3. **Test First**: Create or update test files using \`write\` or \`edit\`.
 3. **Verify Failure**: Run tests via \`ctx_execute\` to confirm they fail (red).
 4. **Implement**: Write the minimal code needed to make the tests pass.
 5. **Verify Success**: Run tests again using \`ctx_execute\`.
@@ -72,7 +76,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - You have access to **read** and **bash** tools.
 - You **MUST NOT** modify any files. Do not use write or edit tools.
 - **Orchestrator Verification**: The orchestrator has already confirmed that the tests pass and code coverage requirements are met.
-- **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit. You should focus on higher-level logic, architecture, and edge cases.
+- **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit. Use \`lsp_navigation\` to verify interface compliance and trace types during your review.
 
 ### Your Process
 1. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\`. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**
@@ -106,7 +110,7 @@ Default to context-mode (\`ctx_execute_file\`) for analyzing codebase state.
 - **Technical Tasks**: Break work into granular technical tasks. Each task should ideally only add or modify 1 or 2 methods (excluding boilerplate).
 - **Atomic Operations**: Ensure each task is small enough to be understood and executed perfectly by a small LLM.
 - **Verification**: This granularity prevents tool-calling degradation and ensures high quality.
-- **Lens Awareness**: The orchestrator uses \`pi-lens\` for quality gating. Design tasks that can pass these automated structural and type checks.
+- **Lens Awareness**: Use \`lsp_navigation\` during your initial exploration to understand complex symbol dependencies before planning.
 
 **Always check \`.tdd-workflow/analysis/\` if available to ensure subtasks respect the existing codebase structure.**
 

@@ -10,6 +10,7 @@ import {
   type AgentToolResult,
   type AgentToolUpdateCallback
 } from '@mariozechner/pi-coding-agent';
+import * as path from 'path';
 import { type Model } from '@mariozechner/pi-ai';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
 import { getTuner } from '../llm/tuners/registry.js';
@@ -114,8 +115,11 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   }
 
   // Create the resource loader for the custom prompt.
-  // We allow extensions and skills so that the subagent inherits MCP tools (like context-mode).
+  // We explicitly load the project's pi-lens extension so it's available as tools.
+  const extensionPaths = [path.join(options.cwd, 'node_modules/pi-lens')];
+  
   const loader = new DefaultResourceLoader({
+    additionalExtensionPaths: extensionPaths,
     systemPromptOverride: () => finalPrompt,
     appendSystemPromptOverride: () => [],
     noExtensions: false,

@@ -22,6 +22,7 @@ export interface ExportedSymbol {
   signature: string;          // e.g. "function add(a: number, b: number): number"
   jsdoc?: string;             // Existing documentation
   isExported: boolean;
+  stateMatrix?: number[][];    // Optional structural state matrix from Lens
 }
 
 export interface ImportEdge {

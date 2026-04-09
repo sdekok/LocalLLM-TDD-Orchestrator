@@ -77,9 +77,14 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
     const allImports: ImportEdge[] = [];
     const patterns: PatternMatch[] = [];
 
+    const lensIndex = this.loadLensIndex(projectDir);
+    if (lensIndex) {
+      logger.info(`Loaded pi-lens index with ${lensIndex.entries.length} entries`);
+    }
+
     for (const sourceFile of sourceFiles) {
       const relPath = path.relative(projectDir, sourceFile.getFilePath());
-      const exports = this.extractExports(sourceFile, relPath);
+      const exports = this.extractExports(sourceFile, relPath, lensIndex);
       const imports = this.extractImports(sourceFile, relPath, projectDir);
       const detected = this.detectPatterns(sourceFile, relPath);
 
@@ -120,14 +125,32 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
     };
 
     logger.info(
-      `TypeScript analysis complete: ${result.stats.totalFiles} files, ` +
+      `TypeScript analysis complete (Lens-enriched): ${result.stats.totalFiles} files, ` +
       `${result.stats.totalExports} exports, ${circularDeps.length} circular deps`
     );
 
     return result;
   }
 
-  private extractExports(sourceFile: SourceFile, relPath: string): ExportedSymbol[] {
+  private loadLensIndex(projectDir: string): any {
+    const indexPath = path.join(projectDir, '.pi-lens', 'index.json');
+    if (!fs.existsSync(indexPath)) return null;
+
+    try {
+      const data = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
+      // Convert entries array back to a lookup map for faster access
+      const entriesMap = new Map<string, any>();
+      for (const [id, entry] of data.entries) {
+        entriesMap.set(id, entry);
+      }
+      return { ...data, entriesMap };
+    } catch (err) {
+      getLogger().warn(`Failed to parse pi-lens index: ${err}`);
+      return null;
+    }
+  }
+
+  private extractExports(sourceFile: SourceFile, relPath: string, lensIndex?: any): ExportedSymbol[] {
     const exports: ExportedSymbol[] = [];
 
     for (const decl of sourceFile.getExportedDeclarations()) {
@@ -137,6 +160,17 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
         const jsdocNodes = 'getJsDocs' in node ? (node as any).getJsDocs() : [];
         const jsdoc = jsdocNodes.length > 0 ? jsdocNodes[0].getDescription().trim() : undefined;
 
+        // Try to enrich with Lens state matrix
+        let stateMatrix: number[][] | undefined;
+        if (lensIndex?.entriesMap) {
+          // Lens id format is "relPath:functionName"
+          const lensId = `${relPath}:${name}`;
+          const entry = lensIndex.entriesMap.get(lensId);
+          if (entry) {
+            stateMatrix = entry.matrix;
+          }
+        }
+
         exports.push({
           name,
           kind,
@@ -145,6 +179,7 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
           signature: this.getSignature(node, name),
           jsdoc,
           isExported: true,
+          stateMatrix
         });
       }
     }
