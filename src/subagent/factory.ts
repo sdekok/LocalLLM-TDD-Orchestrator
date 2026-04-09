@@ -206,47 +206,46 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
 }
 
 /**
- * Creates an ExtensionFactory that strips `thinking` content blocks from
- * prior assistant messages before each LLM call.
+ * Strips `thinking` content blocks from prior assistant messages,
+ * preserving thinking only in the most recent assistant message.
  *
  * Google recommends that for Gemma 4 multi-turn, you "only keep the final
  * visible answer" in history — thought channel blocks in earlier turns
  * degrade thinking quality in subsequent turns.
- *
- * The filter preserves thinking in the *last* assistant message so the
- * model's current reasoning chain remains intact.
  */
+export function stripThinkingFromHistory(messages: any[]): any[] {
+  // Find the last assistant message index so we can preserve its thinking
+  let lastAssistantIdx = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m && 'role' in m && (m as any).role === 'assistant') {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+
+  return messages.map((msg, idx) => {
+    // Only strip thinking from assistant messages that aren't the most recent
+    if (
+      idx !== lastAssistantIdx &&
+      'role' in msg &&
+      (msg as any).role === 'assistant' &&
+      Array.isArray((msg as any).content)
+    ) {
+      const content = (msg as any).content.filter(
+        (block: any) => block.type !== 'thinking'
+      );
+      return { ...msg, content };
+    }
+    return msg;
+  });
+}
+
+/** Wraps stripThinkingFromHistory as a Pi SDK extension factory. */
 function createGemma4ThinkingFilter(): ExtensionFactory {
   return (pi) => {
     pi.on('context', (event) => {
-      const messages = event.messages;
-      // Find the last assistant message index so we can preserve its thinking
-      let lastAssistantIdx = -1;
-      for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
-        if (m && 'role' in m && (m as any).role === 'assistant') {
-          lastAssistantIdx = i;
-          break;
-        }
-      }
-
-      const filtered = messages.map((msg, idx) => {
-        // Only strip thinking from assistant messages that aren't the most recent
-        if (
-          idx !== lastAssistantIdx &&
-          'role' in msg &&
-          (msg as any).role === 'assistant' &&
-          Array.isArray((msg as any).content)
-        ) {
-          const content = (msg as any).content.filter(
-            (block: any) => block.type !== 'thinking'
-          );
-          return { ...msg, content };
-        }
-        return msg;
-      });
-
-      return { messages: filtered };
+      return { messages: stripThinkingFromHistory(event.messages) };
     });
   };
 }
