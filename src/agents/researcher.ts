@@ -195,48 +195,57 @@ export function buildQuestionResearchPrompt(
     '',
     `**Current research question:** ${question}`,
     '',
-    '### Research Instructions',
+    '### Workflow (follow this order EXACTLY)',
     '',
-    '1. **Search broadly** — Use at least 2-3 different search queries to explore this question from multiple angles',
-    '2. **Read deeply** — Fetch and thoroughly read at least 3-5 high-quality sources (official docs, blog posts, papers, GitHub repos)',
-    '3. **Follow references** — If a source mentions another important resource, fetch that too',
-    '4. **Capture specifics** — Record:',
-    '   - Exact code examples, API signatures, configuration snippets',
-    '   - Version numbers, compatibility notes, known limitations',
-    '   - Performance characteristics, benchmarks if available',
-    '   - Trade-offs, pros/cons of different approaches',
-    '   - Common pitfalls and how to avoid them',
+    '**Step 1 — Research** (do ALL research before writing anything):',
+    '1. Search using at least 2-3 different search queries to explore this question from multiple angles',
+    '2. Fetch and thoroughly read at least 3-5 high-quality sources (official docs, blog posts, papers, GitHub repos)',
+    '3. If a source mentions another important resource, fetch that too',
+    '4. Keep mental notes of: code examples, API signatures, version numbers, trade-offs, pitfalls',
     '',
-    '### Documentation Instructions',
+    '**Step 2 — Write findings** (your FINAL and MOST IMPORTANT action):',
     '',
-    `Write a **detailed, self-contained markdown document** to **${notesFile}**.`,
+    '⚠️  **DO NOT create the file until you have completed ALL research above.**',
+    '⚠️  **DO NOT create empty placeholder files.**',
+    '⚠️  **The file write MUST be your last tool call, containing ALL findings.**',
     '',
-    'The file MUST follow this structure:',
+    `Write the complete findings as a single write to **${notesFile}** using this structure:`,
     '',
+    '```markdown',
     `# Q${questionNumber}: ${question}`,
     '',
     '## Answer Summary',
-    '> 2-3 paragraph summary that directly answers the question with concrete specifics.',
+    '<!-- 2-3 paragraphs directly answering the question with concrete specifics -->',
     '',
     '## Detailed Findings',
-    '> For each major finding or approach discovered:',
-    '> ### [Finding/Approach Name]',
-    '> - What it is and how it works (with specifics)',
-    '> - Code examples (actual code from sources, not pseudocode)',
-    '> - Configuration or setup steps',
-    '> - Limitations or caveats',
-    '> - Source: [URL]',
-    '',
-    '## Comparison of Approaches (if applicable)',
-    '> Table or structured comparison of different options found.',
-    '',
-    '## Open Questions',
-    '> Any sub-questions or areas that need deeper investigation.',
+    '<!-- For each major finding: what it is, how it works, code examples, config, limitations, source URL -->',
     '',
     '## Sources',
-    '> Numbered list of all URLs consulted, with a one-line description of what each contained.',
+    '<!-- Numbered list: [N] URL — one-line description -->',
+    '```',
     '',
-    '**IMPORTANT**: The notes file should be detailed enough to stand on its own — someone reading it should understand the complete answer without needing to do further research on this question. Write paragraphs, not bullet-point stubs.',
+    'The file must be **detailed enough to stand alone** — someone reading it should fully understand the answer without further research. Write in full paragraphs with specifics, not terse bullet stubs.',
+  ].join('\n');
+}
+
+/**
+ * Build a follow-up prompt when a notes file was written empty or too short.
+ * Asks the agent to write its findings from the conversation context.
+ */
+export function buildWriteFindingsPrompt(
+  questionNumber: number,
+  question: string,
+  notesFile: string,
+): string {
+  return [
+    `⚠️ The notes file **${notesFile}** is empty or nearly empty.`,
+    '',
+    `You researched Q${questionNumber} ("${question}") — your findings are in this conversation's context.`,
+    '',
+    `**Write everything you learned to ${notesFile} NOW.** This is critical — without written notes, the research is lost.`,
+    '',
+    'Include: Answer summary, detailed findings with specifics and code examples, and source URLs.',
+    'Write in full paragraphs. This is your most important task right now.',
   ].join('\n');
 }
 
@@ -655,6 +664,26 @@ async function performMultiPhaseResearch(
           )
         );
 
+        // Guard: verify the agent actually wrote content to the notes file.
+        // If empty/missing, prompt it to write findings from its context.
+        const absNotesPath = path.resolve(cwd, notesFile);
+        const notesContent = fs.existsSync(absNotesPath)
+          ? fs.readFileSync(absNotesPath, 'utf-8').trim()
+          : '';
+        if (notesContent.length < 100) {
+          logger.warn(`[RESEARCHER] Notes file ${notesFile} is empty/stub (${notesContent.length} chars) — prompting agent to write findings`);
+          options.uiContext.setStatus('research', `📝 Writing findings for Q${i + 1}...`);
+          await session.prompt(buildWriteFindingsPrompt(i + 1, question, notesFile));
+
+          // Check again after retry
+          const retryContent = fs.existsSync(absNotesPath)
+            ? fs.readFileSync(absNotesPath, 'utf-8').trim()
+            : '';
+          if (retryContent.length < 100) {
+            logger.warn(`[RESEARCHER] Notes file ${notesFile} still empty after retry (${retryContent.length} chars)`);
+          }
+        }
+
         allNoteFiles.push(notesFile);
         roundNoteFiles.push(notesFile);
         allQuestionsResearched.push(question);
@@ -681,6 +710,18 @@ async function performMultiPhaseResearch(
             summaryFile,
           )
         );
+
+        // Guard: verify summary was written
+        const absSummaryPath = path.resolve(cwd, summaryFile);
+        const summaryContent = fs.existsSync(absSummaryPath)
+          ? fs.readFileSync(absSummaryPath, 'utf-8').trim()
+          : '';
+        if (summaryContent.length < 100) {
+          logger.warn(`[RESEARCHER] Round summary ${summaryFile} is empty — prompting retry`);
+          await session.prompt(
+            `⚠️ The round summary file **${summaryFile}** is empty. Read the notes files (${roundNoteFiles.join(', ')}) and write a complete summary NOW. This is critical for the final report.`
+          );
+        }
 
         roundSummaryFiles.push(summaryFile);
       }

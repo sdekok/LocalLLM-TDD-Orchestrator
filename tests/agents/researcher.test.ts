@@ -6,6 +6,7 @@ import {
   buildResearchPrompt,
   buildDecompositionPrompt,
   buildQuestionResearchPrompt,
+  buildWriteFindingsPrompt,
   buildRoundSummaryPrompt,
   buildReflectionPrompt,
   buildSynthesisPrompt,
@@ -73,6 +74,12 @@ const uiContext = {
   editor: vi.fn().mockResolvedValue(null)
 };
 
+/**
+ * Default content returned by readFileSync for notes/summary files.
+ * Must be >= 100 chars to pass the empty-file guard in the orchestrator.
+ */
+const MOCK_NOTES_CONTENT = '# Notes\n\n' + 'This is detailed research content with findings and analysis. '.repeat(3);
+
 function resetMocks() {
   vi.clearAllMocks();
   // Ensure mockPrompt returns a resolved Promise (needed for .then() chains in background mode)
@@ -85,7 +92,8 @@ function resetMocks() {
   }) as any);
   // Default fs behavior
   vi.mocked(fs.existsSync).mockReturnValue(true);
-  (vi.mocked(fs.readFileSync) as any).mockReturnValue('Mock Content');
+  // Default: return content long enough to pass the >=100 char guard
+  (vi.mocked(fs.readFileSync) as any).mockReturnValue(MOCK_NOTES_CONTENT);
 }
 
 // ─── Shallow (legacy) mode ──────────────────────────────────────────
@@ -104,7 +112,7 @@ describe('Researcher Agent — Shallow mode', () => {
     expect(mockPrompt).toHaveBeenCalledOnce();
     expect(mockPrompt).toHaveBeenCalledWith(expect.stringContaining('React State 2026'));
     expect(uiContext.notify).toHaveBeenCalledWith(expect.stringContaining('completed'), 'info');
-    expect(uiContext.editor).toHaveBeenCalledWith('Research/react_state_2026.md', 'Mock Content');
+    expect(uiContext.editor).toHaveBeenCalledWith('Research/react_state_2026.md', MOCK_NOTES_CONTENT);
     expect(mockDispose).toHaveBeenCalled();
   });
 
@@ -143,7 +151,9 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
   beforeEach(resetMocks);
 
   it('falls back to single prompt when questions file has no numbered items', async () => {
-    // readFileSync returns 'Mock Content' which has no numbered list → fallback
+    // Return content with no numbered list for questions file → fallback
+    (vi.mocked(fs.readFileSync) as any).mockReturnValue('No numbered items here, just prose.');
+
     await performDeepResearch('React hooks', '/tmp', modelRouter, null, {
       background: false,
       uiContext
@@ -161,19 +171,17 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
   });
 
   it('researches each question when decomposition produces a numbered list', async () => {
-    let readCallCount = 0;
-    vi.mocked(fs.readFileSync).mockImplementation((() => {
-      readCallCount++;
-      // First read: questions file → 3 questions
-      if (readCallCount === 1) {
+    vi.mocked(fs.readFileSync).mockImplementation(((filePath: string) => {
+      const p = String(filePath);
+      if (p.includes('round_01_questions')) {
         return '1. What are React hooks? — Core concepts\n2. How does useState work? — State management\n3. Custom hooks best practices? — Patterns';
       }
-      // Second read: reflection file → research complete
-      if (readCallCount === 2) {
+      if (p.includes('round_02_questions')) {
+        // Reflection result → research complete
         return 'RESEARCH_COMPLETE — No significant gaps identified.';
       }
-      // Final read: report content for editor
-      return '# Final Report Content';
+      // Notes, summaries, final report → return long content to pass guards
+      return MOCK_NOTES_CONTENT;
     }) as any);
 
     await performDeepResearch('React hooks', '/tmp', modelRouter, null, {
@@ -201,7 +209,6 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
 
     // Verify synthesis prompt
     expect(mockPrompt.mock.calls[6][0]).toContain('Final Phase: Synthesis');
-    // Synthesis should reference round summaries
     expect(mockPrompt.mock.calls[6][0]).toContain('Round summaries');
 
     expect(uiContext.notify).toHaveBeenCalledWith(expect.stringContaining('Deep Research completed'), 'info');
@@ -209,22 +216,21 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
   });
 
   it('iterates multiple rounds when reflection produces new questions', async () => {
-    let readCallCount = 0;
-    vi.mocked(fs.readFileSync).mockImplementation((() => {
-      readCallCount++;
-      if (readCallCount === 1) {
-        // Round 1 questions
+    vi.mocked(fs.readFileSync).mockImplementation(((filePath: string) => {
+      const p = String(filePath);
+      if (p.includes('round_01_questions')) {
         return '1. Question A — Details A';
       }
-      if (readCallCount === 2) {
-        // Round 1 reflection → new questions
+      if (p.includes('round_02_questions')) {
+        // Round 1 reflection → new questions for round 2
         return '1. Follow-up Question B — Details B';
       }
-      if (readCallCount === 3) {
+      if (p.includes('round_03_questions')) {
         // Round 2 reflection → done
         return 'RESEARCH_COMPLETE — No significant gaps identified.';
       }
-      return '# Report';
+      // Notes, summaries → long content to pass guards
+      return MOCK_NOTES_CONTENT;
     }) as any);
 
     await performDeepResearch('Test', '/tmp', modelRouter, null, {
@@ -249,17 +255,17 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
   });
 
   it('stops iterating when no new questions are generated', async () => {
-    let readCallCount = 0;
-    vi.mocked(fs.readFileSync).mockImplementation((() => {
-      readCallCount++;
-      if (readCallCount === 1) {
+    vi.mocked(fs.readFileSync).mockImplementation(((filePath: string) => {
+      const p = String(filePath);
+      if (p.includes('round_01_questions')) {
         return '1. Only question — Details';
       }
-      if (readCallCount === 2) {
+      if (p.includes('round_02_questions')) {
         // Reflection: no numbered questions and no RESEARCH_COMPLETE
         return 'All areas seem well covered.';
       }
-      return '# Report';
+      // Notes, summaries → long content to pass guards
+      return MOCK_NOTES_CONTENT;
     }) as any);
 
     await performDeepResearch('Test', '/tmp', modelRouter, null, {
@@ -275,8 +281,38 @@ describe('Researcher Agent — Deep mode (multi-phase)', () => {
     );
   });
 
+  it('retries writing notes when file is empty after question research', async () => {
+    let notesReadCount = 0;
+    vi.mocked(fs.readFileSync).mockImplementation(((filePath: string) => {
+      const p = String(filePath);
+      if (p.includes('round_01_questions')) {
+        return '1. Single question — Details';
+      }
+      if (p.includes('round_02_questions')) {
+        return 'RESEARCH_COMPLETE';
+      }
+      if (p.includes('_notes.md')) {
+        notesReadCount++;
+        // First read: empty (guard triggers), second read: has content (retry succeeded)
+        return notesReadCount === 1 ? '' : MOCK_NOTES_CONTENT;
+      }
+      return MOCK_NOTES_CONTENT;
+    }) as any);
+
+    await performDeepResearch('Test', '/tmp', modelRouter, null, {
+      background: false,
+      uiContext
+    });
+
+    // Find the retry prompt in the calls
+    const retryCall = mockPrompt.mock.calls.find(
+      (call: any[]) => String(call[0]).includes('empty or nearly empty')
+    );
+    expect(retryCall).toBeDefined();
+  });
+
   it('runs deep research in background with phase notifications', async () => {
-    vi.mocked(fs.readFileSync).mockReturnValue('RESEARCH_COMPLETE' as any);
+    vi.mocked(fs.readFileSync).mockReturnValue(MOCK_NOTES_CONTENT as any);
 
     await performDeepResearch('Background Test', '/tmp', modelRouter, null, {
       background: true,
@@ -483,6 +519,23 @@ describe('buildQuestionResearchPrompt', () => {
     expect(p).toContain('How does X work?');
     expect(p).toContain('notes/02.md');
     expect(p).toContain('Topic X');
+  });
+
+  it('emphasizes write-last workflow to prevent empty files', () => {
+    const p = buildQuestionResearchPrompt(1, 'Q?', 1, 'notes.md', 'Topic');
+    expect(p).toContain('DO NOT create the file until you have completed ALL research');
+    expect(p).toContain('DO NOT create empty placeholder files');
+    expect(p).toContain('last tool call');
+  });
+});
+
+describe('buildWriteFindingsPrompt', () => {
+  it('references the empty file and asks agent to write findings', () => {
+    const p = buildWriteFindingsPrompt(3, 'How does caching work?', 'notes/03.md');
+    expect(p).toContain('notes/03.md');
+    expect(p).toContain('empty or nearly empty');
+    expect(p).toContain('Q3');
+    expect(p).toContain('How does caching work?');
   });
 });
 
