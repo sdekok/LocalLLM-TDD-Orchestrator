@@ -87,7 +87,7 @@ This exposes the core workflows (start, resume, status, analyze) to your MCP cli
 |---|---|---|
 | **Max attempts** (3/task) | Persistent failures | Marks task as failed, moves to next |
 | **Output similarity** (>90%) | Agent stuck in a loop | Bails immediately — doesn't waste remaining attempts |
-| **Time budget** (15 min/task) | LLM hangs, runaway tool calls | Breaks the attempt loop, marks task as failed |
+| **Time budget** (10 min/task) | LLM hangs, runaway tool calls | Breaks the attempt loop, marks task as failed |
 | **Circuit breaker** (3 failures) | Systemic problems | Stops entire workflow with clear message |
 
 ## Multi-Language Support
@@ -109,6 +109,10 @@ Configure your models in `models.config.json`. The system supports:
 - **Cloud**: OpenRouter, OpenAI, Anthropic
 - **Optimized Tuning**: Built-in tuners for **Gemma 4** (thinking prompts) and **Qwen 3.5** (sampling floors).
 
+> **API Keys**: The `apiKey` field is **not** supported in model profiles. API keys must be supplied via environment variables. Use `apiKeyEnvVar` in the model profile to specify which environment variable holds the key (e.g. `"apiKeyEnvVar": "OPENROUTER_API_KEY"`).
+
+> **Security**: `models.config.json` and `models.config.local.json` are listed in `.gitignore` to prevent accidental secret commits. Never hardcode API keys in these files.
+
 ## Commit Messages
 
 Every merge commit includes quality gate results, test counts, and reviewer feedback:
@@ -129,7 +133,9 @@ Files: src/auth/jwt.ts, tests/auth/jwt.test.ts
 
 ```bash
 npm run test         # Run unit tests (vitest)
-npm run build        # Compile extension
+npm run build        # Compile TypeScript only
+npm run build:csharp # Build the Roslyn C# analyzer (requires .NET 10 SDK)
+npm run build:all    # Full build: C# analyzer + TypeScript
 npm run dev          # Watch mode
 ```
 
@@ -258,3 +264,5 @@ Default to context-mode for ALL commands.
 | `OPENROUTER_API_KEY` | — | API key for OpenRouter models |
 | `OPENAI_API_KEY` | — | API key for OpenAI models |
 | `TDD_WORKFLOW_CONFIG_DIR` | — | Override config file search directory |
+| `LENS_FAIL_POLICY` | `fail-closed` | Controls Lens gate crash behaviour. `fail-open` skips the gate on crash (use on dev machines without Lens); `fail-closed` (default) treats a crash as a gate failure (safe for CI). |
+| `TDD_SLOT_RECOVERY_MS` | `5000` | Milliseconds to wait after sub-agent session disposal before reusing the slot. Lower this on fast machines to speed up parallel execution. |

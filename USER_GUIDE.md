@@ -16,7 +16,11 @@ The TDD Agentic Workflow orchestrator is a native **Pi Extension** that automate
 ```bash
 cd /path/to/pi-coding-agent
 npm install
-npm run build
+npm run build        # TypeScript only
+# Optional: build the Roslyn C# analyzer (requires .NET 10 SDK)
+npm run build:csharp
+# Or build everything at once
+npm run build:all
 ```
 
 ### 2. Register with Pi
@@ -63,6 +67,20 @@ The orchestrator uses a `models.config.json` file to route different tasks to ap
 
 - **Local (llama.cpp)**: Default provider. Supports "Router Mode" for on-demand model loading.
 - **Cloud**: Supports OpenRouter, OpenAI, and Anthropic providers.
+
+### API Keys
+
+API keys must **not** be placed directly in `models.config.json` — the `apiKey` field is not supported in model profiles. Instead, store keys in environment variables and reference them by name using `apiKeyEnvVar`:
+
+```json
+{
+  "id": "my-openrouter-model",
+  "provider": "openrouter",
+  "apiKeyEnvVar": "OPENROUTER_API_KEY"
+}
+```
+
+`models.config.json` and `models.config.local.json` are listed in `.gitignore` to prevent accidental secret commits. Set the corresponding environment variable in your shell profile or CI secrets store.
 
 ### Optimized Tunings
 The system includes built-in "Tuners" that automatically adjust sampling and prompts for specific models:
@@ -125,7 +143,7 @@ If coverage falls below these levels, the workflow will halt before moving to th
 
 ## Agent Prompts Reference
 
-For developers looking to tune their models, the exact system prompts are provided in the [README.md#core-agents--prompts](file:///home/stephen/dev/tdd-pi-plugin/README.md#core-agents--prompts) for reference.
+For developers looking to tune their models, the exact system prompts are provided in the [README.md#core-agents--prompts](./README.md#core-agents--prompts) for reference.
 
 ## Troubleshooting
 
@@ -136,3 +154,5 @@ For developers looking to tune their models, the exact system prompts are provid
 | Workflow hangs | Check `.tdd-workflow/logs/` for details. Usually means the LLM is stuck or local VRAM is exhausted. |
 | Quality gates always fail | Verify your `package.json` scripts (`test`, `build`) work manually first. |
 | JSON parsing failure | Some models struggle with the structured output of `/plan`. Use a more capable model (like Gemma 2 27B or Claude 3.5 Sonnet) for the `project-plan` role. |
+| Lens gate always fails in CI | Set `LENS_FAIL_POLICY=fail-open` if Lens is not installed on the machine, or check that `pi-lens` is listed in your project's dependencies. |
+| Workflow failed but I don't know why | Each workflow start returns an ID (e.g. `Workflow started (id: abc-123)`). Search `.tdd-workflow/logs/` for that ID to find the relevant error output. |
