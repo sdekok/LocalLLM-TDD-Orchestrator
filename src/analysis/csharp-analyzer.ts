@@ -4,6 +4,7 @@ import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
+import { glob } from 'glob';
 import { getLogger } from '../utils/logger.js';
 import type {
   CodeAnalyzer,
@@ -15,6 +16,18 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const execFileAsync = promisify(execFile);
+
+async function findAnalyzerDll(analyzerDir: string): Promise<string> {
+  const releasePattern = path.join(analyzerDir, 'bin', 'Release', 'net*', 'CsharpAstAnalyzer.dll');
+  const releaseMatches = await glob(releasePattern);
+  if (releaseMatches.length > 0) return releaseMatches[0]!;
+
+  const debugPattern = path.join(analyzerDir, 'bin', 'Debug', 'net*', 'CsharpAstAnalyzer.dll');
+  const debugMatches = await glob(debugPattern);
+  if (debugMatches.length > 0) return debugMatches[0]!;
+
+  throw new Error(`CsharpAstAnalyzer.dll not found in ${analyzerDir}. Run 'dotnet build' first.`);
+}
 
 export class CSharpAnalyzer implements CodeAnalyzer {
   readonly name = 'C# AST Analyzer';
@@ -81,10 +94,7 @@ export class CSharpAnalyzer implements CodeAnalyzer {
       };
     }
 
-    const dllPath = path.resolve(__dirname, 'tools', 'CsharpAstAnalyzer', 'bin', 'Release', 'net10.0', 'CsharpAstAnalyzer.dll');
-    if (!fs.existsSync(dllPath)) {
-      throw new Error(`CsharpAstAnalyzer.dll not found at ${dllPath}. Please ensure the C# analyzer tool has been built.`);
-    }
+    const dllPath = await findAnalyzerDll(path.resolve(__dirname, 'tools', 'CsharpAstAnalyzer'));
 
     try {
       // Chunk arguments if there are too many files (max args limit on linux is large, but to be safe we can pass all)

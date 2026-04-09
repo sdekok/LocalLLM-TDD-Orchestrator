@@ -10,7 +10,9 @@
     ]
   },
   "scripts": {
-    "build": "dotnet build src/analysis/tools/CsharpAstAnalyzer/CsharpAstAnalyzer.csproj -c Release && tsc && npm run bundle && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
+    "build": "tsc && npm run bundle && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
+    "build:csharp": "dotnet build src/analysis/tools/CsharpAstAnalyzer/CsharpAstAnalyzer.csproj -c Release",
+    "build:all": "npm run build:csharp && npm run build",
     "bundle": "esbuild dist/interfaces/pi/index.js --bundle --platform=node --format=esm --outfile=dist/interfaces/pi/index.bundle.js --external:tree-sitter --external:tree-sitter-cpp && mv dist/interfaces/pi/index.bundle.js dist/interfaces/pi/index.js",
     "deploylocal": "npm run build && rm -rf ~/.pi/extensions/tdd-workflow && ln -sf $(pwd) ~/.pi/extensions/tdd-workflow",
     "start": "node dist/interfaces/mcp/index.js",
