@@ -12,7 +12,8 @@ import {
   type ToolDefinition,
   type ExtensionContext,
   type AgentToolResult,
-  type AgentToolUpdateCallback
+  type AgentToolUpdateCallback,
+  type ExtensionFactory,
 } from '@mariozechner/pi-coding-agent';
 import * as path from 'path';
 import { type Model } from '@mariozechner/pi-ai';
@@ -145,9 +146,19 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   // Create the resource loader for the custom prompt.
   // We explicitly load the project's pi-lens extension so it's available as tools.
   const extensionPaths = [path.join(options.cwd, 'node_modules/pi-lens')];
-  
+
+  // For Gemma 4 with thinking enabled, register an extension that strips thought
+  // blocks from prior assistant messages. Google recommends keeping only the final
+  // visible answer in multi-turn history to prevent thinking quality degradation.
+  const extensionFactories: ExtensionFactory[] = [];
+  if (profile.modelFamily === 'gemma4' && profile.enableThinking) {
+    extensionFactories.push(createGemma4ThinkingFilter());
+    logger.info('[SUBAGENT FACTORY] Registered Gemma 4 thinking-filter extension');
+  }
+
   const loader = new DefaultResourceLoader({
     additionalExtensionPaths: extensionPaths,
+    extensionFactories,
     systemPromptOverride: () => populatedPrompt,
     appendSystemPromptOverride: () => [],
     noExtensions: false,
@@ -173,7 +184,7 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
 
   // Log available tools so operators can verify extension tools (ctx_execute, lsp_navigation, etc.) loaded
   try {
-    const availableTools = session.tools?.map((t: any) => t.name || t.label).filter(Boolean) || [];
+    const availableTools = ((session as any).tools as any[] | undefined)?.map((t: any) => t.name || t.label).filter(Boolean) || [];
     logger.info(`[SUBAGENT FACTORY] Available tools: ${availableTools.join(', ') || '(none detected)'}`);
   } catch {
     logger.info(`[SUBAGENT FACTORY] Could not enumerate session tools`);
@@ -192,4 +203,50 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
 
   logger.info(`[SUBAGENT FACTORY] Session setup complete`);
   return session;
+}
+
+/**
+ * Creates an ExtensionFactory that strips `thinking` content blocks from
+ * prior assistant messages before each LLM call.
+ *
+ * Google recommends that for Gemma 4 multi-turn, you "only keep the final
+ * visible answer" in history — thought channel blocks in earlier turns
+ * degrade thinking quality in subsequent turns.
+ *
+ * The filter preserves thinking in the *last* assistant message so the
+ * model's current reasoning chain remains intact.
+ */
+function createGemma4ThinkingFilter(): ExtensionFactory {
+  return (pi) => {
+    pi.on('context', (event) => {
+      const messages = event.messages;
+      // Find the last assistant message index so we can preserve its thinking
+      let lastAssistantIdx = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m && 'role' in m && (m as any).role === 'assistant') {
+          lastAssistantIdx = i;
+          break;
+        }
+      }
+
+      const filtered = messages.map((msg, idx) => {
+        // Only strip thinking from assistant messages that aren't the most recent
+        if (
+          idx !== lastAssistantIdx &&
+          'role' in msg &&
+          (msg as any).role === 'assistant' &&
+          Array.isArray((msg as any).content)
+        ) {
+          const content = (msg as any).content.filter(
+            (block: any) => block.type !== 'thinking'
+          );
+          return { ...msg, content };
+        }
+        return msg;
+      });
+
+      return { messages: filtered };
+    });
+  };
 }
