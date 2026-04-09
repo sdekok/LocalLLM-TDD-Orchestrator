@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import JSON5 from 'json5';
 import { createHash } from 'crypto';
+import type { ZodSchema } from 'zod';
 import { ModelRouter, type TaskType, type ModelProfile } from './model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { getTuner } from './tuners/registry.js';
@@ -13,6 +14,10 @@ export class LLMClient {
 
   constructor(modelRouter?: ModelRouter) {
     this.router = modelRouter || new ModelRouter();
+  }
+
+  getRoutingConfig(): ReturnType<ModelRouter['getConfig']>['routing'] {
+    return this.router.getConfig().routing;
   }
 
   private getClient(profile: ModelProfile): OpenAI {
@@ -45,7 +50,8 @@ export class LLMClient {
     userPrompt: string,
     jsonSchema: Record<string, unknown>,
     taskType: TaskType,
-    temperature = 0.1
+    temperature = 0.1,
+    zodSchema?: ZodSchema<T>
   ): Promise<T> {
     const logger = getLogger();
     const profile = this.router.selectModel(taskType);
@@ -75,7 +81,17 @@ export class LLMClient {
     });
 
     const content = response.choices[0]?.message?.content || '';
-    return extractJSON<T>(content);
+    const parsed = extractJSON<T>(content);
+
+    if (zodSchema) {
+      const result = zodSchema.safeParse(parsed);
+      if (!result.success) {
+        throw new Error(`LLM response failed validation: ${result.error.message}`);
+      }
+      return result.data;
+    }
+
+    return parsed;
   }
 }
 

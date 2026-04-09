@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { type Model } from '@mariozechner/pi-ai';
+import { getLogger } from '../utils/logger.js';
 import { getTuner } from './tuners/registry.js';
 
 export interface SamplingParams {
@@ -77,8 +77,8 @@ export function loadConfig(projectDir?: string): ModelRouterConfig | null {
         try {
           const raw = fs.readFileSync(configPath, 'utf-8');
           return JSON.parse(raw) as ModelRouterConfig;
-        } catch {
-          // Malformed — try next
+        } catch (err) {
+          getLogger().warn(`Failed to parse ${configPath}: ${(err as Error).message}. Trying next config file.`);
         }
       }
     }
@@ -91,8 +91,8 @@ export function loadConfig(projectDir?: string): ModelRouterConfig | null {
       try {
         const raw = fs.readFileSync(examplePath, 'utf-8');
         return JSON.parse(raw) as ModelRouterConfig;
-      } catch {
-        // Malformed
+      } catch (err) {
+        getLogger().warn(`Failed to parse ${examplePath}: ${(err as Error).message}.`);
       }
     }
   }

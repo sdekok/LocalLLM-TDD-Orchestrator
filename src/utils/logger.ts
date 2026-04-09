@@ -60,12 +60,22 @@ export class Logger {
 }
 
 let _logger: Logger | null = null;
+let _configuredDir: string | null = null;
 
 export function getLogger(logDir?: string): Logger {
-  if (!_logger) {
-    const dir = logDir || path.join(process.cwd(), '.tdd-workflow', 'logs');
-    _logger = new Logger(dir);
+  const dir = logDir ?? path.join(process.cwd(), '.tdd-workflow', 'logs');
+
+  if (_logger) {
+    if (_configuredDir && dir !== _configuredDir) {
+      console.warn(
+        `Warning: getLogger() called with logDir="${dir}" but already initialized with "${_configuredDir}". Using existing instance.`
+      );
+    }
+    return _logger;
   }
+
+  _configuredDir = dir;
+  _logger = new Logger(dir);
   return _logger;
 }
 
@@ -73,4 +83,5 @@ export function getLogger(logDir?: string): Logger {
 export function _resetLogger(): void {
   _logger?.close();
   _logger = null;
+  _configuredDir = null;
 }

@@ -2,6 +2,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomUUID } from 'crypto';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -141,16 +142,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const userRequest = args.request as string;
     const { executor } = await getOrCreate(projectDir);
 
-    // Fire-and-forget — the workflow runs in the background
+    const workflowId = randomUUID();
     executor.startNew(userRequest).catch((err: unknown) => {
-      getLogger().error(`Workflow failed: ${err}`);
+      getLogger().error(`Workflow ${workflowId} failed: ${err instanceof Error ? err.message : String(err)}`);
     });
 
     return {
       content: [
         {
           type: 'text',
-          text: `Workflow started for project: ${projectDir}\nRequest: ${userRequest}\nUse check_workflow_status to monitor progress.`,
+          text: `Workflow started (id: ${workflowId})\nProject: ${projectDir}\nRequest: ${userRequest}\nUse check_workflow_status to monitor progress. If the workflow fails, search logs for "${workflowId}".`,
         },
       ],
     };
@@ -161,15 +162,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const retryFailed = (args.retryFailed as boolean) || false;
     const { executor } = await getOrCreate(projectDir);
 
+    const resumeId = randomUUID();
     executor.resume(retryFailed).catch((err: unknown) => {
-      getLogger().error(`Resume failed: ${err}`);
+      getLogger().error(`Resume ${resumeId} failed: ${err instanceof Error ? err.message : String(err)}`);
     });
 
     return {
       content: [
         {
           type: 'text',
-          text: `Workflow resumed for project: ${projectDir} (retryFailed: ${retryFailed})`,
+          text: `Workflow resumed (id: ${resumeId})\nProject: ${projectDir} (retryFailed: ${retryFailed})\nUse check_workflow_status to monitor progress.`,
         },
       ],
     };
@@ -180,7 +182,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { state, llm } = await getOrCreate(projectDir);
     const summary = state.getSummary();
     const fullState = state.getState();
-    const modelConfig = llm['router'].getConfig().routing;
+    const modelConfig = llm.getRoutingConfig();
 
     return {
       content: [
