@@ -5,7 +5,9 @@ import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
 import { loadCachedAnalysis } from '../analysis/runner.js';
 import { formatMultiAnalysisForPrompt } from '../analysis/types.js';
+import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 
+// exec is still used for getFileTree which needs shell pipes (fully hardcoded, no user input)
 const execAsync = promisify(exec);
 
 export interface WorkspaceSnapshot {
@@ -106,9 +108,11 @@ export function detectTestFramework(deps: Record<string, string>): string {
 
 async function getFileTree(projectDir: string): Promise<string> {
   try {
+    // This command is fully hardcoded — no user input is interpolated — so using
+    // exec (shell) here is acceptable and lets us use pipes cleanly.
     const { stdout } = await execAsync(
       'find . -type f -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" -not -path "*/.tdd-workflow/*" | sort | head -200',
-      { cwd: projectDir }
+      { cwd: projectDir, maxBuffer: DEFAULT_MAX_BUFFER }
     );
     return stdout.trim();
   } catch {
@@ -116,30 +120,60 @@ async function getFileTree(projectDir: string): Promise<string> {
   }
 }
 
+/**
+ * Find an example test or source file by walking the src/ directory with Node fs.
+ * Replaces the previous `find -regextype posix-extended` command which is Linux-only.
+ */
 async function findExampleFile(
   projectDir: string,
   type: 'test' | 'source'
 ): Promise<string | null> {
   try {
-    const pattern =
-      type === 'test'
-        ? '\\.(test|spec)\\.(ts|js)$'
-        : '(?<!test|spec)\\.(ts|js)$';
-    const { stdout } = await execAsync(
-      `find ./src -type f -regextype posix-extended -regex '.*${pattern}' | head -1`,
-      { cwd: projectDir }
-    );
-    const filePath = stdout.trim();
-    if (!filePath) return null;
-    const fullPath = path.resolve(projectDir, filePath);
-    if (!fs.existsSync(fullPath)) return null;
-    const content = fs.readFileSync(fullPath, 'utf-8');
-    return `// File: ${filePath}\n${content.substring(0, 3000)}`;
+    const srcDir = path.join(projectDir, 'src');
+    if (!fs.existsSync(srcDir)) return null;
+
+    const isTestFile = (name: string) => /\.(test|spec)\.(ts|js|tsx|jsx)$/.test(name);
+    const isSourceFile = (name: string) => /\.(ts|js|tsx|jsx)$/.test(name) && !isTestFile(name);
+    const predicate = type === 'test' ? isTestFile : isSourceFile;
+
+    const found = walkForFirst(srcDir, predicate);
+    if (!found) return null;
+
+    const relativePath = './' + path.relative(projectDir, found).replace(/\\/g, '/');
+    const content = fs.readFileSync(found, 'utf-8');
+    return `// File: ${relativePath}\n${content.substring(0, 3000)}`;
   } catch {
     return null;
   }
 }
 
+/**
+ * Recursively walk a directory and return the first file matching predicate.
+ */
+function walkForFirst(dir: string, predicate: (name: string) => boolean): string | null {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (['node_modules', '.git', 'dist', 'coverage'].includes(entry.name)) continue;
+      const found = walkForFirst(fullPath, predicate);
+      if (found) return found;
+    } else if (entry.isFile() && predicate(entry.name)) {
+      return fullPath;
+    }
+  }
+  return null;
+}
+
+/**
+ * Find files relevant to a task by grepping for extracted keywords.
+ * Uses execFile (no shell) so keyword values cannot inject shell commands.
+ */
 async function findRelevantFiles(
   projectDir: string,
   taskDescription: string
@@ -149,14 +183,17 @@ async function findRelevantFiles(
 
   for (const keyword of keywords.slice(0, 5)) {
     try {
-      const { stdout } = await execAsync(
-        `grep -rl "${keyword}" --include="*.ts" --include="*.js" . 2>/dev/null | head -3`,
-        { cwd: projectDir }
+      // execFileAsync does not spawn a shell — keyword is passed as a plain argument,
+      // so shell metacharacters in keywords have no effect.
+      const { stdout } = await execFileAsync(
+        'grep',
+        ['-rl', keyword, '--include=*.ts', '--include=*.js', '.'],
+        { cwd: projectDir, maxBuffer: DEFAULT_MAX_BUFFER }
       );
-      for (const f of stdout.trim().split('\n').filter(Boolean)) {
+      for (const f of stdout.trim().split('\n').filter(Boolean).slice(0, 3)) {
         foundFiles.add(f);
       }
-    } catch { /* no matches */ }
+    } catch { /* grep exits 1 on no matches — not an error */ }
   }
 
   const results: { filepath: string; content: string }[] = [];

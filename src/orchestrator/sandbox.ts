@@ -1,10 +1,7 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
-
-const execAsync = promisify(exec);
+import { execFileAsync, sanitizeBranchName, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 
 export interface GateResult {
   gate: string;
@@ -22,6 +19,8 @@ export interface CommitDetails {
   coverageMetrics?: { lines: number; branches: number; functions: number; statements: number };
 }
 
+const EXEC_OPTS = { maxBuffer: DEFAULT_MAX_BUFFER };
+
 export class Sandbox {
   constructor(private projectDir: string) {}
 
@@ -38,23 +37,43 @@ export class Sandbox {
 
   /**
    * Create a git branch for sandboxed work.
+   * Branch name is validated against a strict allowlist before use.
    */
   async createBranch(branchName: string): Promise<void> {
     const logger = getLogger();
+    const safeBranch = sanitizeBranchName(branchName);
+
     try {
-      await execAsync('git rev-parse --is-inside-work-tree', { cwd: this.projectDir });
-    } catch {
-      await execAsync('git init && git add -A && git commit -m "Initial commit" --allow-empty', {
+      await execFileAsync('git', ['rev-parse', '--is-inside-work-tree'], {
         cwd: this.projectDir,
+        ...EXEC_OPTS,
+      });
+    } catch {
+      // Not a git repo — initialise one
+      const gitignorePath = path.join(this.projectDir, '.gitignore');
+      if (!fs.existsSync(gitignorePath)) {
+        fs.writeFileSync(gitignorePath, 'node_modules/\n.env\n.env.*\n*.key\n*.pem\n', 'utf-8');
+      }
+      await execFileAsync('git', ['init'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['add', '-A'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['commit', '-m', 'Initial commit', '--allow-empty'], {
+        cwd: this.projectDir,
+        ...EXEC_OPTS,
       });
     }
 
     try {
-      await execAsync(`git checkout -b ${branchName}`, { cwd: this.projectDir });
-      logger.info(`Created sandbox branch: ${branchName}`);
+      await execFileAsync('git', ['checkout', '-b', safeBranch], {
+        cwd: this.projectDir,
+        ...EXEC_OPTS,
+      });
+      logger.info(`Created sandbox branch: ${safeBranch}`);
     } catch {
-      await execAsync(`git checkout ${branchName}`, { cwd: this.projectDir });
-      logger.info(`Checked out existing branch: ${branchName}`);
+      await execFileAsync('git', ['checkout', safeBranch], {
+        cwd: this.projectDir,
+        ...EXEC_OPTS,
+      });
+      logger.info(`Checked out existing branch: ${safeBranch}`);
     }
   }
 
@@ -118,27 +137,29 @@ export class Sandbox {
       fullMessage = `${message}\n${lines.join('\n')}`;
     }
 
-    // Use a temp file for the commit message to avoid shell escaping issues
+    // Write commit message to a temp file to avoid any shell escaping issues
     const msgFile = path.join(this.projectDir, '.git', 'COMMIT_MSG_TMP');
     fs.writeFileSync(msgFile, fullMessage, 'utf-8');
     try {
-      await execAsync(`git add -A && git commit -F "${msgFile}"`, {
-        cwd: this.projectDir,
-      });
+      await execFileAsync('git', ['add', '-A'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['commit', '-F', msgFile], { cwd: this.projectDir, ...EXEC_OPTS });
     } finally {
       if (fs.existsSync(msgFile)) fs.unlinkSync(msgFile);
     }
   }
 
   /**
-   * Roll back the sandbox — discard all uncommitted changes and return to main branch.
+   * Roll back the sandbox — discard all uncommitted changes and return to original branch.
+   * originalBranch is validated before use.
    */
   async rollback(originalBranch: string): Promise<void> {
     const logger = getLogger();
+    const safeBranch = sanitizeBranchName(originalBranch);
     try {
-      await execAsync('git checkout -- . && git clean -fd', { cwd: this.projectDir });
-      await execAsync(`git checkout ${originalBranch}`, { cwd: this.projectDir });
-      logger.info(`Rolled back to ${originalBranch}`);
+      await execFileAsync('git', ['checkout', '--', '.'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['clean', '-fd'], { cwd: this.projectDir, ...EXEC_OPTS });
+      await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+      logger.info(`Rolled back to ${safeBranch}`);
     } catch (err) {
       logger.error(`Rollback failed: ${err}`);
     }
@@ -146,24 +167,28 @@ export class Sandbox {
 
   /**
    * Merge sandbox branch into the original branch, then delete the sandbox branch.
+   * Both branch names are validated before use.
    */
   async mergeAndCleanup(sandboxBranch: string, originalBranch: string): Promise<void> {
     const logger = getLogger();
-    await execAsync(`git checkout ${originalBranch}`, { cwd: this.projectDir });
-    await execAsync(`git merge ${sandboxBranch} --no-edit`, { cwd: this.projectDir });
-    await execAsync(`git branch -d ${sandboxBranch}`, { cwd: this.projectDir });
-    logger.info(`Merged ${sandboxBranch} into ${originalBranch}`);
+    const safeSandbox = sanitizeBranchName(sandboxBranch);
+    const safeOriginal = sanitizeBranchName(originalBranch);
+    await execFileAsync('git', ['checkout', safeOriginal], { cwd: this.projectDir, ...EXEC_OPTS });
+    await execFileAsync('git', ['merge', safeSandbox, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
+    await execFileAsync('git', ['branch', '-d', safeSandbox], { cwd: this.projectDir, ...EXEC_OPTS });
+    logger.info(`Merged ${safeSandbox} into ${safeOriginal}`);
   }
 
   /**
    * Get the current git branch name.
+   * Throws if git is unavailable or not in a repo — callers must store the
+   * original branch before switching rather than re-querying later.
    */
   async getCurrentBranch(): Promise<string> {
-    try {
-      const { stdout } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: this.projectDir });
-      return stdout.trim();
-    } catch {
-      return 'main';
-    }
+    const { stdout } = await execFileAsync(
+      'git', ['rev-parse', '--abbrev-ref', 'HEAD'],
+      { cwd: this.projectDir, ...EXEC_OPTS }
+    );
+    return stdout.trim();
   }
 }

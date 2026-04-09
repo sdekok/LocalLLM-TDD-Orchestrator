@@ -1,11 +1,8 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
+import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 import { getTestRunner, type TestMetrics, type CoverageMetrics, type TestResult } from './test-runner.js';
-
-const execAsync = promisify(exec);
 
 export interface GateResult {
   gate: string;
@@ -41,19 +38,24 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
   // If Lens passed, we still run full TSC for final safety until Lens is fully proven
   const tsconfigPath = path.join(projectDir, 'tsconfig.json');
   if (fs.existsSync(tsconfigPath)) {
-    gates.push(await runGate('typescript', 'npx tsc --noEmit', projectDir, true, 60_000));
+    gates.push(await runGate('typescript', ['npx', 'tsc', '--noEmit'], projectDir, true, 60_000));
   }
 
   // Gate 2: Tests pass (BLOCKING)
   const runner = getTestRunner(projectDir);
   if (runner) {
     const pkgJsonPath = path.join(projectDir, 'package.json');
-    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-    
+    let pkg: any = {};
+    try {
+      pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+    } catch (err) {
+      logger.warn(`Failed to parse ${pkgJsonPath}: ${(err as Error).message}`);
+    }
+
     // Check if we should run with coverage
     const hasCoverageScript = pkg.scripts?.['test:coverage'] || pkg.scripts?.coverage;
     const isVitest = runner.name === 'vitest' && (pkg.devDependencies?.['@vitest/coverage-v8'] || pkg.devDependencies?.['@vitest/coverage-istanbul']);
-    
+
     let result: TestResult;
     if (hasCoverageScript || isVitest) {
       result = await runner.runCoverage(projectDir, 120_000);
@@ -75,7 +77,7 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
     if (coverageMetrics) {
       const thresholds = pkg.tddConfig?.coverageThresholds || { lines: 80, functions: 80, branches: 70 };
       const coveragePass = checkCoverageThresholds(coverageMetrics, thresholds);
-      
+
       gates.push({
         gate: 'coverage',
         passed: coveragePass.passed,
@@ -92,7 +94,7 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
     (f) => fs.existsSync(path.join(projectDir, f))
   );
   if (eslintConfig) {
-    gates.push(await runGate('lint', 'npx eslint . --ext .ts,.js --max-warnings 0', projectDir, false, 30_000));
+    gates.push(await runGate('lint', ['npx', 'eslint', '.', '--ext', '.ts,.js', '--max-warnings', '0'], projectDir, false, 30_000));
   }
 
   // Gate 4: File safety (BLOCKING)
@@ -111,16 +113,26 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
   return { gates, allBlockingPassed, testMetrics, coverageMetrics };
 }
 
+/**
+ * Run a quality gate command.
+ * Accepts a command as [program, ...args] to avoid shell injection —
+ * execFile does not spawn a shell so arguments are passed directly.
+ */
 async function runGate(
   name: string,
-  command: string,
+  command: [string, ...string[]],
   cwd: string,
   blocking: boolean,
   timeoutMs: number
 ): Promise<GateResult> {
   const logger = getLogger();
+  const [program, ...args] = command;
   try {
-    const { stdout, stderr } = await execAsync(command, { cwd, timeout: timeoutMs });
+    const { stdout, stderr } = await execFileAsync(program, args, {
+      cwd,
+      timeout: timeoutMs,
+      maxBuffer: DEFAULT_MAX_BUFFER,
+    });
     logger.info(`Gate '${name}' PASSED`);
     return { gate: name, passed: true, output: (stdout + '\n' + stderr).trim(), blocking };
   } catch (err: unknown) {
@@ -237,18 +249,29 @@ async function getSourceFiles(projectDir: string): Promise<string[]> {
   return walk(projectDir);
 }
 
-// ─── Test Command Detection ──────────────────────────────────────
-
-// Removed manual test detection — handled by test-runner.ts
-
 // ─── File Safety ─────────────────────────────────────────────────
 
 async function checkFileSafety(projectDir: string): Promise<GateResult> {
   try {
-    const { stdout } = await execAsync('git diff --name-only HEAD 2>/dev/null || git ls-files --others --exclude-standard', {
-      cwd: projectDir,
-      timeout: 10_000,
-    });
+    let stdout: string;
+
+    try {
+      // Try to get files changed since last commit
+      const result = await execFileAsync('git', ['diff', '--name-only', 'HEAD'], {
+        cwd: projectDir,
+        timeout: 10_000,
+        maxBuffer: DEFAULT_MAX_BUFFER,
+      });
+      stdout = result.stdout;
+    } catch {
+      // No commits yet or not a git repo — list untracked files instead
+      const result = await execFileAsync('git', ['ls-files', '--others', '--exclude-standard'], {
+        cwd: projectDir,
+        timeout: 10_000,
+        maxBuffer: DEFAULT_MAX_BUFFER,
+      });
+      stdout = result.stdout;
+    }
 
     const unexpectedFiles = stdout
       .trim()
