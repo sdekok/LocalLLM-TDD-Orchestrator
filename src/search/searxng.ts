@@ -1,4 +1,5 @@
 import { getLogger } from '../utils/logger.js';
+import { validateExternalUrl } from '../utils/url-validator.js';
 
 export interface SearchResult {
   title: string;
@@ -19,13 +20,13 @@ export interface SearchOptions {
   maxResults?: number;
 }
 
-const SEARXNG_URL = process.env.SEARXNG_URL || 'http://localhost:8888';
-
 export class SearchClient {
   private baseURL: string;
 
   constructor(baseURL?: string) {
-    this.baseURL = baseURL || SEARXNG_URL;
+    // Read env var in constructor so it picks up the value at instantiation time
+    // rather than at module load time.
+    this.baseURL = baseURL ?? process.env.SEARXNG_URL ?? 'http://localhost:8888';
   }
 
   async search(query: string, options?: SearchOptions): Promise<SearchResult[]> {
@@ -52,11 +53,16 @@ export class SearchClient {
   }
 
   async searchAndSummarize(query: string, maxPages = 2): Promise<string> {
+    const logger = getLogger();
     const results = await this.search(query, { maxResults: maxPages });
 
     const pages: string[] = [];
     for (const result of results) {
       try {
+        // Validate the URL from search results before fetching — search results
+        // could be poisoned to point at internal network resources (SSRF).
+        await validateExternalUrl(result.url);
+
         const response = await fetch(result.url, {
           signal: AbortSignal.timeout(8_000),
           headers: { 'User-Agent': 'Mozilla/5.0 (compatible; TDDWorkflow/1.0)' },
@@ -64,7 +70,9 @@ export class SearchClient {
         const html = await response.text();
         const text = stripHTML(html).substring(0, 8_000);
         pages.push(`## ${result.title}\nSource: ${result.url}\n\n${text}`);
-      } catch {
+      } catch (err) {
+        // Blocked or failed URLs fall back to the search result snippet.
+        logger.warn(`Skipping URL ${result.url}: ${(err as Error).message}`);
         pages.push(`## ${result.title}\nSource: ${result.url}\n\n${result.content}`);
       }
     }
