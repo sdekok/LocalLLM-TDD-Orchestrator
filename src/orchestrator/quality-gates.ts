@@ -160,6 +160,27 @@ function checkCoverageThresholds(metrics: CoverageMetrics, thresholds: Partial<C
 }
 
 /**
+ * Controls what happens when the Lens gate itself crashes (e.g. lens-bridge
+ * is not installed on this machine).
+ *
+ * - 'fail-closed'  (default): a crash is treated as a gate failure.
+ *                  Use this in CI and production environments.
+ * - 'fail-open':   a crash is treated as a pass (old behaviour).
+ *                  Set LENS_FAIL_POLICY=fail-open on developer machines where
+ *                  Lens is not installed and you do not want to block work.
+ *
+ * The choice is read from the LENS_FAIL_POLICY environment variable so it is
+ * visible in logs and auditable, rather than being a silent hidden default.
+ */
+export type LensFailPolicy = 'fail-closed' | 'fail-open';
+
+export function getLensFailPolicy(): LensFailPolicy {
+  const raw = process.env['LENS_FAIL_POLICY'];
+  if (raw === 'fail-open') return 'fail-open';
+  return 'fail-closed'; // secure default
+}
+
+/**
  * Runs pi-lens analysis as a quality gate.
  * Leverages LSP diagnostics and structural bug patterns.
  */
@@ -215,11 +236,19 @@ async function runLensGate(projectDir: string): Promise<GateResult> {
       blocking: true,
     };
   } catch (err) {
-    logger.error(`Lens gate crashed: ${err instanceof Error ? err.message : String(err)}`);
+    const errMsg = err instanceof Error ? err.message : String(err);
+    logger.error(`Lens gate crashed: ${errMsg}`);
+
+    const policy = getLensFailPolicy();
+    const passed = policy === 'fail-open';
+    const policyLabel = policy === 'fail-open'
+      ? 'fail-open policy: treating as passed'
+      : 'fail-closed policy: treating as failed';
+
     return {
       gate: 'lens',
-      passed: true, // Fail safe - don't block if Lens itself crashes
-      output: `Lens analysis failed to run: ${err instanceof Error ? err.message : String(err)}`,
+      passed,
+      output: `Lens analysis failed to run (${policyLabel}): ${errMsg}`,
       blocking: true,
     };
   }

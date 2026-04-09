@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { QualityReport, runQualityGates } from '../../src/orchestrator/quality-gates.js';
+import { QualityReport, runQualityGates, getLensFailPolicy } from '../../src/orchestrator/quality-gates.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -107,15 +107,43 @@ describe('Lens Quality Gate', () => {
     expect(lensGate?.output).toContain('Structural issue found');
   });
 
-  it('should fail-safe (pass) if Lens bridge crashes', async () => {
-    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
-    (getLensClients as any).mockRejectedValue(new Error('Module not found'));
+  it('should fail-open (pass) if Lens bridge crashes and LENS_FAIL_POLICY=fail-open', async () => {
+    const saved = process.env['LENS_FAIL_POLICY'];
+    process.env['LENS_FAIL_POLICY'] = 'fail-open';
+    try {
+      const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+      (getLensClients as any).mockRejectedValue(new Error('Module not found'));
 
-    const report: QualityReport = await runQualityGates(projectDir);
-    const lensGate = report.gates.find(g => g.gate === 'lens');
+      const report: QualityReport = await runQualityGates(projectDir);
+      const lensGate = report.gates.find(g => g.gate === 'lens');
 
-    expect(lensGate?.passed).toBe(true);
-    expect(lensGate?.output).toContain('failed to run');
+      expect(lensGate?.passed).toBe(true);
+      expect(lensGate?.output).toContain('failed to run');
+      expect(lensGate?.output).toContain('fail-open policy');
+    } finally {
+      if (saved !== undefined) process.env['LENS_FAIL_POLICY'] = saved;
+      else delete process.env['LENS_FAIL_POLICY'];
+    }
+  });
+
+  it('should fail-closed (not pass) if Lens bridge crashes and LENS_FAIL_POLICY=fail-closed (default)', async () => {
+    const saved = process.env['LENS_FAIL_POLICY'];
+    delete process.env['LENS_FAIL_POLICY']; // ensure default (fail-closed)
+    try {
+      const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+      (getLensClients as any).mockRejectedValue(new Error('import failed'));
+
+      const report: QualityReport = await runQualityGates(projectDir);
+      const lensGate = report.gates.find(g => g.gate === 'lens');
+
+      expect(lensGate?.passed).toBe(false);
+      expect(lensGate?.output).toContain('failed to run');
+      expect(lensGate?.output).toContain('fail-closed policy');
+      // allBlockingPassed should be false since lens is blocking
+      expect(report.allBlockingPassed).toBe(false);
+    } finally {
+      if (saved !== undefined) process.env['LENS_FAIL_POLICY'] = saved;
+    }
   });
 });
 
@@ -171,5 +199,28 @@ describe('runGate: execFile (no shell) command execution', () => {
 
     // Should not throw — the gate pipeline continues with empty pkg config
     await expect(runQualityGates(tmpDir)).resolves.not.toThrow();
+  });
+});
+
+// ─── getLensFailPolicy ────────────────────────────────────────────
+
+describe('getLensFailPolicy', () => {
+  afterEach(() => {
+    delete process.env['LENS_FAIL_POLICY'];
+  });
+
+  it('returns fail-closed when env var is not set (secure default)', () => {
+    delete process.env['LENS_FAIL_POLICY'];
+    expect(getLensFailPolicy()).toBe('fail-closed');
+  });
+
+  it('returns fail-open when LENS_FAIL_POLICY=fail-open', () => {
+    process.env['LENS_FAIL_POLICY'] = 'fail-open';
+    expect(getLensFailPolicy()).toBe('fail-open');
+  });
+
+  it('returns fail-closed for unrecognised values', () => {
+    process.env['LENS_FAIL_POLICY'] = 'unknown-value';
+    expect(getLensFailPolicy()).toBe('fail-closed');
   });
 });
