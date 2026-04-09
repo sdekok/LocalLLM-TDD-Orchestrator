@@ -168,27 +168,29 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('research', {
-    description: 'Launch a Deep Research Agent to browse the web and distill knowledge',
+    description: 'Launch a Deep Research Agent to browse the web and distill knowledge. Flags: --bg (background), --shallow (single-pass), --time N (time limit in minutes, default 30)',
     handler: async (args: string, ctx) => {
-      // Parse background flag
+      // Parse flags from args
       let isBackground = false;
+      let isShallow = false;
+      let timeLimitMinutes: number | undefined;
       let topic = args.trim();
-      
-      const bgMatch = topic.match(/\s+(--bg|--background)$/i);
-      if (bgMatch) {
-        isBackground = true;
-        topic = topic.replace(bgMatch[0], '').trim();
-      }
+
+      // Extract flags (order-independent, can appear anywhere)
+      topic = topic.replace(/\s+--?(bg|background)\b/gi, () => { isBackground = true; return ''; });
+      topic = topic.replace(/\s+--?shallow\b/gi, () => { isShallow = true; return ''; });
+      topic = topic.replace(/\s+--?time\s+(\d+)/gi, (_match, mins) => { timeLimitMinutes = parseInt(mins, 10); return ''; });
+      topic = topic.trim();
 
       if (!topic) {
-        topic = await ctx.ui.input('Enter research topic or query (append --bg for background):') || '';
+        topic = await ctx.ui.input('Enter research topic (flags: --bg, --shallow, --time N):') || '';
         if (!topic) return;
-        
-        const lateBgMatch = topic.match(/\s+(--bg|--background)$/i);
-        if (lateBgMatch) {
-          isBackground = true;
-          topic = topic.replace(lateBgMatch[0], '').trim();
-        }
+
+        // Re-parse flags from interactive input
+        topic = topic.replace(/\s+--?(bg|background)\b/gi, () => { isBackground = true; return ''; });
+        topic = topic.replace(/\s+--?shallow\b/gi, () => { isShallow = true; return ''; });
+        topic = topic.replace(/\s+--?time\s+(\d+)/gi, (_match, mins) => { timeLimitMinutes = parseInt(mins, 10); return ''; });
+        topic = topic.trim();
       }
 
       const modelRouter = new ModelRouter();
@@ -202,7 +204,9 @@ export default function(pi: ExtensionAPI) {
 
       await performDeepResearch(topic, ctx.cwd, modelRouter, searchClient, {
         background: isBackground,
-        uiContext: ctx.ui
+        shallow: isShallow,
+        timeLimitMinutes,
+        uiContext: ctx.ui,
       });
     }
   });
