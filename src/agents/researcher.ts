@@ -1,4 +1,5 @@
 import { createSubAgentSession } from '../subagent/factory.js';
+import type { AgentSession } from '@mariozechner/pi-coding-agent';
 import { ModelRouter } from '../llm/model-router.js';
 import { createResearchTools } from '../subagent/research-tools.js';
 import { SearchClient } from '../search/searxng.js';
@@ -123,6 +124,46 @@ function postProgress(options: ResearchOptions, message: string, type: 'info' | 
     options.chatMessage(message);
   }
   options.uiContext.notify(message, type);
+}
+
+/**
+ * Maximum time (ms) to wait for a streaming session to finish before prompting.
+ * If the session is still streaming after this timeout, we proceed anyway
+ * (the Pi SDK will throw, and our caller handles it).
+ */
+const STREAMING_WAIT_TIMEOUT_MS = 30_000;
+
+/**
+ * Safely send a prompt to an agent session, waiting for any in-flight streaming
+ * to finish first.
+ *
+ * The Pi SDK's `session.prompt()` throws "Agent is already processing a prompt"
+ * when called while `session.isStreaming` is true. This can happen even with
+ * properly `await`ed calls — the previous prompt's streaming may not have fully
+ * flushed by the time the `await` resolves.
+ *
+ * This wrapper polls `isStreaming` with a short back-off before calling `prompt()`,
+ * preventing the race condition.
+ */
+export async function safePrompt(session: AgentSession, message: string): Promise<void> {
+  const logger = getLogger();
+
+  if (session.isStreaming) {
+    logger.info('[RESEARCHER] Session still streaming — waiting for completion before next prompt...');
+    const deadline = Date.now() + STREAMING_WAIT_TIMEOUT_MS;
+    let waitMs = 100;
+
+    while (session.isStreaming && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+      waitMs = Math.min(waitMs * 1.5, 2000); // exponential back-off, max 2 s
+    }
+
+    if (session.isStreaming) {
+      logger.warn('[RESEARCHER] Session still streaming after timeout — attempting prompt anyway');
+    }
+  }
+
+  await session.prompt(message);
 }
 
 /**
@@ -856,7 +897,7 @@ async function performShallowResearch(
 
   if (options.background) {
     options.uiContext.notify('Shallow research started in the background.', 'info');
-    session.prompt(buildResearchPrompt(topic, outFileName))
+    safePrompt(session, buildResearchPrompt(topic, outFileName))
       .then(() => {
         options.uiContext.notify(`Research on "${topic}" completed! Saved to ${outFileName}.`, 'info');
       })
@@ -869,7 +910,7 @@ async function performShallowResearch(
 
   options.uiContext.setStatus('research', '🔍 Researching...');
   try {
-    await session.prompt(buildResearchPrompt(topic, outFileName));
+    await safePrompt(session, buildResearchPrompt(topic, outFileName));
     options.uiContext.setStatus('research', undefined);
     options.uiContext.notify('Research completed!', 'info');
 
@@ -1006,7 +1047,7 @@ async function performMultiPhaseResearch(
   const runResearch = async () => {
     // ── If resuming, prime the agent with prior context ──
     if (isResume) {
-      await session.prompt(buildResumeContextPrompt(state, cwd));
+      await safePrompt(session, buildResumeContextPrompt(state, cwd));
     }
 
     // Helper to get total elapsed (including prior sessions)
@@ -1041,7 +1082,7 @@ async function performMultiPhaseResearch(
       options.uiContext.setStatus('research', '📋 Round 1: Decomposing topic into research questions...');
       postProgress(options, '🔬 Deep Research started — Round 1: Identifying research questions...');
 
-      await session.prompt(buildDecompositionPrompt(topic, questionsFile));
+      await safePrompt(session, buildDecompositionPrompt(topic, questionsFile));
 
       // Read the questions file to get the list
       const absQuestionsPath = path.resolve(cwd, questionsFile);
@@ -1055,7 +1096,7 @@ async function performMultiPhaseResearch(
         // Fallback: if the agent didn't write the file properly, do a single synthesis pass
         logger.warn('[RESEARCHER] Could not parse questions file — proceeding with single synthesis pass');
         options.uiContext.setStatus('research', '🔍 Researching topic...');
-        await session.prompt(buildResearchPrompt(topic, state.finalReportFile));
+        await safePrompt(session, buildResearchPrompt(topic, state.finalReportFile));
         state.synthesisComplete = true;
         state.totalElapsedMs = totalElapsed();
         saveResearchState(cwd, state);
@@ -1154,7 +1195,7 @@ async function performMultiPhaseResearch(
         );
         postProgress(options, `📖 Round ${round}, Q${i + 1}/${roundState.questions.length}: Researching — ${question.substring(0, 120)}`);
 
-        await session.prompt(
+        await safePrompt(session,
           buildQuestionResearchPrompt(
             i + 1,
             question,
@@ -1172,7 +1213,7 @@ async function performMultiPhaseResearch(
         if (notesContent.length < 100) {
           logger.warn(`[RESEARCHER] Notes file ${notesFile} is empty/stub (${notesContent.length} chars) — prompting agent to write findings`);
           options.uiContext.setStatus('research', `📝 Writing findings for Q${i + 1}...`);
-          await session.prompt(buildWriteFindingsPrompt(i + 1, question, notesFile));
+          await safePrompt(session, buildWriteFindingsPrompt(i + 1, question, notesFile));
 
           // Check again after retry
           const retryContent = fs.existsSync(absNotesPath)
@@ -1204,7 +1245,7 @@ async function performMultiPhaseResearch(
         options.uiContext.setStatus('research', `📄 Round ${round}: Writing summary of findings...`);
         postProgress(options, `📄 Round ${round}: Summarizing ${roundState.questionsResearched.length} questions into round summary...`);
 
-        await session.prompt(
+        await safePrompt(session,
           buildRoundSummaryPrompt(
             topic,
             round,
@@ -1221,7 +1262,7 @@ async function performMultiPhaseResearch(
           : '';
         if (summaryContent.length < 100) {
           logger.warn(`[RESEARCHER] Round summary ${summaryFile} is empty — prompting retry`);
-          await session.prompt(
+          await safePrompt(session,
             `⚠️ The round summary file **${summaryFile}** is empty. Read the notes files (${roundState.noteFiles.join(', ')}) and write a complete summary NOW. This is critical for the final report.`
           );
         }
@@ -1251,7 +1292,7 @@ async function performMultiPhaseResearch(
       options.uiContext.setStatus('research', `🤔 Round ${round}: Reflecting on research gaps...`);
       postProgress(options, `🤔 Round ${round} complete. Reflecting on gaps and new leads...`);
 
-      await session.prompt(
+      await safePrompt(session,
         buildReflectionPrompt(
           topic,
           round,
@@ -1312,7 +1353,7 @@ async function performMultiPhaseResearch(
       options.uiContext.setStatus('research', '📝 Writing report outline & Executive Summary...');
       postProgress(options, '📝 Step 1/3: Writing Executive Summary & report outline...');
 
-      await session.prompt(
+      await safePrompt(session,
         buildSynthesisOutlinePrompt(
           topic,
           state.roundSummaryFiles,
@@ -1332,7 +1373,7 @@ async function performMultiPhaseResearch(
         : '';
       if (reportContent.length < 100) {
         logger.warn(`[RESEARCHER] Final report outline is empty — prompting retry`);
-        await session.prompt(
+        await safePrompt(session,
           `⚠️ The report file **${state.finalReportFile}** is empty. Write the outline and Executive Summary NOW. This is the critical first step.`
         );
         reportContent = fs.existsSync(absFinalPath)
@@ -1346,7 +1387,7 @@ async function performMultiPhaseResearch(
         options.uiContext.setStatus('research', `📝 Writing Key Findings for Round ${roundState.round}...`);
         postProgress(options, `📝 Step 2/3: Writing Key Findings — Round ${roundState.round} of ${numRounds}...`);
 
-        await session.prompt(
+        await safePrompt(session,
           buildSynthesisRoundPrompt(
             topic,
             roundState.round,
@@ -1365,7 +1406,7 @@ async function performMultiPhaseResearch(
           : '';
         if (currentContent.length <= reportContent.length) {
           logger.warn(`[RESEARCHER] Report did not grow after round ${roundState.round} findings — file may not have been appended`);
-          await session.prompt(
+          await safePrompt(session,
             `⚠️ The report file **${state.finalReportFile}** was not updated. Read the current file, then APPEND the Key Findings for round ${roundState.round} at the end. Do NOT overwrite existing content.`
           );
         }
@@ -1378,7 +1419,7 @@ async function performMultiPhaseResearch(
       options.uiContext.setStatus('research', '📝 Writing Implementation Guide & References...');
       postProgress(options, '📝 Step 3/3: Writing Implementation Guide, Risks & References...');
 
-      await session.prompt(
+      await safePrompt(session,
         buildSynthesisClosingPrompt(
           topic,
           state.allNoteFiles,
@@ -1397,7 +1438,7 @@ async function performMultiPhaseResearch(
         options.uiContext.setStatus('research', '📝 Completing missing report sections...');
         postProgress(options, `📝 Report incomplete — writing ${missing.length} missing section(s)...`);
 
-        await session.prompt(
+        await safePrompt(session,
           buildSynthesisContinuationPrompt(state.finalReportFile, missing)
         );
 

@@ -248,10 +248,17 @@ export default function(pi: ExtensionAPI) {
         resumeDir,
         uiContext: ctx.ui,
         chatMessage: (content: string) => {
-          pi.sendMessage(
-            { customType: 'research-progress', content, display: true, details: {} },
-            { triggerTurn: false }
-          );
+          try {
+            pi.sendMessage(
+              { customType: 'research-progress', content, display: true, details: {} },
+              { triggerTurn: false }
+            );
+          } catch (err) {
+            // pi.sendMessage() can occasionally interfere with an active agent session.
+            // Swallow the error — the message is also delivered via uiContext.notify().
+            const logger = getLogger();
+            logger.warn(`[PI] chatMessage sendMessage failed (non-fatal): ${(err as Error).message}`);
+          }
         },
       });
     }
