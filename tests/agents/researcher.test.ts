@@ -1058,11 +1058,13 @@ describe('buildQuestionResearchPrompt', () => {
     expect(p).toContain('Topic X');
   });
 
-  it('emphasizes write-last workflow to prevent empty files', () => {
+  it('emphasizes write-last workflow and round isolation to prevent overwrites', () => {
     const p = buildQuestionResearchPrompt(1, 'Q?', 1, 'notes.md', 'Topic');
     expect(p).toContain('DO NOT create the file until you have completed ALL research');
     expect(p).toContain('DO NOT create empty placeholder files');
     expect(p).toContain('last tool call');
+    expect(p).toContain('DO NOT modify, move, or delete ANY files from previous rounds');
+    expect(p).toContain('Write ONLY to the EXACT path specified below');
   });
 });
 

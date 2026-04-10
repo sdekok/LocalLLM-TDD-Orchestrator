@@ -390,6 +390,8 @@ export function buildQuestionResearchPrompt(
     '⚠️  **DO NOT create the file until you have completed ALL research above.**',
     '⚠️  **DO NOT create empty placeholder files.**',
     '⚠️  **The file write MUST be your last tool call, containing ALL findings.**',
+    '⚠️  **DO NOT modify, move, or delete ANY files from previous rounds.**',
+    '⚠️  **Write ONLY to the EXACT path specified below — no other path.**',
     '',
     `Write the complete findings as a single write to **${notesFile}** using this structure:`,
     '',
@@ -1136,7 +1138,12 @@ async function performMultiPhaseResearch(
         }
 
         const question = roundState.questions[i]!;
-        const noteFileName = buildNoteFileName(i + 1, question);
+        // Use GLOBAL question number (not per-round) to prevent filename collisions.
+        // If the agent accidentally writes to the wrong round directory, global numbering
+        // ensures it won't overwrite earlier round's files (e.g., round 2 starts at 09_
+        // instead of 01_, so even a misplaced write can't clobber round 1's 01_-08_ files).
+        const globalQNum = state.allNoteFiles.length + 1;
+        const noteFileName = buildNoteFileName(globalQNum, question);
         const roundDir = roundDirPath(state.topicDir, round);
         const notesFile = `${roundDir}/${noteFileName}`;
 
