@@ -5,63 +5,48 @@ import { LLMClient } from '../../src/llm/client.js';
 function makeTestConfig(): ModelRouterConfig {
   return {
     models: {
-      'gemma-test': {
-        name: 'Gemma 4',
-        ggufFilename: 'gemma-4.gguf',
+      'thinking-model': {
+        name: 'Thinking Model',
+        ggufFilename: 'thinking-27b.gguf',
         provider: 'local',
         contextWindow: 128000,
         maxOutputTokens: 8192,
         architecture: 'dense',
-        speed: 'fast',
-        modelFamily: 'gemma4',
+        speed: 'slow',
         enableThinking: true,
       },
-      'qwen-think-test': {
-        name: 'Qwen 3',
-        ggufFilename: 'qwen-3.gguf',
-        provider: 'local',
-        contextWindow: 128000,
-        maxOutputTokens: 8192,
-        architecture: 'moe',
-        speed: 'medium',
-        modelFamily: 'qwen35',
-        enableThinking: true,
-      },
-      'qwen-instruct': {
-        name: 'Qwen 3 Instruct',
-        ggufFilename: 'qwen-3-ins.gguf',
+      'fast-model': {
+        name: 'Fast Model',
+        ggufFilename: 'fast-30b-a3b.gguf',
         provider: 'local',
         contextWindow: 128000,
         maxOutputTokens: 8192,
         architecture: 'moe',
         speed: 'fast',
-        modelFamily: 'qwen35',
         enableThinking: false,
+        samplingParams: { temperature: 0.3, top_k: 20 },
       },
     },
     routing: {
-      plan: 'gemma-test',
-      implement: 'qwen-think-test',
-      review: 'qwen-instruct',
+      plan: 'thinking-model',
+      implement: 'fast-model',
     },
   };
 }
 
-describe('Model Tuning and Family Defaults', () => {
-  it('returns empty when samplingParams is omitted', () => {
+describe('ModelRouter sampling', () => {
+  it('returns empty object when samplingParams is omitted from profile', () => {
     const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('plan');
+    const params = router.getSamplingParams('plan'); // thinking-model has no samplingParams
     expect(params.temperature).toBeUndefined();
-    expect(params.top_p).toBeUndefined();
     expect(params.top_k).toBeUndefined();
   });
 
-  it('preserves empty sampling across families', () => {
+  it('returns configured samplingParams when present', () => {
     const router = new ModelRouter(makeTestConfig());
-    const thinkParams = router.getSamplingParams('implement');
-    const instructParams = router.getSamplingParams('review');
-    expect(thinkParams.temperature).toBeUndefined();
-    expect(instructParams.temperature).toBeUndefined();
+    const params = router.getSamplingParams('implement'); // fast-model has samplingParams
+    expect(params.temperature).toBe(0.3);
+    expect(params.top_k).toBe(20);
   });
 });
 
@@ -73,27 +58,12 @@ const { mockCreate } = vi.hoisted(() => ({
 
 vi.mock('openai', () => {
   class MockOpenAI {
-    chat = {
-      completions: {
-        create: mockCreate
-      }
-    }
+    chat = { completions: { create: mockCreate } }
   }
-  return {
-    default: MockOpenAI,
-    OpenAI: MockOpenAI
-  };
+  return { default: MockOpenAI, OpenAI: MockOpenAI };
 });
 
-describe('Model Tuning and Family Defaults', () => {
-  it('returns empty when samplingParams is omitted', () => {
-    const router = new ModelRouter(makeTestConfig());
-    const params = router.getSamplingParams('plan');
-    expect(params.temperature).toBeUndefined();
-  });
-});
-
-describe('LLMClient Prompt Mutations', () => {
+describe('LLMClient.askStructured', () => {
   beforeEach(() => {
     mockCreate.mockClear();
     mockCreate.mockResolvedValue({
@@ -101,36 +71,30 @@ describe('LLMClient Prompt Mutations', () => {
     });
   });
 
-  it('injects <|think|> into system prompt for gemma4 with thinking enabled', async () => {
-    const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient(router);
-    
+  it('passes the system prompt through without modification', async () => {
+    const client = new LLMClient(new ModelRouter(makeTestConfig()));
     await client.askStructured('You are a helpful assistant.', 'Help me', { type: 'object' }, 'plan');
-    
-    expect(mockCreate).toHaveBeenCalled();
+
     const args = mockCreate.mock.calls[0][0];
-    
-    expect(args.messages[0].role).toBe('system');
-    expect(args.messages[0].content).toContain('<|think|>\nYou are a helpful assistant.');
+    expect(args.messages[0].content).toContain('You are a helpful assistant.');
+    expect(args.messages[0].content).not.toContain('<|think|>');
   });
 
-  it('does NOT floor temperature for qwen thinking models (trusting server)', async () => {
-    const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient(router);
-    
+  it('merges profile samplingParams with the caller-supplied temperature', async () => {
+    const client = new LLMClient(new ModelRouter(makeTestConfig()));
     await client.askStructured('System', 'User', { type: 'object' }, 'implement', 0.1);
-    
+
     const args = mockCreate.mock.calls[0][0];
-    expect(args.temperature).toBe(0.1); 
+    expect(args.temperature).toBe(0.1);   // caller wins
+    expect(args.top_k).toBe(20);           // from profile.samplingParams
   });
 
-  it('allows temperature lower than 0.6 for qwen instruct models', async () => {
-    const router = new ModelRouter(makeTestConfig());
-    const client = new LLMClient(router);
-    
-    await client.askStructured('System', 'User', { type: 'object' }, 'review', 0.1);
-    
+  it('uses only the caller temperature when profile has no samplingParams', async () => {
+    const client = new LLMClient(new ModelRouter(makeTestConfig()));
+    await client.askStructured('System', 'User', { type: 'object' }, 'plan', 0.2);
+
     const args = mockCreate.mock.calls[0][0];
-    expect(args.temperature).toBe(0.1); // Should remain 0.1 since not thinking
+    expect(args.temperature).toBe(0.2);
+    expect(args.top_k).toBeUndefined();
   });
 });

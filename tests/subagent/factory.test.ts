@@ -47,7 +47,6 @@ describe('SubAgent Factory', () => {
         maxOutputTokens: 1024,
         architecture: 'dense',
         speed: 'fast',
-        modelFamily: 'generic',
         enableThinking: false,
       }
     },

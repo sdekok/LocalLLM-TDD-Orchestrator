@@ -49,7 +49,6 @@ describe('WorkflowExecutor - Refinement and Epic Loading', () => {
           maxOutputTokens: 1024,
           architecture: 'dense',
           speed: 'fast',
-          modelFamily: 'generic',
           enableThinking: false,
         }
       },

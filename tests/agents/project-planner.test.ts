@@ -139,7 +139,6 @@ describe('Project Planner Integration', () => {
         maxOutputTokens: 1024,
         architecture: 'dense',
         speed: 'fast',
-        modelFamily: 'generic',
         enableThinking: false,
       }
     },
@@ -372,7 +371,6 @@ describe('planProject', () => {
         maxOutputTokens: 1024,
         architecture: 'dense',
         speed: 'fast',
-        modelFamily: 'generic',
         enableThinking: false,
       }
     },
@@ -447,6 +445,84 @@ describe('planProject', () => {
     expect(uiContext.editor).toHaveBeenCalled();
     expect(uiContext.confirm).toHaveBeenCalled();
     expect(mockFs.writeFileSync).toHaveBeenCalled();
+  });
+
+  it('extracts plan from thinking blocks when no text blocks are present', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    const mockSession = {
+      prompt: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            {
+              type: 'thinking',
+              thinking: '{"reasoning":"Thought it through","summary":"Thinking Model Plan","epics":[],"architecturalDecisions":["Use TypeScript"]}',
+            },
+            // deliberately no 'text' block
+          ],
+        },
+      ],
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const result = await planProject('Build something', mockModelRouter, '/tmp/test');
+
+    expect(result.plan?.summary).toBe('Thinking Model Plan');
+    expect(mockSession.prompt).toHaveBeenCalledTimes(1); // no retry needed
+  });
+
+  it('retries with a follow-up prompt when the first response has no JSON', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    const messagesStore: any[] = [];
+    const mockSession = {
+      prompt: vi.fn().mockImplementation(async () => {
+        if (messagesStore.length === 0) {
+          // First call: conversational response, no JSON
+          messagesStore.push({ role: 'assistant', content: [{ type: 'text', text: 'Sure, I can help plan that for you!' }] });
+        } else {
+          // Second call (follow-up): returns valid JSON
+          messagesStore.push({ role: 'assistant', content: [{ type: 'text', text: '{"reasoning":"r","summary":"Retry Plan","epics":[],"architecturalDecisions":[]}' }] });
+        }
+      }),
+      dispose: vi.fn(),
+      get messages() { return messagesStore; },
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const result = await planProject('Build something', mockModelRouter, '/tmp/test');
+
+    expect(result.plan?.summary).toBe('Retry Plan');
+    expect(mockSession.prompt).toHaveBeenCalledTimes(2);
+    // Second call should ask for JSON explicitly
+    const retryPrompt = mockSession.prompt.mock.calls[1][0] as string;
+    expect(retryPrompt).toContain('JSON');
+  });
+
+  it('throws a clear error when both initial response and retry contain no JSON', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    const mockSession = {
+      prompt: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: 'I cannot produce JSON.' }] }],
+    };
+    (createSubAgentSession as any).mockResolvedValue(mockSession);
+
+    await expect(planProject('Build something', mockModelRouter, '/tmp/test'))
+      .rejects.toThrow('Invalid plan format after retry');
+
+    expect(mockSession.prompt).toHaveBeenCalledTimes(2);
   });
 
   it('cancels planning if user rejects the editor review', async () => {

@@ -4,6 +4,7 @@ import { ModelRouter } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { ProjectPlanSchema, type ProjectPlan } from './project-plan-schema.js';
 import { generatePlanMarkdown } from './components/markdown-generator.js';
+import { extractPlanFromResponse } from './components/response-extractor.js';
 export { generatePlanMarkdown };
 export { extractPlanFromResponse } from './components/response-extractor.js';
 import * as fs from 'fs';
@@ -104,10 +105,18 @@ export async function planProject(
       });
     }
 
-    // Extract text content from the message
-    const assistantText = Array.isArray(lastAssistantMessage.content)
-      ? lastAssistantMessage.content.filter(c => c.type === 'text').map(c => (c as any).text).join('\n')
-      : (lastAssistantMessage.content as string);
+    // Extract text content from the message. Thinking blocks are a fallback for
+    // reasoning models that don't emit a separate text block in passthrough mode.
+    const extractText = (msg: any): string => {
+      if (typeof msg.content === 'string') return msg.content;
+      if (!Array.isArray(msg.content)) return '';
+      const textBlocks = msg.content.filter((c: any) => c.type === 'text').map((c: any) => c.text as string);
+      if (textBlocks.length > 0) return textBlocks.join('\n');
+      // Fallback: try thinking blocks
+      return msg.content.filter((c: any) => c.type === 'thinking').map((c: any) => c.thinking as string).join('\n');
+    };
+
+    let assistantText = extractText(lastAssistantMessage);
 
     // Comprehensive logging
     logger.info(`--- PLANNER EXTRACTION DETAILS ---`);
@@ -118,31 +127,37 @@ export async function planProject(
     logger.debug(`[DEBUG] Planner session completed. Total messages: ${messages.length}`);
     logger.debug(`[DEBUG] Last assistant response length: ${assistantText.length}`);
     logger.debug(`[DEBUG] Last assistant raw message content: ${JSON.stringify(lastAssistantMessage.content, null, 2)}`);
-    logger.debug(`[DEBUG] Checking all assistant messages:`);
-    assistantMessages.forEach((msg, idx) => {
-      logger.debug(`  Assistant message ${idx}: Full message object keys: ${Object.keys(msg).join(', ')}`);
-      logger.debug(`  Message JSON: ${JSON.stringify(msg, (key, value) => {
-        if (typeof value === 'string' && value.length > 500) {
-          return value.substring(0, 500) + '... (truncated)';
-        }
-        return value;
-      }, 2)}`);
-    });
 
-    // Parse and validate the JSON
+    // Parse and validate the JSON. If the model didn't return JSON (common with passthrough
+    // mode chat models), send a follow-up prompt that explicitly requests structured output.
     let plan: ProjectPlan;
     try {
-      // Try to find JSON in the response (agent might add conversational text)
-      const jsonMatch = assistantText.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('No JSON object found in agent response.');
+      plan = extractPlanFromResponse(assistantText);
+    } catch {
+      logger.info(`[PLANNER] No JSON in initial response — sending follow-up prompt for structured output.`);
+      const schemaHint = `{"reasoning":"string","summary":"string","epics":[{"title":"string","slug":"string","description":"string","workItems":[{"id":"string","title":"string","description":"string","acceptance":["string"],"tests":["string"]}]}],"architecturalDecisions":["string"]}`;
+      await session.prompt(
+        `Your previous response did not contain a valid JSON plan.\n\n` +
+        `Please respond with ONLY a JSON object — no prose, no markdown fences — that matches this shape:\n${schemaHint}\n\n` +
+        `Use the exploration you already did. Output the JSON now.`
+      );
+
+      const retryMessages = session.messages.filter((m: any) => m.role === 'assistant');
+      const retryMessage = retryMessages[retryMessages.length - 1];
+      if (!retryMessage) {
+        throw new Error('Agent did not produce a response on retry.');
       }
-      const parsed = JSON.parse(jsonMatch[0]);
-      plan = ProjectPlanSchema.parse(parsed);
-    } catch (err) {
-      const e = err as Error;
-      logger.debug(`[DEBUG] Failed to parse plan JSON: ${e.message}`);
-      throw new Error(`Invalid plan format: ${e.message}. Raw output:\n${assistantText.substring(0, 500)}`);
+      assistantText = extractText(retryMessage);
+      logger.info(`[PLANNER] Retry response length: ${assistantText.length} characters`);
+      logger.info(`[PLANNER] Retry response preview: ${assistantText.substring(0, 200)}`);
+
+      try {
+        plan = extractPlanFromResponse(assistantText);
+      } catch (retryErr) {
+        const e = retryErr as Error;
+        logger.debug(`[DEBUG] Failed to parse plan JSON after retry: ${e.message}`);
+        throw new Error(`Invalid plan format after retry: ${e.message}. Raw output:\n${assistantText.substring(0, 500)}`);
+      }
     }
 
     // If UI context is provided, show the plan for review

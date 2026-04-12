@@ -18,7 +18,6 @@ import {
 import * as path from 'path';
 import { type Model } from '@mariozechner/pi-ai';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
-import { getTuner } from '../llm/tuners/registry.js';
 import { getLogger } from '../utils/logger.js';
 import { getAskUserForClarificationParams, type AskUserForClarificationArgs } from './tools.js';
 
@@ -46,32 +45,19 @@ export interface SubAgentOptions {
 
 /**
  * Factory for spawning ephemeral Pi sub-agent sessions.
- * Integrates with the existing ModelRouter and ModelTuner system.
  */
 export async function createSubAgentSession(options: SubAgentOptions): Promise<AgentSession> {
   const logger = getLogger();
   const profile = options.modelRouter.selectModel(options.taskType);
   logger.info(`[SUBAGENT FACTORY] Selected model for ${options.taskType}: ${profile.modelId || profile.ggufFilename}`);
   logger.info(`[SUBAGENT FACTORY] Model provider: ${profile.provider}, Thinking enabled: ${profile.enableThinking}`);
-  
-  const tuner = getTuner(profile.modelFamily);
-
-  // Apply model-specific tweaks (thinking, prompt mutations, sampling floor)
-  const samplingParams = options.modelRouter.getSamplingParams(options.taskType);
-  const { systemPrompt: tunedPrompt, sampling } = tuner.applyTweaks(
-    profile,
-    options.systemPrompt,
-    samplingParams
-  );
-  
-  logger.info(`[SUBAGENT FACTORY] Tuning applied.`);
 
   // Inject feedback Context if provided
   const feedbackContext = options.feedback
     ? `\n\nPREVIOUS ATTEMPT FAILED. Feedback for this attempt:\n${options.feedback}\n\nFix these issues.`
     : '';
   
-  const finalPrompt = tunedPrompt.replace('{feedbackContext}', feedbackContext);
+  const finalPrompt = options.systemPrompt.replace('{feedbackContext}', feedbackContext);
 
   // Populate task metadata placeholders from Epic/WorkItem context
   const meta = options.taskMetadata;
@@ -147,13 +133,13 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   // We explicitly load the project's pi-lens extension so it's available as tools.
   const extensionPaths = [path.join(options.cwd, 'node_modules/pi-lens')];
 
-  // For Gemma 4 with thinking enabled, register an extension that strips thought
-  // blocks from prior assistant messages. Google recommends keeping only the final
-  // visible answer in multi-turn history to prevent thinking quality degradation.
+  // When thinking mode is active, register an extension that strips thinking
+  // blocks from prior assistant messages. Keeping only the final visible answer
+  // in multi-turn history prevents thinking quality degradation on subsequent turns.
   const extensionFactories: ExtensionFactory[] = [];
-  if (profile.modelFamily === 'gemma4' && profile.enableThinking) {
-    extensionFactories.push(createGemma4ThinkingFilter());
-    logger.info('[SUBAGENT FACTORY] Registered Gemma 4 thinking-filter extension');
+  if (profile.enableThinking) {
+    extensionFactories.push(createThinkingFilter());
+    logger.info('[SUBAGENT FACTORY] Registered thinking-filter extension');
   }
 
   const loader = new DefaultResourceLoader({
@@ -242,7 +228,7 @@ export function stripThinkingFromHistory(messages: any[]): any[] {
 }
 
 /** Wraps stripThinkingFromHistory as a Pi SDK extension factory. */
-function createGemma4ThinkingFilter(): ExtensionFactory {
+function createThinkingFilter(): ExtensionFactory {
   return (pi) => {
     pi.on('context', (event) => {
       return { messages: stripThinkingFromHistory(event.messages) };

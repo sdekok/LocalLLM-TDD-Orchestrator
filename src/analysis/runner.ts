@@ -97,23 +97,35 @@ export function isAnalysisStale(projectDir: string): boolean {
   if (!fs.existsSync(summaryPath)) return true;
 
   const analysisMtime = fs.statSync(summaryPath).mtimeMs;
-  const srcDir = path.join(projectDir, 'src');
+  
+  // Common source directories in various project structures
+  const scanDirs = ['src', 'apps', 'libs'].filter(d => fs.existsSync(path.join(projectDir, d)));
+  
+  if (scanDirs.length === 0) {
+    // If none of the common dirs exist, it's either a simple project or something else.
+    // For safety, we check the root but with basic exclusions.
+    scanDirs.push('.');
+  }
 
-  if (!fs.existsSync(srcDir)) return true;
-
-  // Check if any source file is newer than the analysis
-  try {
-    const files = fs.readdirSync(srcDir, { recursive: true }) as string[];
-    for (const file of files) {
-      const filePath = path.join(srcDir, file);
-      try {
-        const stat = fs.statSync(filePath);
-        if (stat.isFile() && stat.mtimeMs > analysisMtime) {
-          return true;
-        }
-      } catch { /* file access error */ }
-    }
-  } catch { /* directory read error */ }
+  for (const dirName of scanDirs) {
+    const dirPath = dirName === '.' ? projectDir : path.join(projectDir, dirName);
+    try {
+      // Note: non-recursive readdir for the root check to avoid scanning node_modules if no src/apps/libs
+      const files = fs.readdirSync(dirPath, { recursive: dirName !== '.' }) as string[];
+      for (const file of files) {
+        // Basic exclusions for root scan
+        if (file.includes('node_modules') || file.includes('.git') || file.includes(ANALYSIS_DIR) || file.includes('dist')) continue;
+        
+        const filePath = path.join(dirPath, file);
+        try {
+          const stat = fs.statSync(filePath);
+          if (stat.isFile() && stat.mtimeMs > analysisMtime) {
+            return true;
+          }
+        } catch { /* file access error */ }
+      }
+    } catch { /* directory read error */ }
+  }
 
   return false;
 }

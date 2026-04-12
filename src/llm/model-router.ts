@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 import { getLogger } from '../utils/logger.js';
-import { getTuner } from './tuners/registry.js';
 
 export interface SamplingParams {
   temperature?: number;
@@ -14,7 +14,6 @@ export interface SamplingParams {
 }
 
 export type ModelProvider = 'local' | 'openrouter' | 'openai' | 'custom';
-export type ModelFamily = 'gemma4' | 'qwen35' | 'llama' | 'deepseek' | 'claude' | 'generic';
 
 export interface ModelProfile {
   name: string;
@@ -25,8 +24,7 @@ export interface ModelProfile {
   // apiKey intentionally removed — store secrets only in environment variables.
   // Use apiKeyEnvVar to name the env var, e.g. 'OPENROUTER_API_KEY'.
   apiKeyEnvVar?: string;         // Environment variable name for API key
-  modelFamily?: ModelFamily;     // Model family for auto-tuning defaults and prompt handling
-  enableThinking?: boolean;      // Whether to attempt to activate reasoning/thinking mode
+  enableThinking?: boolean;      // Whether to activate reasoning mode + thinking-block history filter
   contextWindow: number;
   maxOutputTokens: number;
   architecture: 'dense' | 'moe' | 'unknown';
@@ -55,49 +53,82 @@ export interface ModelRouterConfig {
 }
 
 const CONFIG_FILENAMES = ['models.config.json', 'models.config.local.json'];
-const EXAMPLE_FILENAME = 'models.config.example.json';
 
 /**
- * Load model config from a JSON file.
- * Search order: models.config.local.json (user override) → models.config.json → example fallback.
+ * Walk up the directory tree from startDir to find the nearest package root
+ * (first directory that contains a package.json).
  */
-export function loadConfig(projectDir?: string): ModelRouterConfig | null {
-  const searchDirs = [
-    projectDir,
-    process.env.TDD_WORKFLOW_CONFIG_DIR,
-    path.dirname(new URL(import.meta.url).pathname), // Same dir as this file
-    process.cwd(),
-  ].filter(Boolean) as string[];
+function findPackageRoot(startDir: string): string {
+  let dir = startDir;
+  while (dir !== path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    dir = path.dirname(dir);
+  }
+  return startDir;
+}
 
-  // Try config files in priority order
-  for (const dir of searchDirs) {
+/**
+ * Load a config from the first matching file in the given directories.
+ */
+function loadFirstConfig(dirs: string[]): ModelRouterConfig | null {
+  for (const dir of dirs) {
     for (const filename of CONFIG_FILENAMES) {
       const configPath = path.join(dir, filename);
       if (fs.existsSync(configPath)) {
         try {
-          const raw = fs.readFileSync(configPath, 'utf-8');
-          return JSON.parse(raw) as ModelRouterConfig;
+          return JSON.parse(fs.readFileSync(configPath, 'utf-8')) as ModelRouterConfig;
         } catch (err) {
-          getLogger().warn(`Failed to parse ${configPath}: ${(err as Error).message}. Trying next config file.`);
+          getLogger().warn(`Failed to parse ${configPath}: ${(err as Error).message}. Trying next.`);
         }
       }
     }
   }
-
-  // Try the example config as last resort
-  for (const dir of searchDirs) {
-    const examplePath = path.join(dir, EXAMPLE_FILENAME);
-    if (fs.existsSync(examplePath)) {
-      try {
-        const raw = fs.readFileSync(examplePath, 'utf-8');
-        return JSON.parse(raw) as ModelRouterConfig;
-      } catch (err) {
-        getLogger().warn(`Failed to parse ${examplePath}: ${(err as Error).message}.`);
-      }
-    }
-  }
-
   return null;
+}
+
+/**
+ * Load the project-level config. Searches (in order):
+ *   1. projectDir (explicit path, e.g. ctx.cwd from the Pi interface)
+ *   2. TDD_WORKFLOW_CONFIG_DIR env var
+ *   3. process.cwd()
+ */
+export function loadConfig(projectDir?: string): ModelRouterConfig | null {
+  const searchDirs = [
+    projectDir,
+    process.env['TDD_WORKFLOW_CONFIG_DIR'],
+    process.cwd(),
+  ].filter(Boolean) as string[];
+
+  return loadFirstConfig(searchDirs);
+}
+
+/**
+ * Load the global/system-level config. Searches (in order):
+ *   1. ~/.config/tdd-workflow/  (XDG-style user home)
+ *   2. The extension package root (directory of the installed plugin's package.json)
+ *
+ * This config is used as a baseline — project configs are merged on top of it,
+ * so individual model profiles and routing entries can be overridden per-project
+ * without having to repeat everything.
+ */
+export function loadGlobalConfig(): ModelRouterConfig | null {
+  const extensionRoot = findPackageRoot(path.dirname(new URL(import.meta.url).pathname));
+  const homeCfgDir = path.join(os.homedir(), '.config', 'tdd-workflow');
+
+  return loadFirstConfig([homeCfgDir, extensionRoot]);
+}
+
+/**
+ * Merge two configs. overlay wins on every conflict; base provides defaults.
+ * Models and routing are merged key-by-key so a project config only needs to
+ * declare the profiles and routes it wants to override or add.
+ */
+export function mergeConfigs(base: ModelRouterConfig, overlay: ModelRouterConfig): ModelRouterConfig {
+  return {
+    llamaCppUrl: overlay.llamaCppUrl ?? base.llamaCppUrl,
+    models: { ...base.models, ...overlay.models },
+    routing: { ...base.routing, ...overlay.routing },
+  };
 }
 
 /**
@@ -129,7 +160,6 @@ const PASSTHROUGH_PROFILE: ModelProfile = {
   maxOutputTokens: 8_192,
   architecture: 'unknown',
   speed: 'medium',
-  modelFamily: 'generic',
   enableThinking: false,
 };
 
@@ -138,22 +168,38 @@ export class ModelRouter {
   /** True when operating without a models.config.json — defers model selection to Pi. */
   readonly isPassthrough: boolean;
 
-  constructor(config?: ModelRouterConfig | null) {
+  constructor(config?: ModelRouterConfig | null, projectDir?: string) {
     if (config) {
       this.config = config;
       this.isPassthrough = false;
     } else {
-      const loaded = loadConfig();
-      if (!loaded) {
+      const projectConfig = loadConfig(projectDir);
+      const globalConfig = loadGlobalConfig();
+
+      let merged: ModelRouterConfig | null = null;
+      if (projectConfig && globalConfig) {
+        merged = mergeConfigs(globalConfig, projectConfig);
+        getLogger().info('Model routing: merged global + project config.');
+      } else if (projectConfig) {
+        merged = projectConfig;
+        getLogger().info('Model routing: using project config only.');
+      } else if (globalConfig) {
+        merged = globalConfig;
+        getLogger().info('Model routing: using global config only (no project override).');
+      }
+
+      if (!merged) {
         getLogger().warn(
           'No models.config.json found — model routing is disabled. ' +
           "Pi's currently active model will be used for all sub-agents. " +
-          'Run `npx tsx scripts/setup-wizard.ts` to enable model routing.'
+          'Place models.config.json in ~/.config/tdd-workflow/ for a system-wide default, ' +
+          'or in your project root to override per-project. ' +
+          'Run the /setup command in Pi to configure interactively.'
         );
         this.config = { models: {}, routing: {} };
         this.isPassthrough = true;
       } else {
-        this.config = loaded;
+        this.config = merged;
         this.isPassthrough = false;
       }
     }

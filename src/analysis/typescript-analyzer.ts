@@ -21,15 +21,21 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
   readonly languages = ['typescript', 'javascript'];
 
   async canAnalyze(projectDir: string): Promise<boolean> {
-    // Has tsconfig.json OR has .ts/.js files in src/
+    // Has tsconfig.json, tsconfig.base.json OR has .ts/.js files in src/
     if (fs.existsSync(path.join(projectDir, 'tsconfig.json'))) return true;
+    if (fs.existsSync(path.join(projectDir, 'tsconfig.base.json'))) return true;
     if (fs.existsSync(path.join(projectDir, 'jsconfig.json'))) return true;
+    if (fs.existsSync(path.join(projectDir, 'nx.json'))) return true;
+
     if (fs.existsSync(path.join(projectDir, 'package.json'))) {
       // Check if it's a JS/TS project
       try {
         const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
         const scripts = JSON.stringify(pkg.scripts || {});
-        return scripts.includes('tsc') || scripts.includes('ts-') || scripts.includes('node');
+        if (scripts.includes('tsc') || scripts.includes('ts-') || scripts.includes('node')) return true;
+
+        const deps = JSON.stringify({ ...pkg.dependencies, ...pkg.devDependencies });
+        return deps.includes('typescript') || deps.includes('nx');
       } catch {
         return false;
       }
@@ -41,18 +47,31 @@ export class TypeScriptAnalyzer implements CodeAnalyzer {
     const logger = getLogger();
     logger.info(`TypeScript analysis starting: ${projectDir}`);
 
-    const tsconfigPath = path.join(projectDir, 'tsconfig.json');
-    const project = fs.existsSync(tsconfigPath)
+    const tsconfigPath = fs.existsSync(path.join(projectDir, 'tsconfig.json'))
+      ? path.join(projectDir, 'tsconfig.json')
+      : fs.existsSync(path.join(projectDir, 'tsconfig.base.json'))
+        ? path.join(projectDir, 'tsconfig.base.json')
+        : null;
+
+    const project = tsconfigPath
       ? new Project({ tsConfigFilePath: tsconfigPath, skipAddingFilesFromTsConfig: false })
       : new Project();
 
-    // If no tsconfig, add source files manually
-    if (!fs.existsSync(tsconfigPath)) {
+    // If no tsconfig OR no files found in tsconfig, add source files manually
+    if (!tsconfigPath || project.getSourceFiles().length === 0) {
       const srcDir = path.join(projectDir, 'src');
       if (fs.existsSync(srcDir)) {
         project.addSourceFilesAtPaths(path.join(srcDir, '**/*.{ts,js,tsx,jsx}'));
       } else {
-        project.addSourceFilesAtPaths(path.join(projectDir, '**/*.{ts,js,tsx,jsx}'));
+        // For mono-repos,apps and libs are common
+        const hasApps = fs.existsSync(path.join(projectDir, 'apps'));
+        const hasLibs = fs.existsSync(path.join(projectDir, 'libs'));
+        if (hasApps || hasLibs) {
+          if (hasApps) project.addSourceFilesAtPaths(path.join(projectDir, 'apps/**/*.{ts,js,tsx,jsx}'));
+          if (hasLibs) project.addSourceFilesAtPaths(path.join(projectDir, 'libs/**/*.{ts,js,tsx,jsx}'));
+        } else {
+          project.addSourceFilesAtPaths(path.join(projectDir, '**/*.{ts,js,tsx,jsx}'));
+        }
       }
     }
 

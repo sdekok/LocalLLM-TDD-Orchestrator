@@ -4,7 +4,6 @@ import { createHash } from 'crypto';
 import type { ZodSchema } from 'zod';
 import { ModelRouter, type TaskType, type ModelProfile } from './model-router.js';
 import { getLogger } from '../utils/logger.js';
-import { getTuner } from './tuners/registry.js';
 
 export class LLMClient {
   private clients = new Map<string, OpenAI>();
@@ -56,14 +55,7 @@ export class LLMClient {
     const client = this.getClient(profile);
     const model = this.router.getModelIdentifier(profile);
 
-    const tuner = getTuner(profile.modelFamily);
-    const { systemPrompt: tunedPrompt, sampling } = tuner.applyTweaks(
-      profile,
-      systemPrompt,
-      { temperature }
-    );
-
-    const finalPrompt = `${tunedPrompt}\n\nRespond ONLY with valid JSON matching this schema: ${JSON.stringify(jsonSchema)}. No markdown, no explanation.`;
+    const finalPrompt = `${systemPrompt}\n\nRespond ONLY with valid JSON matching this schema: ${JSON.stringify(jsonSchema)}. No markdown, no explanation.`;
 
     logger.info(`LLM structured request: model=${model} task=${taskType}`);
 
@@ -73,7 +65,8 @@ export class LLMClient {
         { role: 'system', content: finalPrompt },
         { role: 'user', content: userPrompt },
       ],
-      ...(sampling || {}),
+      ...profile.samplingParams,
+      temperature,
       max_tokens: profile.maxOutputTokens,
       response_format: { type: 'json_object' }
     });

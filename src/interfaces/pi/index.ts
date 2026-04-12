@@ -1,13 +1,34 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { StateManager } from '../../orchestrator/state.js';
 import { WorkflowExecutor } from '../../orchestrator/executor.js';
-import { ModelRouter } from '../../llm/model-router.js';
+import {
+  ModelRouter,
+  discoverModels,
+  loadConfig,
+  loadGlobalConfig,
+  mergeConfigs,
+  saveConfig,
+  type ModelProfile,
+  type ModelRouterConfig,
+  type TaskType,
+} from '../../llm/model-router.js';
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { planProject } from '../../agents/project-planner.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
-import * as path from 'path';
+
+function guessArchitecture(modelId: string): 'moe' | 'dense' | 'unknown' {
+  const lower = modelId.toLowerCase();
+  // MoE indicators: explicit "moe", active-param suffix like "a3b"/"a22b",
+  // or the "30b-a3b" / "30ba3b" total+active pattern
+  if (lower.includes('moe') || /a\d+b/.test(lower) || /\d+b[_-]?a\d+b/.test(lower)) return 'moe';
+  if (lower.includes('instruct') || lower.includes('chat') || /\d+b/.test(lower)) return 'dense';
+  return 'unknown';
+}
 
 export default function(pi: ExtensionAPI) {
   let executor: WorkflowExecutor | null = null;
@@ -19,7 +40,7 @@ export default function(pi: ExtensionAPI) {
       // Lazy init orchestrator state
       if (!stateManager) {
         stateManager = new StateManager(ctx.cwd);
-        const modelRouter = new ModelRouter();
+        const modelRouter = new ModelRouter(null, ctx.cwd);
         if (modelRouter.isPassthrough) {
           ctx.ui.notify(
             "⚠️  No models.config.json found — using Pi's active model for all TDD sub-agents. " +
@@ -110,7 +131,7 @@ export default function(pi: ExtensionAPI) {
           await analyzeProject(ctx.cwd);
         }
 
-        const modelRouter = new ModelRouter();
+        const modelRouter = new ModelRouter(null, ctx.cwd);
         if (modelRouter.isPassthrough) {
           ctx.ui.notify(
             "⚠️  No models.config.json found — using Pi's active model for planning.",
@@ -232,7 +253,7 @@ export default function(pi: ExtensionAPI) {
         topic = topic.trim();
       }
 
-      const modelRouter = new ModelRouter();
+      const modelRouter = new ModelRouter(null, ctx.cwd);
       if (modelRouter.isPassthrough) {
         ctx.ui.notify(
           "⚠️  No models.config.json found — using Pi's active model for research.",
@@ -262,6 +283,124 @@ export default function(pi: ExtensionAPI) {
         },
       });
     }
+  });
+
+  pi.registerCommand('setup', {
+    description: 'Configure model routing for TDD/research agents. Use --global to save system-wide.',
+    handler: async (args: string, ctx) => {
+      const isGlobal = args.includes('--global');
+
+      ctx.ui.notify('TDD Workflow — Model Setup', 'info');
+
+      // ── 1. llama.cpp URL ──────────────────────────────────────────────
+      const existingConfig = isGlobal ? loadGlobalConfig() : loadConfig(ctx.cwd);
+      const defaultUrl = process.env['LLAMA_CPP_URL'] || existingConfig?.llamaCppUrl || 'http://localhost:8080/v1';
+
+      const urlInput = await ctx.ui.input(`llama.cpp API URL [${defaultUrl}]:`);
+      const llamaUrl = urlInput?.trim() || defaultUrl;
+
+      // ── 2. Discover models ────────────────────────────────────────────
+      ctx.ui.setStatus('setup', '🔍 Discovering models...');
+      const discovered = await discoverModels(llamaUrl);
+      ctx.ui.setStatus('setup', undefined);
+
+      let modelIds: string[] = discovered;
+      if (discovered.length === 0) {
+        ctx.ui.notify('No models found at that URL. Enter model IDs manually.', 'warning');
+        const manual = await ctx.ui.input('Model IDs (comma-separated), or leave empty to cancel:');
+        if (!manual?.trim()) return;
+        modelIds = manual.split(',').map(s => s.trim()).filter(Boolean);
+      } else {
+        const listText = discovered.map((id, i) => `${i + 1}. ${id}`).join('\n');
+        ctx.ui.notify(`Found models:\n${listText}`, 'info');
+
+        const sel = await ctx.ui.input('Select models to configure (e.g. "1,3") or Enter for all:');
+        if (sel?.trim()) {
+          const indices = sel.split(',').map(s => parseInt(s.trim(), 10) - 1);
+          modelIds = indices.filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!);
+          if (modelIds.length === 0) {
+            ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
+            return;
+          }
+        }
+      }
+
+      // ── 3. Configure each model ───────────────────────────────────────
+      const models: Record<string, ModelProfile> = {};
+      for (const id of modelIds) {
+        const defaultName = id.replace(/\.gguf$/i, '').replace(/[-_]/g, ' ');
+        const nameInput = await ctx.ui.input(`Display name for "${id}" [${defaultName}]:`);
+        const name = nameInput?.trim() || defaultName;
+
+        const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${name}"? (y/N):`);
+        const enableThinking = thinkInput?.toLowerCase().startsWith('y') ?? false;
+
+        const arch = guessArchitecture(id);
+        const key = id.replace(/\.gguf$/i, '').replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').toLowerCase().substring(0, 30);
+        models[key] = {
+          name,
+          ggufFilename: id,
+          provider: 'local',
+          contextWindow: 128_000,
+          maxOutputTokens: 8_192,
+          architecture: arch,
+          speed: arch === 'moe' ? 'fast' : 'slow',
+          enableThinking,
+        };
+      }
+
+      // ── 4. Route models to task types ─────────────────────────────────
+      const taskTypes: Array<{ type: TaskType; label: string; preferThinking: boolean }> = [
+        { type: 'plan',         label: 'Task planning / breakdown',   preferThinking: true  },
+        { type: 'project-plan', label: 'Project-level planning',      preferThinking: true  },
+        { type: 'implement',    label: 'Code implementation',         preferThinking: false },
+        { type: 'review',       label: 'Code review',                 preferThinking: true  },
+        { type: 'research',     label: 'Research',                    preferThinking: false },
+      ];
+
+      const modelKeys = Object.keys(models);
+      const modelMenu = modelKeys.map((k, i) => `${i + 1}. ${models[k]!.name}`).join('  ');
+      ctx.ui.notify(`Models: ${modelMenu}`, 'info');
+
+      const routing: Partial<Record<TaskType, string>> = {};
+      for (const { type, label, preferThinking } of taskTypes) {
+        const fallback = modelKeys.find(k => models[k]!.enableThinking === preferThinking) ?? modelKeys[0]!;
+        const defaultIdx = modelKeys.indexOf(fallback) + 1;
+        const input = await ctx.ui.input(`${type} (${label}) [${defaultIdx}]:`);
+        const idx = parseInt(input?.trim() || String(defaultIdx), 10) - 1;
+        routing[type] = modelKeys[Math.max(0, Math.min(idx, modelKeys.length - 1))]!;
+      }
+
+      // ── 5. Save location ──────────────────────────────────────────────
+      let saveGlobal = isGlobal;
+      if (!isGlobal) {
+        saveGlobal = await ctx.ui.confirm(
+          'Save as global default?',
+          'Yes → ~/.config/tdd-workflow/models.config.json  |  No → ./models.config.json'
+        );
+      }
+
+      const newConfig: ModelRouterConfig = {
+        ...(llamaUrl !== 'http://localhost:8080/v1' ? { llamaCppUrl: llamaUrl } : {}),
+        models,
+        routing,
+      };
+
+      // Merge with any existing config at the target location
+      const existingAtTarget = saveGlobal ? loadGlobalConfig() : loadConfig(ctx.cwd);
+      const finalConfig = existingAtTarget ? mergeConfigs(existingAtTarget, newConfig) : newConfig;
+
+      const targetDir = saveGlobal ? path.join(os.homedir(), '.config', 'tdd-workflow') : ctx.cwd;
+      fs.mkdirSync(targetDir, { recursive: true });
+      saveConfig(finalConfig, targetDir);
+
+      // ── 6. Summary ───────────────────────────────────────────────────
+      const savedPath = path.join(targetDir, 'models.config.json');
+      const routingSummary = taskTypes
+        .map(({ type }) => `  ${type.padEnd(14)} → ${models[routing[type]!]?.name ?? routing[type]}`)
+        .join('\n');
+      ctx.ui.notify(`Saved to ${savedPath}\n\nRouting:\n${routingSummary}`, 'info');
+    },
   });
 
   pi.on('session_shutdown', async () => {
