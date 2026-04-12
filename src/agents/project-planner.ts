@@ -120,49 +120,79 @@ export async function planProject(
       throw new Error('Agent did not produce any response.');
     }
     
-    // Log message details
-    logger.info(`Last assistant message found`);
-    const lastMsgContent = (lastAssistantMessage as any).content;
-    logger.info(`Message content type: ${Array.isArray(lastMsgContent) ? 'array' : typeof lastMsgContent}`);
-    logger.info(`Message content length: ${Array.isArray(lastMsgContent) ? lastMsgContent.length : 'N/A'}`);
-    if (Array.isArray(lastMsgContent)) {
-      logger.info(`Content block types: ${lastMsgContent.map((c: any) => c.type).join(', ')}`);
-      lastMsgContent.forEach((c: any, i: number) => {
-        logger.info(`  Block ${i}: type=${c.type}, text=${c.text ? c.text.substring(0, 100) : 'N/A'}, thinking=${c.thinking ? c.thinking.substring(0, 100) : 'N/A'}`);
-      });
-    }
 
-    // Extract text content from the message. Thinking blocks are a fallback for
-    // reasoning models that don't emit a separate text block in passthrough mode.
+
+    /**
+     * Extract all text from a message, combining text blocks and thinking blocks.
+     * Only falls back to thinking if text blocks are absent or all empty — avoids
+     * returning an empty string when the model emits a blank text block followed
+     * by a thinking block that contains the actual JSON.
+     */
     const extractText = (msg: any): string => {
       if (typeof msg.content === 'string') return msg.content;
       if (!Array.isArray(msg.content)) return '';
-      const textBlocks = msg.content.filter((c: any) => c.type === 'text').map((c: any) => c.text as string);
-      if (textBlocks.length > 0) return textBlocks.join('\n');
-      // Fallback: try thinking blocks
-      return msg.content.filter((c: any) => c.type === 'thinking').map((c: any) => c.thinking as string).join('\n');
+      const textContent = msg.content
+        .filter((c: any) => c.type === 'text')
+        .map((c: any) => c.text as string)
+        .join('\n')
+        .trim();
+      if (textContent) return textContent;
+      // Fall back to thinking blocks — reasoning models sometimes emit JSON only there
+      return msg.content
+        .filter((c: any) => c.type === 'thinking')
+        .map((c: any) => c.thinking as string)
+        .join('\n');
     };
 
-    let assistantText = extractText(lastAssistantMessage);
+    /**
+     * Scan all assistant messages (newest first) for a valid plan.
+     * The JSON may appear in any turn — e.g. the model reasoned in a thinking
+     * block and then produced JSON in a prior text block.
+     */
+    const findPlanInMessages = (msgs: any[]): ProjectPlan | null => {
+      const assistantMsgs = [...msgs].filter(m => m.role === 'assistant').reverse();
+      for (const msg of assistantMsgs) {
+        const text = extractText(msg);
+        if (!text) continue;
+        try {
+          return extractPlanFromResponse(text);
+        } catch {
+          // not this message
+        }
+      }
+      return null;
+    };
 
-    // Comprehensive logging
-    logger.info(`--- PLANNER EXTRACTION DETAILS ---`);
-    logger.info(`Assistant text extracted: ${assistantText.length} characters`);
-    logger.info(`Assistant text preview (first 200 chars): ${assistantText.substring(0, 200)}`);
-    logger.info(`All message types in session: ${messages.map((m: any) => m.role).join(', ')}`);
-    logger.info(`--- END PLANNER DETAILS ---`);
-    logger.debug(`[DEBUG] Planner session completed. Total messages: ${messages.length}`);
-    logger.debug(`[DEBUG] Last assistant response length: ${assistantText.length}`);
-    logger.debug(`[DEBUG] Last assistant raw message content: ${JSON.stringify(lastAssistantMessage.content, null, 2)}`);
+    const lastMsgContent = (lastAssistantMessage as any).content;
+    logger.info(`Last assistant message content types: ${Array.isArray(lastMsgContent) ? lastMsgContent.map((c: any) => c.type).join(', ') : typeof lastMsgContent}`);
+    let assistantText = extractText(lastAssistantMessage);
+    logger.info(`[PLANNER] Extracted text length: ${assistantText.length} chars`);
+
+    /** Dump full session messages to a timestamped file for debugging. */
+    const dumpSessionMessages = (label: string) => {
+      try {
+        const dumpDir = path.join(cwd, '.tdd-workflow', 'logs');
+        fs.mkdirSync(dumpDir, { recursive: true });
+        const dumpFile = path.join(dumpDir, `planner-session-${Date.now()}.json`);
+        fs.writeFileSync(dumpFile, JSON.stringify({ label, messages: session.messages }, null, 2), 'utf-8');
+        logger.info(`[PLANNER] Session dump written to ${dumpFile}`);
+      } catch (e) {
+        logger.warn(`[PLANNER] Failed to write session dump: ${(e as Error).message}`);
+      }
+    };
 
     // Parse and validate the JSON. If the model didn't return JSON (common with passthrough
     // mode chat models), send a follow-up prompt that explicitly requests structured output.
     let plan: ProjectPlan;
-    try {
-      plan = extractPlanFromResponse(assistantText);
-    } catch {
-      logger.info(`[PLANNER] No JSON in initial response — sending follow-up prompt for structured output.`);
-      const schemaHint = `{"reasoning":"string","summary":"string","epics":[{"title":"string","slug":"string","description":"string","workItems":[{"id":"string","title":"string","description":"string","acceptance":["string"],"tests":["string"]}]}],"architecturalDecisions":["string"]}`;
+
+    // First: scan all messages — the plan might be in an earlier turn or a thinking block
+    const foundPlan = findPlanInMessages(messages);
+    if (foundPlan) {
+      plan = foundPlan;
+    } else {
+      dumpSessionMessages('no-json-in-initial-response');
+      logger.info(`[PLANNER] No JSON found in any message — sending follow-up prompt.`);
+      const schemaHint = `{"summary":"string","epics":[{"title":"string","slug":"string","description":"string","workItems":[{"id":"string","title":"string","description":"string","acceptance":["string"],"tests":["string"]}]}],"architecturalDecisions":["string"]}`;
       await session.prompt(
         `Your previous response did not contain a valid JSON plan.\n\n` +
         `Please respond with ONLY a JSON object — no prose, no markdown fences — that matches this shape:\n${schemaHint}\n\n` +
@@ -178,20 +208,22 @@ export async function planProject(
       logger.info(`[PLANNER] Retry response length: ${assistantText.length} characters`);
       logger.info(`[PLANNER] Retry response preview: ${assistantText.substring(0, 200)}`);
 
-      try {
-        plan = extractPlanFromResponse(assistantText);
-      } catch (retryErr) {
-        const e = retryErr as Error;
-        logger.debug(`[DEBUG] Failed to parse plan JSON after retry: ${e.message}`);
-        if (retryErr instanceof TruncatedJsonError) {
+      // Scan all messages again — retry turn may have put JSON in a thinking block
+      const retryPlan = findPlanInMessages(session.messages);
+      if (retryPlan) {
+        plan = retryPlan;
+      } else {
+        dumpSessionMessages('no-json-after-retry');
+        let lastErr: Error = new Error('No JSON found');
+        try { extractPlanFromResponse(assistantText); } catch (e) { lastErr = e as Error; }
+        if (lastErr instanceof TruncatedJsonError) {
           throw new Error(
             `Model output was truncated — the plan JSON was cut off mid-stream. ` +
             `This usually means maxOutputTokens is too low for the size of plan requested. ` +
-            `Current maxOutputTokens: check models.config.json. ` +
-            `Consider asking for a smaller/simpler plan, or increasing maxOutputTokens.`
+            `Check models.config.json or ask for a smaller plan.`
           );
         }
-        throw new Error(`Invalid plan format after retry: ${e.message}. Raw output:\n${assistantText.substring(0, 500)}`);
+        throw new Error(`Invalid plan format after retry: ${lastErr.message}. Raw output:\n${assistantText.substring(0, 500)}`);
       }
     }
 
