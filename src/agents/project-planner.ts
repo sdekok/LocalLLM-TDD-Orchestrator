@@ -131,17 +131,11 @@ export async function planProject(
     const extractText = (msg: any): string => {
       if (typeof msg.content === 'string') return msg.content;
       if (!Array.isArray(msg.content)) return '';
-      const textContent = msg.content
+      return msg.content
         .filter((c: any) => c.type === 'text')
         .map((c: any) => c.text as string)
         .join('\n')
         .trim();
-      if (textContent) return textContent;
-      // Fall back to thinking blocks — reasoning models sometimes emit JSON only there
-      return msg.content
-        .filter((c: any) => c.type === 'thinking')
-        .map((c: any) => c.thinking as string)
-        .join('\n');
     };
 
     /**
