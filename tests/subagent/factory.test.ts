@@ -16,6 +16,10 @@ vi.mock('@mariozechner/pi-coding-agent', () => {
       session: {
         agent: { state: { systemPrompt } },
         setThinkingLevel: vi.fn(),
+        getAllTools: vi.fn().mockReturnValue([]),
+        modelRegistry: {
+          getAll: vi.fn().mockReturnValue([]),
+        },
         dispose: vi.fn(),
       }
     };

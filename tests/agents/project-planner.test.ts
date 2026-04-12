@@ -447,25 +447,39 @@ describe('planProject', () => {
     expect(mockFs.writeFileSync).toHaveBeenCalled();
   });
 
-  it('extracts plan from thinking blocks when no text blocks are present', async () => {
+  it('triggers retry when response only has thinking blocks and no text blocks', async () => {
+    // Thinking blocks are internal model scratchpad — the orchestrator never extracts JSON from them.
+    // When only thinking blocks are present, the planner must retry to get text output.
     const { planProject } = await import('../../src/agents/project-planner.js');
     const { createSubAgentSession } = await import('../../src/subagent/factory.js');
 
+    const messagesStore: any[] = [
+      {
+        role: 'assistant',
+        content: [
+          {
+            type: 'thinking',
+            thinking: '{"summary":"Thinking Model Plan","epics":[],"architecturalDecisions":[]}',
+          },
+          // no 'text' block — should trigger retry
+        ],
+      },
+    ];
+    let promptCallCount = 0;
     const mockSession = {
-      prompt: vi.fn().mockResolvedValue(undefined),
+      prompt: vi.fn().mockImplementation(async () => {
+        promptCallCount++;
+        if (promptCallCount >= 2) {
+          // On retry (second call), add a text block with the plan
+          messagesStore.push({
+            role: 'assistant',
+            content: [{ type: 'text', text: '{"summary":"Text Plan","epics":[],"architecturalDecisions":[]}' }],
+          });
+        }
+        // First call: initial prompt — no new message added (model only output thinking, pre-seeded above)
+      }),
       dispose: vi.fn(),
-      messages: [
-        {
-          role: 'assistant',
-          content: [
-            {
-              type: 'thinking',
-              thinking: '{"reasoning":"Thought it through","summary":"Thinking Model Plan","epics":[],"architecturalDecisions":["Use TypeScript"]}',
-            },
-            // deliberately no 'text' block
-          ],
-        },
-      ],
+      get messages() { return messagesStore; },
     };
     (createSubAgentSession as any).mockResolvedValue(mockSession);
     mockFs.existsSync.mockReturnValue(true);
@@ -473,8 +487,9 @@ describe('planProject', () => {
 
     const result = await planProject('Build something', mockModelRouter, '/tmp/test');
 
-    expect(result.plan?.summary).toBe('Thinking Model Plan');
-    expect(mockSession.prompt).toHaveBeenCalledTimes(1); // no retry needed
+    // Should extract from the retry's text block, not the thinking block
+    expect(result.plan?.summary).toBe('Text Plan');
+    expect(mockSession.prompt).toHaveBeenCalledTimes(2); // initial + retry
   });
 
   it('retries with a follow-up prompt when the first response has no JSON', async () => {
@@ -546,7 +561,11 @@ describe('planProject', () => {
     const result = await planProject('UI Plan', mockModelRouter, '/tmp/test', uiContext);
 
     expect(result.summary).toBe('Plan review cancelled by user.');
-    expect(mockFs.writeFileSync).not.toHaveBeenCalled();
+    // Plan files (WorkItems/) must not be written — only the session debug dump is allowed.
+    const planFilesWritten = (mockFs.writeFileSync as any).mock.calls.filter(
+      (args: any[]) => typeof args[0] === 'string' && (args[0].includes('WorkItems') || args[0].includes('epic-') || args[0].includes('_overview'))
+    );
+    expect(planFilesWritten).toHaveLength(0);
   });
 });
 

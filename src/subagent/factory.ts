@@ -19,7 +19,6 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { createRequire } from 'module';
-import { type Model } from '@mariozechner/pi-ai';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { getAskUserForClarificationParams, type AskUserForClarificationArgs } from './tools.js';
@@ -131,18 +130,8 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     .replace('{tests}', meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
     .replace('{devNotes}', meta?.devNotes || 'None specified');
 
-  // Map ModelProfile to Pi's Model format
-  // Note: Pi's Model type matches our Profile's provider/id structure
-  const piModel: Model<any> = {
-    id: profile.modelId || profile.ggufFilename,
-    provider: profile.provider,
-    name: profile.name,
-    contextWindow: profile.contextWindow,
-    maxTokens: profile.maxOutputTokens,
-    // Add other fields if needed for Pi compatibility
-  } as any;
-
-  logger.info(`Spawning sub-agent [${options.taskType}] with model: ${piModel.id}`);
+  const targetModelId = profile.modelId || profile.ggufFilename;
+  logger.info(`Spawning sub-agent [${options.taskType}] with target model: ${targetModelId}`);
   // Rough token estimate for context budget monitoring (1 token ≈ 4 chars for English)
   const estimatedTokens = Math.ceil(populatedPrompt.length / 4);
   logger.info(`[SUBAGENT FACTORY] System prompt: ~${estimatedTokens} tokens (${populatedPrompt.length} chars)`);
@@ -216,41 +205,60 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   });
   await loader.reload();
 
-  // Create the ephemeral session
-  logger.info(`[SUBAGENT FACTORY] Creating agent session with model: ${piModel.id}`);
+  // Create the ephemeral session without specifying the model.
+  // Pi will fall back to its default (potentially wrong provider like openrouter).
+  // We correct the model below once extensions have registered their models.
+  logger.info(`[SUBAGENT FACTORY] Creating agent session (model will be resolved after extension binding)`);
   const { session } = await createAgentSession({
     cwd: options.cwd,
     sessionManager: SessionManager.inMemory(), // Ephemeral session
     resourceLoader: loader,
-    // model: intentionally omitted — use the Pi SDK's default model selection
-    // unless a per-agent override is configured in models.config.json
     tools: baseTools,
     customTools,
   });
-  
-  // Give async extensions (like pi-mcp-adapter) time to establish their RPC bounds
-  // before the LLM fires off its first context exploration tool.
+
+  // Give async extensions (like pi-mcp-adapter, llama-cpp connector) time to:
+  //   1. Establish MCP/RPC connections
+  //   2. Register their providers (e.g. llama-cpp → session.modelRegistry via pi.registerProvider)
   await new Promise(resolve => setTimeout(resolve, 2000));
 
-  // Log available tools so operators can verify extension tools (ctx_execute, lsp_navigation, etc.) loaded
+  // Log available tools for diagnostics
   try {
-    const availableTools = ((session as any).tools as any[] | undefined)?.map((t: any) => t.name || t.label).filter(Boolean) || [];
-    logger.info(`[SUBAGENT FACTORY] Available tools: ${availableTools.join(', ') || '(none detected)'}`);
+    const toolInfos = session.getAllTools() as Array<{ name: string }>;
+    const toolNames = toolInfos.map((t) => t.name).filter(Boolean);
+    logger.info(`[SUBAGENT FACTORY] Available tools: ${toolNames.join(', ') || '(none detected)'}`);
   } catch {
     logger.info(`[SUBAGENT FACTORY] Could not enumerate session tools`);
   }
 
-  logger.info(`[SUBAGENT FACTORY] Agent session created successfully`);
-
-  // Apply thinking level if specified in profile
-  if (profile.enableThinking) {
-     session.setThinkingLevel('medium'); // Default to medium for reasoning models
-     logger.info(`[SUBAGENT FACTORY] Thinking level set to: medium`);
+  // Resolve the correct model now that extensions have registered theirs.
+  // The profile's ggufFilename/modelId is the model ID registered by the llama-cpp connector
+  // (or the built-in ID for cloud providers). We look it up in the full registry so we get a
+  // fully populated Model<TApi> object (with api, baseUrl, etc.) rather than a partial stub.
+  if (targetModelId) {
+    const allModels = session.modelRegistry.getAll();
+    const targetModel = allModels.find((m) => m.id === targetModelId);
+    if (targetModel) {
+      // Set the model directly on agent state to avoid the side-effect in session.setModel()
+      // which persists to ~/.pi/agent/settings.json — undesirable for ephemeral subagents.
+      (session as any).agent.state.model = targetModel;
+      logger.info(`[SUBAGENT FACTORY] Model set to: ${targetModel.provider}/${targetModel.id}`);
+    } else {
+      const availableIds = allModels.map((m) => `${m.provider}/${m.id}`).slice(0, 10).join(', ');
+      logger.warn(`[SUBAGENT FACTORY] Target model '${targetModelId}' not found in registry after extension binding. Available (first 10): ${availableIds}`);
+      logger.warn(`[SUBAGENT FACTORY] Using Pi's fallback model: ${session.model?.provider}/${session.model?.id}`);
+    }
   } else {
-     session.setThinkingLevel('off');
-     logger.info(`[SUBAGENT FACTORY] Thinking level set to: off`);
+    // Passthrough mode (no models.config.json) — use whatever Pi selected
+    logger.info(`[SUBAGENT FACTORY] Passthrough mode, using Pi's default model: ${session.model?.provider}/${session.model?.id}`);
   }
 
+  // Set thinking level after the model is resolved (model.reasoning gates whether thinking is on).
+  const thinkingLevel = profile.enableThinking ? 'medium' : 'off';
+  session.setThinkingLevel(thinkingLevel as any);
+
+  logger.info(`[SUBAGENT FACTORY] Agent session created successfully`);
+  logger.info(`[SUBAGENT FACTORY] Thinking level: ${thinkingLevel}`);
   logger.info(`[SUBAGENT FACTORY] Session setup complete`);
   return session;
 }
