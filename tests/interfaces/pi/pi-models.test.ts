@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { readPiLlamaCppProviders, readPiCachedModels } from '../../../src/interfaces/pi/pi-models.js';
+import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo } from '../../../src/interfaces/pi/pi-models.js';
 
 function makePiAgentDir(homeDir: string) {
   const dir = path.join(homeDir, '.pi', 'agent');
@@ -152,5 +152,65 @@ describe('readPiCachedModels', () => {
     }));
     expect(readPiCachedModels('http://localhost:8080/v1', tmpHome)).toEqual(['local-model']);
     expect(readPiCachedModels('http://server.example.com:8000/v1', tmpHome)).toEqual(['remote-model-1', 'remote-model-2']);
+  });
+});
+
+describe('readPiCachedModelInfo', () => {
+  let tmpHome: string;
+
+  afterEach(() => {
+    if (tmpHome && fs.existsSync(tmpHome)) {
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it('returns an empty map when cache file does not exist', () => {
+    tmpHome = path.join(os.tmpdir(), `pi-home-${Date.now()}`);
+    fs.mkdirSync(tmpHome, { recursive: true });
+    expect(readPiCachedModelInfo('http://localhost:8080/v1', tmpHome).size).toBe(0);
+  });
+
+  it('returns an empty map when baseUrl is not in cache', () => {
+    tmpHome = path.join(os.tmpdir(), `pi-home-${Date.now()}`);
+    const agentDir = makePiAgentDir(tmpHome);
+    fs.writeFileSync(path.join(agentDir, 'llama-cpp-cache.json'), JSON.stringify({
+      'llama-cpp': { baseUrl: 'http://other:9090/v1', models: [{ id: 'x', reasoning: true }] },
+    }));
+    expect(readPiCachedModelInfo('http://localhost:8080/v1', tmpHome).size).toBe(0);
+  });
+
+  it('returns reasoning=true for models flagged as reasoning', () => {
+    tmpHome = path.join(os.tmpdir(), `pi-home-${Date.now()}`);
+    const agentDir = makePiAgentDir(tmpHome);
+    fs.writeFileSync(path.join(agentDir, 'llama-cpp-cache.json'), JSON.stringify({
+      'llama-cpp': {
+        baseUrl: 'http://localhost:8080/v1',
+        models: [
+          { id: 'thinker', reasoning: true },
+          { id: 'vanilla', reasoning: false },
+          { id: 'unknown' },
+        ],
+      },
+    }));
+    const info = readPiCachedModelInfo('http://localhost:8080/v1', tmpHome);
+    expect(info.get('thinker')).toEqual({ id: 'thinker', reasoning: true });
+    expect(info.get('vanilla')).toEqual({ id: 'vanilla', reasoning: false });
+    expect(info.get('unknown')).toEqual({ id: 'unknown', reasoning: false }); // absent → false
+  });
+
+  it('keys the map by model id for O(1) lookup', () => {
+    tmpHome = path.join(os.tmpdir(), `pi-home-${Date.now()}`);
+    const agentDir = makePiAgentDir(tmpHome);
+    fs.writeFileSync(path.join(agentDir, 'llama-cpp-cache.json'), JSON.stringify({
+      'llama-cpp': {
+        baseUrl: 'http://localhost:8080/v1',
+        models: [{ id: 'model-a', reasoning: true }, { id: 'model-b', reasoning: false }],
+      },
+    }));
+    const info = readPiCachedModelInfo('http://localhost:8080/v1', tmpHome);
+    expect(info.size).toBe(2);
+    expect(info.has('model-a')).toBe(true);
+    expect(info.has('model-b')).toBe(true);
+    expect(info.has('model-c')).toBe(false);
   });
 });

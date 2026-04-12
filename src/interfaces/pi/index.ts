@@ -20,7 +20,7 @@ import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { planProject } from '../../agents/project-planner.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
-import { readPiLlamaCppProviders, readPiCachedModels } from './pi-models.js';
+import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo } from './pi-models.js';
 
 function guessArchitecture(modelId: string): 'moe' | 'dense' | 'unknown' {
   const lower = modelId.toLowerCase();
@@ -151,6 +151,17 @@ export default function(pi: ExtensionAPI) {
           },
           confirm: async (message: string) => {
             return await ctx.ui.confirm(message, 'This will create files in WorkItems/');
+          },
+          chatMessage: (content: string) => {
+            try {
+              pi.sendMessage(
+                { customType: 'plan-progress', content, display: true, details: {} },
+                { triggerTurn: false }
+              );
+            } catch (err) {
+              const logger = getLogger();
+              logger.warn(`[PI] plan chatMessage failed (non-fatal): ${(err as Error).message}`);
+            }
           },
         });
         
@@ -396,50 +407,62 @@ export default function(pi: ExtensionAPI) {
         }
       }
 
-      // ── 3. Configure each model ───────────────────────────────────────
-      const models: Record<string, ModelProfile> = {};
-      for (const id of modelIds) {
-        const defaultName = id.replace(/\.gguf$/i, '').replace(/[-_]/g, ' ');
-        const nameInput = await ctx.ui.input(`Display name for "${id}" [${defaultName}]:`);
-        const name = nameInput?.trim() || defaultName;
-
-        const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${name}"? (y/N):`);
-        const enableThinking = thinkInput?.toLowerCase().startsWith('y') ?? false;
-
-        const arch = guessArchitecture(id);
-        const key = id.replace(/\.gguf$/i, '').replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').toLowerCase().substring(0, 30);
-        models[key] = {
-          name,
-          ggufFilename: id,
-          provider: 'local',
-          contextWindow: 128_000,
-          maxOutputTokens: 8_192,
-          architecture: arch,
-          speed: arch === 'moe' ? 'fast' : 'slow',
-          enableThinking,
-        };
-      }
-
-      // ── 4. Route models to task types ─────────────────────────────────
-      const taskTypes: Array<{ type: TaskType; label: string; preferThinking: boolean }> = [
-        { type: 'plan',         label: 'Task planning / breakdown',   preferThinking: true  },
-        { type: 'project-plan', label: 'Project-level planning',      preferThinking: true  },
-        { type: 'implement',    label: 'Code implementation',         preferThinking: false },
-        { type: 'review',       label: 'Code review',                 preferThinking: true  },
-        { type: 'research',     label: 'Research',                    preferThinking: false },
+      // ── 3. Assign a model to each agent (configure on first use) ─────
+      const taskTypes: Array<{ type: TaskType; label: string }> = [
+        { type: 'plan',         label: 'Task planning / breakdown'  },
+        { type: 'project-plan', label: 'Project-level planning'     },
+        { type: 'implement',    label: 'Code implementation'        },
+        { type: 'review',       label: 'Code review'                },
+        { type: 'research',     label: 'Research'                   },
       ];
 
-      const modelKeys = Object.keys(models);
-      const modelMenu = modelKeys.map((k, i) => `${i + 1}. ${models[k]!.name}`).join('  ');
-      ctx.ui.notify(`Models: ${modelMenu}`, 'info');
+      const modelList = modelIds; // full list available for selection
+      const listText = modelList.map((id, i) => `${i + 1}. ${id}`).join('\n');
+      const piModelInfo = readPiCachedModelInfo(llamaUrl);
 
+      const models: Record<string, ModelProfile> = {};
       const routing: Partial<Record<TaskType, string>> = {};
-      for (const { type, label, preferThinking } of taskTypes) {
-        const fallback = modelKeys.find(k => models[k]!.enableThinking === preferThinking) ?? modelKeys[0]!;
-        const defaultIdx = modelKeys.indexOf(fallback) + 1;
-        const input = await ctx.ui.input(`${type} (${label}) [${defaultIdx}]:`);
-        const idx = parseInt(input?.trim() || String(defaultIdx), 10) - 1;
-        routing[type] = modelKeys[Math.max(0, Math.min(idx, modelKeys.length - 1))]!;
+      let lastKey: string | undefined;
+
+      for (const { type, label } of taskTypes) {
+        const defaultIdx = lastKey
+          ? modelList.indexOf(models[lastKey]!.ggufFilename) + 1
+          : 1;
+
+        const input = await ctx.ui.input(
+          `${listText}\n\n${type} — ${label} [${defaultIdx}]:`
+        );
+        const idx = Math.max(0, Math.min(
+          parseInt(input?.trim() || String(defaultIdx), 10) - 1,
+          modelList.length - 1
+        ));
+        const chosenId = modelList[idx]!;
+        const key = chosenId.replace(/\.gguf$/i, '').replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').toLowerCase().substring(0, 30);
+
+        // Configure this model the first time it's selected
+        if (!models[key]) {
+          const cachedReasoning = piModelInfo.get(chosenId)?.reasoning ?? false;
+          const thinkDefault = cachedReasoning ? 'Y/n' : 'y/N';
+          const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${chosenId}"? (${thinkDefault}):`);
+          const enableThinking = thinkInput?.trim()
+            ? thinkInput.toLowerCase().startsWith('y')
+            : cachedReasoning;
+
+          const arch = guessArchitecture(chosenId);
+          models[key] = {
+            name: chosenId,
+            ggufFilename: chosenId,
+            provider: 'local',
+            contextWindow: 128_000,
+            maxOutputTokens: 8_192,
+            architecture: arch,
+            speed: arch === 'moe' ? 'fast' : 'slow',
+            enableThinking,
+          };
+        }
+
+        routing[type] = key;
+        lastKey = key;
       }
 
       // ── 5. Save location ──────────────────────────────────────────────

@@ -33,6 +33,8 @@ export async function planProject(
     notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
     editor: (label: string, initialText: string) => Promise<string | null>;
     confirm: (message: string) => Promise<boolean>;
+    /** Post a message into the Pi chat history for live progress visibility. */
+    chatMessage?: (content: string) => void;
   }
 ): Promise<ProjectPlanResult> {
   const logger = getLogger();
@@ -56,6 +58,31 @@ export async function planProject(
     } : undefined,
   });
   
+  // Stream reasoning, tool calls, and text back into Pi chat
+  if (uiContext?.chatMessage) {
+    const chatMessage = uiContext.chatMessage;
+    session.subscribe((event) => {
+      if (event.type === 'message_update') {
+        const ae = event.assistantMessageEvent;
+        if (ae.type === 'thinking_end' && ae.content) {
+          const preview = ae.content.length > 400
+            ? ae.content.substring(0, 400) + '…'
+            : ae.content;
+          chatMessage(`💭 ${preview}`);
+        } else if (ae.type === 'text_end' && ae.content?.trim()) {
+          chatMessage(ae.content);
+        }
+      } else if (event.type === 'tool_execution_start') {
+        // Extract a short human-readable arg summary (first string value in args)
+        const firstArg = event.args && typeof event.args === 'object'
+          ? Object.values(event.args as Record<string, unknown>).find(v => typeof v === 'string') as string | undefined
+          : undefined;
+        const argHint = firstArg ? `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}` : '';
+        chatMessage(`🔧 \`${event.toolName}\`${argHint}`);
+      }
+    });
+  }
+
   logger.info(`Sub-agent session created, starting to send prompt...`);
   logger.info(`Prompt length: ${request.length} characters`);
   logger.info(`Sending prompt to agent: ${request.substring(0, 200)}...`);
