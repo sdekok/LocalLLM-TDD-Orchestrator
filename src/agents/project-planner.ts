@@ -163,28 +163,45 @@ export async function planProject(
     logger.info(`[PLANNER] Extracted text length: ${assistantText.length} chars`);
 
     /** Dump full session messages to a timestamped file for debugging. */
+    /** Write full session (thinking + text) to a timestamped JSON file and log each block. */
     const dumpSessionMessages = (label: string) => {
       try {
         const dumpDir = path.join(cwd, '.tdd-workflow', 'logs');
         fs.mkdirSync(dumpDir, { recursive: true });
         const dumpFile = path.join(dumpDir, `planner-session-${Date.now()}.json`);
         fs.writeFileSync(dumpFile, JSON.stringify({ label, messages: session.messages }, null, 2), 'utf-8');
-        logger.info(`[PLANNER] Session dump written to ${dumpFile}`);
+        logger.info(`[PLANNER] Session dump (${label}): ${dumpFile}`);
       } catch (e) {
         logger.warn(`[PLANNER] Failed to write session dump: ${(e as Error).message}`);
       }
+      // Log each assistant block to the main log so it's visible without opening the dump file
+      const assistantMsgs = (session.messages as any[]).filter(m => m.role === 'assistant');
+      assistantMsgs.forEach((msg, msgIdx) => {
+        const blocks: any[] = Array.isArray(msg.content) ? msg.content : [];
+        blocks.forEach((block, blockIdx) => {
+          if (block.type === 'thinking') {
+            logger.info(`[PLANNER] msg[${msgIdx}] thinking[${blockIdx}]: ${String(block.thinking ?? '').substring(0, 500)}`);
+          } else if (block.type === 'text') {
+            logger.info(`[PLANNER] msg[${msgIdx}] text[${blockIdx}]: ${String(block.text ?? '').substring(0, 500)}`);
+          } else {
+            logger.info(`[PLANNER] msg[${msgIdx}] ${block.type}[${blockIdx}]`);
+          }
+        });
+      });
     };
+
+    // Always dump after the initial prompt so there's always a record
+    dumpSessionMessages('initial-response');
 
     // Parse and validate the JSON. If the model didn't return JSON (common with passthrough
     // mode chat models), send a follow-up prompt that explicitly requests structured output.
     let plan: ProjectPlan;
 
-    // First: scan all messages — the plan might be in an earlier turn or a thinking block
+    // First: scan all messages — the plan might be in an earlier turn
     const foundPlan = findPlanInMessages(messages);
     if (foundPlan) {
       plan = foundPlan;
     } else {
-      dumpSessionMessages('no-json-in-initial-response');
       logger.info(`[PLANNER] No JSON found in any message — sending follow-up prompt.`);
       const schemaHint = `{"summary":"string","epics":[{"title":"string","slug":"string","description":"string","workItems":[{"id":"string","title":"string","description":"string","acceptance":["string"],"tests":["string"]}]}],"architecturalDecisions":["string"]}`;
       await session.prompt(
@@ -199,15 +216,13 @@ export async function planProject(
         throw new Error('Agent did not produce a response on retry.');
       }
       assistantText = extractText(retryMessage);
-      logger.info(`[PLANNER] Retry response length: ${assistantText.length} characters`);
-      logger.info(`[PLANNER] Retry response preview: ${assistantText.substring(0, 200)}`);
+      dumpSessionMessages('retry-response');
 
-      // Scan all messages again — retry turn may have put JSON in a thinking block
+      // Scan all messages again for a valid plan
       const retryPlan = findPlanInMessages(session.messages);
       if (retryPlan) {
         plan = retryPlan;
       } else {
-        dumpSessionMessages('no-json-after-retry');
         let lastErr: Error = new Error('No JSON found');
         try { extractPlanFromResponse(assistantText); } catch (e) { lastErr = e as Error; }
         if (lastErr instanceof TruncatedJsonError) {
