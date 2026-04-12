@@ -449,12 +449,13 @@ export default function(pi: ExtensionAPI) {
             : cachedReasoning;
 
           const arch = guessArchitecture(chosenId);
+          const cached = piModelInfo.get(chosenId);
           models[key] = {
             name: chosenId,
             ggufFilename: chosenId,
             provider: 'local',
-            contextWindow: 128_000,
-            maxOutputTokens: 8_192,
+            contextWindow: cached?.contextWindow ?? 128_000,
+            maxOutputTokens: cached?.maxTokens ?? 32_768,
             architecture: arch,
             speed: arch === 'moe' ? 'fast' : 'slow',
             enableThinking,

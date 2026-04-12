@@ -179,23 +179,23 @@ describe('readPiCachedModelInfo', () => {
     expect(readPiCachedModelInfo('http://localhost:8080/v1', tmpHome).size).toBe(0);
   });
 
-  it('returns reasoning=true for models flagged as reasoning', () => {
+  it('returns reasoning, contextWindow, and maxTokens for each model', () => {
     tmpHome = path.join(os.tmpdir(), `pi-home-${Date.now()}`);
     const agentDir = makePiAgentDir(tmpHome);
     fs.writeFileSync(path.join(agentDir, 'llama-cpp-cache.json'), JSON.stringify({
       'llama-cpp': {
         baseUrl: 'http://localhost:8080/v1',
         models: [
-          { id: 'thinker', reasoning: true },
-          { id: 'vanilla', reasoning: false },
+          { id: 'thinker', reasoning: true, contextWindow: 200000, maxTokens: 200000 },
+          { id: 'vanilla', reasoning: false, contextWindow: 32000, maxTokens: 16000 },
           { id: 'unknown' },
         ],
       },
     }));
     const info = readPiCachedModelInfo('http://localhost:8080/v1', tmpHome);
-    expect(info.get('thinker')).toEqual({ id: 'thinker', reasoning: true });
-    expect(info.get('vanilla')).toEqual({ id: 'vanilla', reasoning: false });
-    expect(info.get('unknown')).toEqual({ id: 'unknown', reasoning: false }); // absent → false
+    expect(info.get('thinker')).toMatchObject({ id: 'thinker', reasoning: true, contextWindow: 200000, maxTokens: 200000 });
+    expect(info.get('vanilla')).toMatchObject({ id: 'vanilla', reasoning: false, contextWindow: 32000, maxTokens: 16000 });
+    expect(info.get('unknown')).toMatchObject({ id: 'unknown', reasoning: false, contextWindow: 128_000, maxTokens: 8_192 }); // absent → defaults
   });
 
   it('keys the map by model id for O(1) lookup', () => {

@@ -40,6 +40,8 @@ export function readPiLlamaCppProviders(homeDir = os.homedir()): PiLlamaCppProvi
 export interface PiCachedModelInfo {
   id: string;
   reasoning: boolean;
+  contextWindow: number;
+  maxTokens: number;
 }
 
 function loadCacheEntry(baseUrl: string, homeDir: string): PiLlamaCppCacheEntry | undefined {
@@ -66,7 +68,12 @@ export function readPiCachedModelInfo(baseUrl: string, homeDir = os.homedir()): 
   const entry = loadCacheEntry(baseUrl, homeDir);
   const map = new Map<string, PiCachedModelInfo>();
   for (const m of entry?.models ?? []) {
-    map.set(m.id, { id: m.id, reasoning: m.reasoning ?? false });
+    map.set(m.id, {
+      id: m.id,
+      reasoning: m.reasoning ?? false,
+      contextWindow: m.contextWindow ?? 128_000,
+      maxTokens: m.maxTokens ?? 8_192,
+    });
   }
   return map;
 }

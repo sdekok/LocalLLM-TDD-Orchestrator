@@ -5,7 +5,18 @@ import { InvalidJsonError, SchemaValidationError, NoResponseError } from '../err
  * Scans text character-by-character to extract the outermost valid JSON object.
  * Skips invalid candidates and returns the first one that parses successfully.
  * Returns null if no valid JSON object is found.
+ *
+ * If the text contains an unterminated outermost JSON object (i.e. the model
+ * output was truncated), throws a descriptive TruncatedJsonError so callers
+ * can surface it clearly rather than silently matching an inner object.
  */
+export class TruncatedJsonError extends Error {
+  constructor(public readonly partial: string) {
+    super(`Model output appears to have been truncated (JSON object opened but never closed). First 200 chars: ${partial.substring(0, 200)}`);
+    this.name = 'TruncatedJsonError';
+  }
+}
+
 export function extractOutermostJSON(text: string): string | null {
   let depth = 0;
   let start = -1;
@@ -28,6 +39,11 @@ export function extractOutermostJSON(text: string): string | null {
         }
       }
     }
+  }
+
+  // If we ended mid-object the output was truncated
+  if (depth > 0 && start !== -1) {
+    throw new TruncatedJsonError(text.slice(start));
   }
 
   return null;
@@ -54,7 +70,13 @@ export function extractPlanFromResponse(text: string): ProjectPlan {
 
   // Fallback: use bracket-balanced JSON extraction
   if (!parsed) {
-    const jsonStr = extractOutermostJSON(text);
+    let jsonStr: string | null = null;
+    try {
+      jsonStr = extractOutermostJSON(text);
+    } catch (err) {
+      if (err instanceof TruncatedJsonError) throw err; // propagate truncation clearly
+      lastParserError = err as Error;
+    }
     if (jsonStr) {
       try {
         parsed = JSON.parse(jsonStr);

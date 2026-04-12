@@ -4,7 +4,7 @@ import { ModelRouter } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { ProjectPlanSchema, type ProjectPlan } from './project-plan-schema.js';
 import { generatePlanMarkdown } from './components/markdown-generator.js';
-import { extractPlanFromResponse } from './components/response-extractor.js';
+import { extractPlanFromResponse, TruncatedJsonError } from './components/response-extractor.js';
 export { generatePlanMarkdown };
 export { extractPlanFromResponse } from './components/response-extractor.js';
 import * as fs from 'fs';
@@ -183,6 +183,14 @@ export async function planProject(
       } catch (retryErr) {
         const e = retryErr as Error;
         logger.debug(`[DEBUG] Failed to parse plan JSON after retry: ${e.message}`);
+        if (retryErr instanceof TruncatedJsonError) {
+          throw new Error(
+            `Model output was truncated — the plan JSON was cut off mid-stream. ` +
+            `This usually means maxOutputTokens is too low for the size of plan requested. ` +
+            `Current maxOutputTokens: check models.config.json. ` +
+            `Consider asking for a smaller/simpler plan, or increasing maxOutputTokens.`
+          );
+        }
         throw new Error(`Invalid plan format after retry: ${e.message}. Raw output:\n${assistantText.substring(0, 500)}`);
       }
     }

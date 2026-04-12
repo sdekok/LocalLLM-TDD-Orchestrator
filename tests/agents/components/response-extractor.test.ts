@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractOutermostJSON, extractPlanFromResponse } from '../../../src/agents/components/response-extractor.js';
+import { extractOutermostJSON, extractPlanFromResponse, TruncatedJsonError } from '../../../src/agents/components/response-extractor.js';
 import { InvalidJsonError } from '../../../src/agents/errors/planner-errors.js';
 
 describe('extractOutermostJSON', () => {
@@ -26,6 +26,19 @@ describe('extractOutermostJSON', () => {
     expect(extractOutermostJSON(text)).toBeNull();
   });
 
+  it('throws TruncatedJsonError when outermost object is never closed', () => {
+    const text = '{"reasoning": "thinking...", "summary": "A design system';
+    expect(() => extractOutermostJSON(text)).toThrow(TruncatedJsonError);
+  });
+
+  it('TruncatedJsonError includes the partial content', () => {
+    const text = '{"key": "val';
+    let err: TruncatedJsonError | undefined;
+    try { extractOutermostJSON(text); } catch (e) { err = e as TruncatedJsonError; }
+    expect(err).toBeInstanceOf(TruncatedJsonError);
+    expect(err!.partial).toContain('"key"');
+  });
+
   it('handles nested objects correctly', () => {
     const text = 'prefix {"outer": {"inner": 42}} suffix';
     const result = extractOutermostJSON(text);
@@ -36,7 +49,6 @@ describe('extractOutermostJSON', () => {
 
 describe('extractPlanFromResponse', () => {
   const validPlan = {
-    reasoning: 'step by step',
     summary: 'test summary',
     epics: [
       {
@@ -73,5 +85,17 @@ describe('extractPlanFromResponse', () => {
 
   it('throws InvalidJsonError when no valid JSON found', () => {
     expect(() => extractPlanFromResponse('no json here')).toThrow(InvalidJsonError);
+  });
+
+  it('accepts a plan without reasoning field', () => {
+    const planNoReasoning = { ...validPlan };
+    const result = extractPlanFromResponse(JSON.stringify(planNoReasoning));
+    expect(result.summary).toBe('test summary');
+    expect(result.reasoning).toBeUndefined();
+  });
+
+  it('throws TruncatedJsonError when the plan JSON is cut off', () => {
+    const truncated = '{"summary": "A design system", "epics": [{"title": "E1", "slug": "e1"';
+    expect(() => extractPlanFromResponse(truncated)).toThrow(TruncatedJsonError);
   });
 });
