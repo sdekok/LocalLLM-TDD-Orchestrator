@@ -15,11 +15,75 @@ import {
   type AgentToolUpdateCallback,
   type ExtensionFactory,
 } from '@mariozechner/pi-coding-agent';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
+import { createRequire } from 'module';
 import { type Model } from '@mariozechner/pi-ai';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { getAskUserForClarificationParams, type AskUserForClarificationArgs } from './tools.js';
+
+const PI_AGENT_DIR = path.join(os.homedir(), '.pi', 'agent');
+
+/**
+ * Resolve Pi extension package paths from ~/.pi/agent/settings.json so the
+ * subagent session loads the same extensions as the main Pi session (including
+ * pi-mcp-adapter, which starts the MCP servers like context-mode).
+ */
+function resolveAgentExtensionPaths(agentDir: string): string[] {
+  const settingsPath = path.join(agentDir, 'settings.json');
+  if (!fs.existsSync(settingsPath)) return [];
+
+  let packages: string[] = [];
+  try {
+    const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) as { packages?: string[] };
+    packages = settings.packages ?? [];
+  } catch {
+    return [];
+  }
+
+  const logger = getLogger();
+  const resolved: string[] = [];
+  // Require resolver rooted at the agent dir so npm: packages are found via Node resolution
+  const agentRequire = createRequire(path.join(agentDir, '__placeholder__.js'));
+
+  for (const pkg of packages) {
+    if (pkg.startsWith('npm:')) {
+      const pkgName = pkg.slice(4);
+      // Try Node module resolution first (handles local + hoisted installs)
+      try {
+        const pkgJsonPath = agentRequire.resolve(`${pkgName}/package.json`);
+        resolved.push(path.dirname(pkgJsonPath));
+        continue;
+      } catch {/* fall through to global search */}
+
+      // Fall back to common npm global prefix locations
+      const npmGlobalCandidates = [
+        path.join(os.homedir(), '.npm-global', 'lib', 'node_modules', pkgName),
+        '/usr/local/lib/node_modules/' + pkgName,
+        '/usr/lib/node_modules/' + pkgName,
+      ];
+      const found = npmGlobalCandidates.find(p => fs.existsSync(path.join(p, 'package.json')));
+      if (found) {
+        resolved.push(found);
+      } else {
+        logger.warn(`[SUBAGENT FACTORY] Could not resolve extension package: ${pkg}`);
+      }
+    } else if (pkg.startsWith('git:')) {
+      // git: packages are cached under agentDir/git/<host>/<user>/<repo>/...
+      const gitPath = path.join(agentDir, 'git', pkg.slice(4));
+      if (fs.existsSync(gitPath)) resolved.push(gitPath);
+    } else {
+      // Relative or absolute filesystem path
+      const absPath = path.isAbsolute(pkg) ? pkg : path.resolve(agentDir, pkg);
+      if (fs.existsSync(absPath)) resolved.push(absPath);
+    }
+  }
+
+  logger.info(`[SUBAGENT FACTORY] Resolved ${resolved.length}/${packages.length} agent extensions`);
+  return resolved;
+}
 
 export interface SubAgentOptions {
   taskType: TaskType;
@@ -129,9 +193,9 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     customTools = [...(customTools || []), ...options.customTools];
   }
 
-  // Create the resource loader for the custom prompt.
-  // We explicitly load the project's pi-lens extension so it's available as tools.
-  const extensionPaths = [path.join(options.cwd, 'node_modules/pi-lens')];
+  // Load the same extensions Pi itself uses (pi-lens, pi-mcp-adapter, etc.)
+  // so MCP servers like context-mode are available in the subagent session.
+  const extensionPaths = resolveAgentExtensionPaths(PI_AGENT_DIR);
 
   // When thinking mode is active, register an extension that strips thinking
   // blocks from prior assistant messages. Keeping only the final visible answer
