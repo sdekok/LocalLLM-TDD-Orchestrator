@@ -35,6 +35,40 @@ export default function(pi: ExtensionAPI) {
   let executor: WorkflowExecutor | null = null;
   let stateManager: StateManager | null = null;
 
+  // --------------------------------------------------------------------------
+  // Chat input bridge — lets planning / interactive flows receive user replies
+  // directly from Pi's chat input area rather than via modal dialogs.
+  // --------------------------------------------------------------------------
+  let chatInputResolve: ((value: string | null) => void) | null = null;
+
+  /** Wait for the user to type something in Pi chat. Returns null if cancelled. */
+  const waitForChatInput = (): Promise<string | null> =>
+    new Promise((resolve) => { chatInputResolve = resolve; });
+
+  /** Cancel a pending waitForChatInput (e.g. on error). */
+  const cancelChatInput = () => {
+    if (chatInputResolve) { chatInputResolve(null); chatInputResolve = null; }
+  };
+
+  /** Helper: post a message to Pi chat history without triggering a turn. */
+  const postToChat = (content: string, customType = 'plan-progress') => {
+    try {
+      pi.sendMessage(
+        { customType, content, display: true, details: {} },
+        { triggerTurn: false }
+      );
+    } catch { /* non-fatal */ }
+  };
+
+  // Intercept interactive user messages while chatInputResolve is set.
+  pi.on('input', async (event) => {
+    if (!chatInputResolve || event.source !== 'interactive') return;
+    const resolve = chatInputResolve;
+    chatInputResolve = null;
+    resolve(event.text);
+    return { action: 'handled' };
+  });
+
   pi.registerCommand('tdd', {
     description: 'Start a new Agentic TDD Epic',
     handler: async (args: string, ctx) => {
@@ -140,29 +174,36 @@ export default function(pi: ExtensionAPI) {
           );
         }
         const result = await planProject(args, modelRouter, ctx.cwd, {
+          // Clarifying questions: post to chat and wait for the user to reply inline.
           input: async (prompt: string) => {
-            const result = await ctx.ui.input(prompt);
-            return result ?? null;
+            postToChat(`❓ **${prompt}**\n\n_Type your answer in the chat…_`, 'plan-question');
+            return await waitForChatInput();
           },
           notify: (message: string, type?: 'info' | 'warning' | 'error') => ctx.ui.notify(message, type || 'info'),
-          editor: async (label: string, initialText: string) => {
-            const result = await ctx.ui.editor(label, initialText);
-            return result ?? null;
-          },
-          confirm: async (message: string) => {
-            return await ctx.ui.confirm(message, 'This will create files in WorkItems/');
-          },
-          chatMessage: (content: string) => {
-            try {
-              pi.sendMessage(
-                { customType: 'plan-progress', content, display: true, details: {} },
-                { triggerTurn: false }
-              );
-            } catch (err) {
-              const logger = getLogger();
-              logger.warn(`[PI] plan chatMessage failed (non-fatal): ${(err as Error).message}`);
+          // Plan review: post the plan markdown to chat and ask for approval or feedback.
+          editor: async (_label: string, initialText: string) => {
+            postToChat(initialText, 'plan-review');
+            postToChat(
+              '---\n✅ Type **`approve`** to create the WorkItems, or describe what you\'d like changed.',
+              'plan-review-prompt'
+            );
+            const response = await waitForChatInput();
+            if (!response) return null; // cancelled / timed out
+            const trimmed = response.trim().toLowerCase();
+            if (trimmed === 'approve' || trimmed === 'yes' || trimmed === 'y') {
+              return initialText; // approved as-is — project-planner will write files
             }
+            // User provided feedback — post a hint and cancel this planning round.
+            postToChat(
+              `📝 Got it. Run \`/plan ${args}\` again and the planner will incorporate your feedback:\n\n> ${response}`,
+              'plan-feedback'
+            );
+            return null;
           },
+          // confirm is reached only if editor returned non-null; auto-approve so we
+          // don't show a second dialog after the chat-based review above.
+          confirm: async (_message: string) => true,
+          chatMessage: (content: string) => postToChat(content),
         });
         
         ctx.ui.setStatus('plan', undefined);
@@ -170,6 +211,7 @@ export default function(pi: ExtensionAPI) {
 
       } catch (err) {
         ctx.ui.setStatus('plan', undefined);
+        cancelChatInput(); // release any pending chat-input waiter
         const e = err as Error;
         ctx.ui.notify(`Planning failed: ${e.message}`, 'error');
       }
