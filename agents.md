@@ -2,7 +2,7 @@
 
 1. **Language**: All code should be in TypeScript by default.
 2. **Programming Paradigm**: Use functional patterns over object-oriented ones, except for domain models.
-3. **Testing**: Use Test-Driven Development (TDD) wherever possible. Ensure edge cases are covered and run tests during each iteration.
+3. **Testing**: Use Test-Driven Development (TDD) wherever possible. Ensure edge cases are covered and run tests during each iteration. **Always run `npm run build && npx vitest run` and fix all failures before committing or pushing.**
 4. **Workflow & Context Management**:
     - Work in small chunks.
     - For each task, the orchestrator spawns **ephemeral sub-agent sessions**.
