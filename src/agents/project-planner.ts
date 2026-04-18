@@ -199,11 +199,21 @@ export async function planProject(
       await appendArchitecturalDecisions(overview.architecturalDecisions, cwd);
     }
 
-    // ── Phase 2: Work items per epic ─────────────────────────────────────────
+    // ── Phase 2: Work items per epic (fresh session each) ────────────────────
+    // Each epic gets its own session to prevent context buildup from prior epics
+    // causing truncated JSON responses and wrong-file extraction fallbacks.
 
     const EPIC_HINT = `{"title":"...","slug":"...","description":"...","workItems":[{"id":"WI-N","title":"...","description":"one sentence","acceptance":["..."],"tests":["Unit: ..."]}]}`;
 
     const completedEpics: Epic[] = [];
+
+    // Shared context prefix injected at the start of every per-epic session
+    const overviewContext =
+      `Project overview: ${overview.summary}\n\n` +
+      `All planned epics:\n${overview.epics.map((e, idx) => `${idx + 1}. ${e.title} (slug: ${e.slug}) — ${e.description}`).join('\n')}\n\n` +
+      `Architectural decisions:\n${overview.architecturalDecisions.map(d => `- ${d}`).join('\n')}`;
+
+    session.dispose(); // Done with Phase 1 session
 
     for (let i = 0; i < overview.epics.length; i++) {
       const epicStub = overview.epics[i]!;
@@ -211,13 +221,69 @@ export async function planProject(
       logger.info(`[PLANNER] Fetching work items for epic ${epicNum}: ${epicStub.title}`);
       uiContext?.chatMessage?.(`⏳ Epic ${i + 1}/${overview.epics.length}: ${epicStub.title}`);
 
-      const epic: Epic = await promptAndFind(
-        `Return the work items JSON for epic ${i + 1}: "${epicStub.title}" (slug: "${epicStub.slug}"). ` +
-        `This epic only. Include all work item fields.`,
-        extractSingleEpic,
-        EPIC_HINT,
-        `phase2-epic-${epicStub.slug}`,
-      );
+      // Fresh session for each epic — clean context, no cross-contamination
+      const epicSession = await createSubAgentSession({
+        taskType: 'project-plan',
+        systemPrompt: PROJECT_PLANNER_PROMPT,
+        cwd,
+        modelRouter,
+        tools: 'coding',
+        uiContext: uiContext ? { input: uiContext.input, notify: uiContext.notify } : undefined,
+      });
+
+      if (uiContext?.chatMessage) {
+        const chatMessage = uiContext.chatMessage;
+        epicSession.subscribe((event) => {
+          if (event.type === 'tool_execution_start') {
+            const firstArg = event.args && typeof event.args === 'object'
+              ? Object.values(event.args as Record<string, unknown>).find(v => typeof v === 'string') as string | undefined
+              : undefined;
+            const argHint = firstArg ? `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}` : '';
+            chatMessage(`🔧 \`${event.toolName}\`${argHint}`);
+          }
+        });
+      }
+
+      const epicExtractText = (msg: any): string => {
+        if (typeof msg.content === 'string') return msg.content;
+        if (!Array.isArray(msg.content)) return '';
+        return msg.content.filter((c: any) => c.type === 'text').map((c: any) => c.text as string).join('\n').trim();
+      };
+
+      const findInEpicMessages = <T>(msgs: any[], extractor: (text: string) => T): T | null => {
+        const assistantMsgs = [...msgs].filter(m => m.role === 'assistant').reverse();
+        for (const msg of assistantMsgs) {
+          const text = epicExtractText(msg);
+          if (!text) continue;
+          try { return extractor(text); } catch { /* not this message */ }
+        }
+        return null;
+      };
+
+      let epic: Epic;
+      try {
+        const prompt =
+          `${overviewContext}\n\n` +
+          `Now return the work items JSON for epic ${i + 1}: "${epicStub.title}" (slug: "${epicStub.slug}").\n` +
+          `THIS EPIC ONLY. Return ALL work item fields. No prose, no code fences — pure JSON object.`;
+
+        await epicSession.prompt(prompt);
+        dumpSessionMessages(`phase2-epic-${epicStub.slug}`);
+
+        let result = findInEpicMessages(epicSession.messages, extractSingleEpic);
+        if (!result) {
+          logger.info(`[PLANNER] No JSON found for epic ${epicStub.slug} — retrying.`);
+          await epicSession.prompt(
+            `Your response did not contain valid JSON. Reply with ONLY a JSON object matching this shape:\n${EPIC_HINT}`
+          );
+          dumpSessionMessages(`phase2-epic-${epicStub.slug}-retry`);
+          result = findInEpicMessages(epicSession.messages, extractSingleEpic);
+          if (!result) throw new Error(`No valid JSON found for epic: ${epicStub.slug}`);
+        }
+        epic = result;
+      } finally {
+        epicSession.dispose();
+      }
 
       // Write epic file immediately
       const filename = `epic-${epicNum}-${epic.slug}.md`;
@@ -245,7 +311,8 @@ export async function planProject(
       plan,
     };
   } finally {
-    session.dispose();
+    // Phase 1 session already disposed above; this is a no-op safety net
+    try { session.dispose(); } catch { /* already disposed */ }
   }
 }
 

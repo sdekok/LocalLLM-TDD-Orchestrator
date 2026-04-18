@@ -509,21 +509,33 @@ export class WorkflowExecutor {
     const logger = getLogger();
     const task = this.state.getSubtask(taskId);
     if (!task) return '';
-    let technicalDescription = task.description;
-    if (attempt === 1 && (task.description.length < 100 || !task.description.toLowerCase().includes('test'))) {
-      logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
-      const subPlan = await planAndBreakdown(
-        `Implement this specific work item: ${task.description}\n\n` +
-        `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
-        `IMPORTANT: Break this down into high-granularity technical tasks. Each task should ideally add or modify 1 or 2 methods. ` +
-        `This granularity ensures quality in small models.`,
-        this.modelRouter,
-        this.searchClient || undefined
-      );
-      technicalDescription = `Task: ${task.description}\n\nTechnical Plan:\n` +
-        subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
+
+    // Only refine on the first attempt — retries reuse the same technical plan
+    // but with updated feedback injected via the system prompt.
+    if (attempt > 1) return task.description;
+
+    logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
+    const subPlan = await planAndBreakdown(
+      `Implement this specific work item: ${task.description}\n\n` +
+      `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
+      `IMPORTANT: Break this down into high-granularity technical tasks. Each task should ideally add or modify 1 or 2 methods. ` +
+      `This granularity ensures quality in small models.`,
+      this.modelRouter,
+      this.searchClient || undefined
+    );
+
+    if (subPlan.subtasks.length === 0) {
+      logger.warn(`Refinement returned 0 subtasks for ${task.id} — using original description`);
+      return task.description;
     }
-    return technicalDescription;
+
+    const plan = subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
+    this.chatMessage?.(
+      `🔍 **${task.id}** refined into ${subPlan.subtasks.length} implementation steps:\n${plan}`
+    );
+    logger.info(`Task ${task.id} refined into ${subPlan.subtasks.length} steps`);
+
+    return `Task: ${task.description}\n\nTechnical Plan:\n${plan}`;
   }
 
 }

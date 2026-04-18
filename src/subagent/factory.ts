@@ -218,9 +218,11 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   });
 
   // Give async extensions (like pi-mcp-adapter, llama-cpp connector) time to:
-  //   1. Establish MCP/RPC connections
+  //   1. Establish MCP/RPC connections (context-mode MCP server needs to spawn + enumerate tools)
   //   2. Register their providers (e.g. llama-cpp → session.modelRegistry via pi.registerProvider)
-  await new Promise(resolve => setTimeout(resolve, 2000));
+  // Default 5 s — override with TDD_MCP_STARTUP_MS if your machine needs more (or less).
+  const mcpStartupMs = parseInt(process.env['TDD_MCP_STARTUP_MS'] ?? '5000', 10);
+  await new Promise(resolve => setTimeout(resolve, mcpStartupMs));
 
   // Log available tools for diagnostics
   try {

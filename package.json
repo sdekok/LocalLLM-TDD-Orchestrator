@@ -10,7 +10,7 @@
     ]
   },
   "scripts": {
-    "build": "tsc && npm run bundle && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
+    "build": "tsc && cp src/orchestrator/lens-bridge.js dist/orchestrator/lens-bridge.js && npm run bundle && cp dist/orchestrator/lens-bridge.js dist/interfaces/pi/lens-bridge.js && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
     "build:csharp": "dotnet build src/analysis/tools/CsharpAstAnalyzer/CsharpAstAnalyzer.csproj -c Release",
     "build:all": "npm run build:csharp && npm run build",
     "bundle": "esbuild dist/interfaces/pi/index.js --bundle --platform=node --format=esm --outfile=dist/interfaces/pi/index.bundle.js --external:tree-sitter --external:tree-sitter-cpp --external:jsdom && mv dist/interfaces/pi/index.bundle.js dist/interfaces/pi/index.js",
