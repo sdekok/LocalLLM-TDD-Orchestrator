@@ -17,6 +17,11 @@ models.config.local.json
 # Scratch/debug artifacts
 git_status.txt
 merge_results.txt
+coverage_output.txt
+test_output.txt
+
+# Pi Lens cache
+.pi-lens/
 
 # .NET build artifacts (CsharpAstAnalyzer)
 src/analysis/tools/CsharpAstAnalyzer/bin/
