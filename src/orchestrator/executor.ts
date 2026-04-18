@@ -14,6 +14,8 @@ import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 
 export interface ExecutorOptions {
   searchClient?: SearchClient | null;
+  /** Optional callback to post messages into the Pi chat history. */
+  chatMessage?: (content: string) => void;
 }
 
 const MAX_ATTEMPTS = 3;
@@ -64,6 +66,7 @@ export class WorkflowExecutor {
   private modelRouter: ModelRouter;
   private sandbox: Sandbox;
   private searchClient: SearchClient | null;
+  private chatMessage: ((content: string) => void) | null;
   public events = new EventEmitter();
 
   constructor(
@@ -75,6 +78,37 @@ export class WorkflowExecutor {
     this.modelRouter = modelRouter;
     this.sandbox = new Sandbox(state.projectDir);
     this.searchClient = options?.searchClient || null;
+    this.chatMessage = options?.chatMessage || null;
+  }
+
+  /**
+   * Subscribe to a sub-agent session and stream thinking blocks, text output,
+   * and tool calls into Pi chat. Mirrors the pattern in project-planner.ts.
+   */
+  private subscribeToSession(session: any, label: string): void {
+    if (!this.chatMessage) return;
+    const chatMessage = this.chatMessage;
+    session.subscribe((event: any) => {
+      if (event.type === 'message_update') {
+        const ae = event.assistantMessageEvent;
+        if (ae.type === 'thinking_end' && ae.content) {
+          const preview = ae.content.length > 400
+            ? ae.content.substring(0, 400) + '…'
+            : ae.content;
+          chatMessage(`**[${label}]** 💭 ${preview}`);
+        } else if (ae.type === 'text_end' && ae.content?.trim()) {
+          chatMessage(`**[${label}]** ${ae.content}`);
+        }
+      } else if (event.type === 'tool_execution_start') {
+        const firstArg = event.args && typeof event.args === 'object'
+          ? Object.values(event.args as Record<string, unknown>).find(v => typeof v === 'string') as string | undefined
+          : undefined;
+        const argHint = firstArg
+          ? `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}`
+          : '';
+        chatMessage(`**[${label}]** 🔧 \`${event.toolName}\`${argHint}`);
+      }
+    });
   }
 
   async startNew(request: string): Promise<void> {
@@ -111,6 +145,15 @@ export class WorkflowExecutor {
       const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
       this.state.updateRefinedRequest(plan.refinedRequest);
       this.state.setSubtasks(plan.subtasks);
+    }
+
+    // Post task checklist to chat so the user can track progress
+    const subtasks = this.state.getState().subtasks;
+    if (subtasks.length > 0) {
+      this.chatMessage?.(
+        `📋 **TDD Workflow** — ${subtasks.length} task${subtasks.length === 1 ? '' : 's'}:\n` +
+        subtasks.map(t => `- [ ] **${t.id}**: ${t.description}`).join('\n')
+      );
     }
 
     await this.processQueue();
@@ -217,6 +260,7 @@ export class WorkflowExecutor {
                 devNotes: task.devNotes,
               },
             });
+            this.subscribeToSession(implementerSession, `Implementer ${task.id}`);
 
             // Enrich the prompt
             let implementerPrompt = technicalDescription;
@@ -341,6 +385,7 @@ export class WorkflowExecutor {
               modelRouter: this.modelRouter,
               tools: 'review'
             });
+            this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`);
 
             let reviewText = '';
             try {
@@ -398,6 +443,7 @@ export class WorkflowExecutor {
               phase: undefined
             });
             logger.info(`Task ${task.id} completed and merged!`);
+            this.chatMessage?.(`✅ **${task.id}** completed (attempt ${attempt}): ${task.description}`);
             const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
             if (completedTask) {
               this.events.emit('taskCompleted', { id: task.id, task: completedTask });
@@ -418,6 +464,15 @@ export class WorkflowExecutor {
         this.state.updateSubtask(task.id, { status: 'failed', feedback });
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
+
+        // Post failure summary to chat with inspection pointers
+        const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
+        this.chatMessage?.(
+          `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempt${MAX_ATTEMPTS === 1 ? '' : 's'}: ${task.description}\n\n` +
+          `**Feedback:** ${feedbackPreview}\n\n` +
+          `**Inspect:** branch \`${branchName}\` has the last attempt's changes\n` +
+          `State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\``
+        );
 
         this.events.emit('taskFailed', {
           id: task.id,

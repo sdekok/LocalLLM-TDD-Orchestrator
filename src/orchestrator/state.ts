@@ -64,6 +64,9 @@ export class StateManager {
     const data = JSON.stringify(this.state, null, 2);
     const tmpPath = `${this.stateFile}.${randomBytes(4).toString('hex')}.tmp`;
     try {
+      // Re-ensure the directory exists — it may have been removed after construction
+      // (e.g. git clean, fresh project, or manual deletion).
+      fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
       fs.writeFileSync(tmpPath, data, 'utf-8');
       fs.renameSync(tmpPath, this.stateFile);
     } catch (err) {
