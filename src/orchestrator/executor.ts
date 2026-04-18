@@ -141,9 +141,29 @@ export class WorkflowExecutor {
         devNotes: wi.devNotes
       })));
     } else {
+      // If the request looks like a bare epic reference (e.g. "1", "01", "epic-2") but no
+      // WorkItems/ directory or matching file was found, fail fast with a clear message rather
+      // than sending a meaningless string to the planner LLM.
+      const looksLikeEpicRef = /^\s*(?:epic[-\s]*)?\d{1,3}\s*$/i.test(request);
+      if (looksLikeEpicRef) {
+        const msg =
+          `No WorkItems directory found (or no epic matching "${request.trim()}"). ` +
+          `Run /plan first to generate epics, then use /tdd <epic number> to execute one.`;
+        this.chatMessage?.(msg);
+        throw new Error(msg);
+      }
+
       logger.warn(`⚠️ No pre-planned Epic found for "${request}". Falling back to on-the-fly decomposition.`);
       const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
       this.state.updateRefinedRequest(plan.refinedRequest);
+
+      if (plan.subtasks.length === 0) {
+        const msg = `Planner returned 0 subtasks for request: "${request.substring(0, 80)}". ` +
+          `Check .tdd-workflow/logs/ for the planner session dump.`;
+        this.chatMessage?.(msg);
+        throw new Error(msg);
+      }
+
       this.state.setSubtasks(plan.subtasks);
     }
 
@@ -479,17 +499,10 @@ export class WorkflowExecutor {
           task: failedTask,
           feedback: failureMessage,
           isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES,
-          canRollback: true,
           originalBranch
         });
       }
     }
-  }
-
-  public async rollbackTask(originalBranch: string): Promise<void> {
-    const logger = getLogger();
-    logger.info(`Performing manual rollback to branch: ${originalBranch}`);
-    await this.sandbox.rollback(originalBranch);
   }
 
   public async refineTaskIntoSubtasks(taskId: string, attempt: number): Promise<string> {

@@ -159,12 +159,13 @@ export class Sandbox {
     const logger = getLogger();
     const safeBranch = sanitizeBranchName(originalBranch);
     try {
-      await execFileAsync('git', ['checkout', '--', '.'], { cwd: this.projectDir, ...EXEC_OPTS });
-      await execFileAsync('git', ['clean', '-fd'], { cwd: this.projectDir, ...EXEC_OPTS });
+      // Switch back to the original branch only — no clean, no restore.
+      // Any WIP from the failed task remains on its sandbox branch so the
+      // user can inspect, debug, or hand it to another agent.
       await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
-      logger.info(`Rolled back to ${safeBranch}`);
+      logger.info(`Returned to ${safeBranch} — sandbox branch preserved for inspection`);
     } catch (err) {
-      logger.error(`Rollback failed: ${err}`);
+      logger.error(`Could not switch back to ${safeBranch}: ${err}`);
     }
   }
 

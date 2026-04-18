@@ -82,7 +82,7 @@ describe('Orchestrator Integration', () => {
     expect(fs.existsSync(path.join(projectDir, 'src/greeting.ts'))).toBe(true);
   });
 
-  it('rolls back sandbox branch on failure', async () => {
+  it('rollback switches back to original branch, leaving WIP intact for inspection', async () => {
     const sandbox = new Sandbox(projectDir);
     const originalBranch = await sandbox.getCurrentBranch();
 
@@ -91,11 +91,14 @@ describe('Orchestrator Integration', () => {
       { filepath: 'src/bad-code.ts', content: 'this will fail type checking\n' },
     ]);
 
-    // Simulate gate failure — rollback
+    // Simulate gate failure — rollback switches branch only, no clean
     await sandbox.rollback(originalBranch);
 
-    // Bad file should be gone
-    expect(fs.existsSync(path.join(projectDir, 'src/bad-code.ts'))).toBe(false);
+    // We're back on the original branch
+    expect(await sandbox.getCurrentBranch()).toBe(originalBranch);
+
+    // WIP file is still present (untracked, preserved for debugging)
+    expect(fs.existsSync(path.join(projectDir, 'src/bad-code.ts'))).toBe(true);
   });
 
   // ─── Quality Gates Integration ──────────────────────────────────
