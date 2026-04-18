@@ -277,6 +277,7 @@ export class WorkflowExecutor {
       let feedback = '';
 
       let lastAttemptDiff = '';
+      let changedFiles: string[] = [];
       const startAttempt = task.attempts || 1;
       for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
         const elapsed = Date.now() - taskStartTime;
@@ -317,6 +318,12 @@ export class WorkflowExecutor {
                 : `Agent is building implementation (Read -> Test -> Code)...`
             });
 
+            if (attempt > 1) {
+              this.chatMessage?.(
+                `🔁 **[${task.id}]** Attempt ${attempt}/${MAX_ATTEMPTS} — agent is starting with the above feedback injected into its system prompt`
+              );
+            }
+
             const implementerSession = await createSubAgentSession({
               taskType: 'implement',
               systemPrompt: IMPLEMENTER_PROMPT,
@@ -355,17 +362,25 @@ export class WorkflowExecutor {
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
 
-            // Capture diff for loop detection
+            // Capture diff for loop detection and pre-existing issue detection
             let currentDiff = '';
             try {
-              const { stdout } = await execFileAsync('git', ['diff', 'HEAD'], {
-                cwd: this.state.projectDir,
-                timeout: 10_000,
-                maxBuffer: DEFAULT_MAX_BUFFER,
-              });
-              currentDiff = stdout;
+              const [diffResult, namesResult] = await Promise.all([
+                execFileAsync('git', ['diff', 'HEAD'], {
+                  cwd: this.state.projectDir,
+                  timeout: 10_000,
+                  maxBuffer: DEFAULT_MAX_BUFFER,
+                }),
+                execFileAsync('git', ['diff', '--name-only', 'HEAD'], {
+                  cwd: this.state.projectDir,
+                  timeout: 10_000,
+                  maxBuffer: DEFAULT_MAX_BUFFER,
+                }),
+              ]);
+              currentDiff = diffResult.stdout;
+              changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
             } catch {
-              // Non-fatal — skip loop detection if diff fails
+              // Non-fatal — skip loop detection / pre-existing check if diff fails
             }
 
             if (lastAttemptDiff && currentDiff) {
@@ -406,6 +421,37 @@ export class WorkflowExecutor {
 
             if (!qualityReport.allBlockingPassed) {
               feedback = formatGateFailures(qualityReport);
+
+              // Detect pre-existing lens failures: if every file mentioned in the lens
+              // output is NOT in the agent's changed set, these errors pre-date this task.
+              if (changedFiles.length > 0) {
+                const lensGate = qualityReport.gates.find(g => g.gate === 'lens' && !g.passed);
+                if (lensGate) {
+                  // Extract bare filenames/paths from lines like:
+                  //   [LSP] libs/shared-contracts/bin/export-schemas.ts: 7 error(s)
+                  //   libs/shared-contracts/bin/export-schemas.ts(3,1): error ...
+                  const mentionedFiles = [...lensGate.output.matchAll(/(?:^\[LSP\]\s+|^|\s)([\w./-]+\.(ts|tsx|js|jsx|cs|cpp|h))\b/gm)]
+                    .map(m => m[1]!)
+                    .filter(Boolean);
+                  if (mentionedFiles.length > 0) {
+                    const allOutOfScope = mentionedFiles.every(
+                      mf => !changedFiles.some(cf => cf.endsWith(mf) || mf.endsWith(cf))
+                    );
+                    if (allOutOfScope) {
+                      const fileList = [...new Set(mentionedFiles)].slice(0, 3).join(', ');
+                      const note =
+                        `⚠️ PRE-EXISTING ISSUE DETECTED: The lens errors below are in files you did NOT modify ` +
+                        `(${fileList}). These errors pre-date your changes and are outside the scope of this task.\n` +
+                        `Do NOT attempt to fix them. Instead: (1) confirm your own changes are correct and tests pass, ` +
+                        `(2) note the pre-existing errors in a code comment if relevant, (3) respond with a summary of ` +
+                        `what you implemented — the orchestrator will note this and proceed.\n\n`;
+                      feedback = note + feedback;
+                      logger.info(`Lens failures appear to be pre-existing (files not in diff): ${fileList}`);
+                    }
+                  }
+                }
+              }
+
               logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
               
               // Emit detailed feedback for TUI
