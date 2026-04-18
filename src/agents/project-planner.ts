@@ -61,14 +61,25 @@ export async function planProject(
   // Stream reasoning, tool calls, and text back into Pi chat
   if (uiContext?.chatMessage) {
     const chatMessage = uiContext.chatMessage;
+    const CHUNK_SIZE = 800;
+    let thinkingBuffer = '';
     session.subscribe((event) => {
       if (event.type === 'message_update') {
         const ae = event.assistantMessageEvent;
-        if (ae.type === 'thinking_end' && ae.content) {
-          const preview = ae.content.length > 400
-            ? ae.content.substring(0, 400) + '…'
-            : ae.content;
-          chatMessage(`💭 ${preview}`);
+        if (ae.type === 'thinking_start') {
+          thinkingBuffer = '';
+          chatMessage(`💭 _Thinking…_`);
+        } else if (ae.type === 'thinking_delta' && ae.delta) {
+          thinkingBuffer += ae.delta;
+          while (thinkingBuffer.length >= CHUNK_SIZE) {
+            chatMessage(`💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`);
+            thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
+          }
+        } else if (ae.type === 'thinking_end') {
+          if (thinkingBuffer.trim()) {
+            chatMessage(`💭 ${thinkingBuffer}`);
+            thinkingBuffer = '';
+          }
         } else if (ae.type === 'text_end' && ae.content?.trim()) {
           chatMessage(ae.content);
         }

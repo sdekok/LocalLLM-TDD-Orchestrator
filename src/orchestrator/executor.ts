@@ -88,14 +88,26 @@ export class WorkflowExecutor {
   private subscribeToSession(session: any, label: string): void {
     if (!this.chatMessage) return;
     const chatMessage = this.chatMessage;
+    const CHUNK_SIZE = 800;
+    let thinkingBuffer = '';
+
     session.subscribe((event: any) => {
       if (event.type === 'message_update') {
         const ae = event.assistantMessageEvent;
-        if (ae.type === 'thinking_end' && ae.content) {
-          const preview = ae.content.length > 400
-            ? ae.content.substring(0, 400) + '…'
-            : ae.content;
-          chatMessage(`**[${label}]** 💭 ${preview}`);
+        if (ae.type === 'thinking_start') {
+          thinkingBuffer = '';
+          chatMessage(`**[${label}]** 💭 _Thinking…_`);
+        } else if (ae.type === 'thinking_delta' && ae.delta) {
+          thinkingBuffer += ae.delta;
+          while (thinkingBuffer.length >= CHUNK_SIZE) {
+            chatMessage(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`);
+            thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
+          }
+        } else if (ae.type === 'thinking_end') {
+          if (thinkingBuffer.trim()) {
+            chatMessage(`**[${label}]** 💭 ${thinkingBuffer}`);
+            thinkingBuffer = '';
+          }
         } else if (ae.type === 'text_end' && ae.content?.trim()) {
           chatMessage(`**[${label}]** ${ae.content}`);
         }
