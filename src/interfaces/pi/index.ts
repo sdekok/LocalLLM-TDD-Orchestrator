@@ -130,9 +130,8 @@ export default function(pi: ExtensionAPI) {
       }
 
       ctx.ui.notify('TDD Workflow starting in background processing...', 'info');
-      stateManager.initWorkflow(args);
-      
-      // Async start
+
+      // Async start (executor.startNew calls stateManager.initWorkflow internally)
       executor!.startNew(args).then(() => {
         const summary = stateManager!.getSummary();
         ctx.ui.setStatus('tdd', undefined); // Clear status

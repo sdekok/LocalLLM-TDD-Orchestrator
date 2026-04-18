@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractOutermostJSON, extractPlanFromResponse, TruncatedJsonError } from '../../../src/agents/components/response-extractor.js';
+import { extractOutermostJSON, extractPlanFromResponse, normalizeJsonQuotes, TruncatedJsonError } from '../../../src/agents/components/response-extractor.js';
 import { InvalidJsonError } from '../../../src/agents/errors/planner-errors.js';
 
 describe('extractOutermostJSON', () => {
@@ -43,6 +43,21 @@ describe('extractOutermostJSON', () => {
     const text = 'prefix {"outer": {"inner": 42}} suffix';
     const result = extractOutermostJSON(text);
     expect(result).toBe('{"outer": {"inner": 42}}');
+    expect(JSON.parse(result!)).toEqual({ outer: { inner: 42 } });
+  });
+
+  it('normalizes curly/smart quotes and returns valid JSON', () => {
+    // Model emitted \u201C/\u201D double curly quotes outside a code block
+    const text = 'Here is the result: {\u201Ckey\u201D: \u201Cvalue\u201D}';
+    const result = extractOutermostJSON(text);
+    expect(result).not.toBeNull();
+    expect(JSON.parse(result!)).toEqual({ key: 'value' });
+  });
+
+  it('normalizes curly quotes in nested objects', () => {
+    const text = '{\u201Couter\u201D: {\u201Cinner\u201D: 42}}';
+    const result = extractOutermostJSON(text);
+    expect(result).not.toBeNull();
     expect(JSON.parse(result!)).toEqual({ outer: { inner: 42 } });
   });
 });
@@ -97,5 +112,20 @@ describe('extractPlanFromResponse', () => {
   it('throws TruncatedJsonError when the plan JSON is cut off', () => {
     const truncated = '{"summary": "A design system", "epics": [{"title": "E1", "slug": "e1"';
     expect(() => extractPlanFromResponse(truncated)).toThrow(TruncatedJsonError);
+  });
+
+  it('parses plan when model uses curly/smart quotes in code block', () => {
+    const raw = `{\u201Csummary\u201D: \u201Ctest summary\u201D, \u201Cepics\u201D: [], \u201CarchitecturalDecisions\u201D: []}`;
+    const normalized = normalizeJsonQuotes(raw);
+    expect(JSON.parse(normalized)).toMatchObject({ summary: 'test summary' });
+  });
+
+  it('parses plan with curly quotes outside a code block (bracket-balanced path)', () => {
+    // This is the path that was previously broken — curly quotes outside a
+    // code block go through extractOutermostJSON, which now normalizes first.
+    const raw = `Here is your plan: {\u201Csummary\u201D: \u201Ctest summary\u201D, \u201Cepics\u201D: [{\u201Ctitle\u201D: \u201CEpic 1\u201D, \u201Cslug\u201D: \u201Cepic-1\u201D, \u201Cdescription\u201D: \u201CDesc\u201D, \u201CworkItems\u201D: [{\u201Cid\u201D: \u201CWI-1\u201D, \u201Ctitle\u201D: \u201CTask\u201D, \u201Cdescription\u201D: \u201CDo thing\u201D, \u201Cacceptance\u201D: [\u201Cdone\u201D], \u201Ctests\u201D: [\u201Ctest\u201D]}]}], \u201CarchitecturalDecisions\u201D: []}`;
+    const result = extractPlanFromResponse(raw);
+    expect(result.summary).toBe('test summary');
+    expect(result.epics).toHaveLength(1);
   });
 });

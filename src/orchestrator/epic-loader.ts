@@ -88,42 +88,77 @@ export class EpicLoader {
     while ((match = wiRegex.exec(content)) !== null) {
       const id = match[1]!;
       const title = match[2]!;
-      
+
       // Get block until next ### header or --- divider
       const startIdx = match.index + match[0].length;
       let nextHeaderIdx = content.indexOf('\n### ', startIdx);
       const dividerIdx = content.indexOf('\n---', startIdx);
-      
+
       if (nextHeaderIdx === -1) nextHeaderIdx = content.length;
       const endIdx = dividerIdx !== -1 && dividerIdx < nextHeaderIdx ? dividerIdx : nextHeaderIdx;
-      
+
       const blockContent = content.substring(startIdx, endIdx).trim();
-      
-      // Extract sub-fields
-      const descriptionMatch = blockContent.match(/\*\*Description\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
-      const securityMatch = blockContent.match(/\*\*Security Considerations\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
-      const devNotesMatch = blockContent.match(/\*\*Developer Notes\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
-      
-      // Extract lists
-      const acceptanceMatch = blockContent.match(/\*\*Acceptance Criteria\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
-      const testsMatch = blockContent.match(/\*\*Recommended Tests\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
-      
-      const acceptance = acceptanceMatch 
-        ? acceptanceMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
-        : [];
-        
-      const tests = testsMatch
-        ? testsMatch[1]!.split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(l => l.length > 0)
-        : [];
-      
-      workItems.push({ 
-        id, 
-        title, 
-        description: descriptionMatch ? descriptionMatch[1]!.trim() : blockContent,
+
+      // Detect format: new (#### headers) vs legacy (**Bold**: inline)
+      const isNewFormat = /^####\s+/m.test(blockContent);
+
+      let description: string | undefined;
+      let acceptance: string[] = [];
+      let tests: string[] = [];
+      let security: string | undefined;
+      let devNotes: string | undefined;
+
+      if (isNewFormat) {
+        // New format: #### Section headers
+        description = this.extractWiSection(blockContent, 'Summary');
+        security = this.extractWiSection(blockContent, 'Security') || undefined;
+        devNotes = this.extractWiSection(blockContent, 'Dev Notes') || undefined;
+
+        const acceptanceRaw = this.extractWiSection(blockContent, 'Acceptance Criteria');
+        if (acceptanceRaw) {
+          acceptance = acceptanceRaw.split('\n')
+            .map(l => l.replace(/^[-*]\s*(\[.\]\s*)?/, '').trim())
+            .filter(l => l.length > 0);
+        }
+
+        const testsRaw = this.extractWiSection(blockContent, 'Recommended Tests');
+        if (testsRaw) {
+          tests = testsRaw.split('\n')
+            .map(l => l.replace(/^[-*]\s*/, '').trim())
+            .filter(l => l.length > 0);
+        }
+      } else {
+        // Legacy format: **Bold**: inline
+        const descriptionMatch = blockContent.match(/\*\*Description\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+        const securityMatch = blockContent.match(/\*\*Security Considerations\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+        const devNotesMatch = blockContent.match(/\*\*Developer Notes\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+        const acceptanceMatch = blockContent.match(/\*\*Acceptance Criteria\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+        const testsMatch = blockContent.match(/\*\*Recommended Tests\*\*:\s*([\s\S]*?)(?=\n\*\*|$)/i);
+
+        description = descriptionMatch ? descriptionMatch[1]!.trim() : undefined;
+        security = securityMatch ? securityMatch[1]!.trim() : undefined;
+        devNotes = devNotesMatch ? devNotesMatch[1]!.trim() : undefined;
+
+        if (acceptanceMatch) {
+          acceptance = acceptanceMatch[1]!.split('\n')
+            .map(l => l.replace(/^[-*]\s*/, '').trim())
+            .filter(l => l.length > 0);
+        }
+        if (testsMatch) {
+          tests = testsMatch[1]!.split('\n')
+            .map(l => l.replace(/^[-*]\s*/, '').trim())
+            .filter(l => l.length > 0);
+        }
+      }
+
+      workItems.push({
+        id,
+        title,
+        description: description || blockContent,
         acceptance,
-        security: securityMatch ? securityMatch[1]!.trim() : undefined,
+        security,
         tests: tests.length > 0 ? tests : undefined,
-        devNotes: devNotesMatch ? devNotesMatch[1]!.trim() : undefined
+        devNotes,
       });
     }
 
@@ -135,6 +170,16 @@ export class EpicLoader {
       workItems,
       filePath
     };
+  }
+
+  /**
+   * Extract a #### sub-section from a work item block.
+   */
+  private extractWiSection(blockContent: string, name: string): string {
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(?:^|\\n)####\\s+${escapedName}\\s*\\n([\\s\\S]*?)(?=\\n####|$)`, 'i');
+    const match = blockContent.match(regex);
+    return match ? match[1]!.trim() : '';
   }
 
   private extractSection(content: string, name: string): string {

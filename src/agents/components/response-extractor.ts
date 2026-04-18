@@ -1,5 +1,23 @@
-import { ProjectPlanSchema, type ProjectPlan } from '../project-plan-schema.js';
+import { ProjectPlanSchema, EpicOverviewSchema, EpicSchema, type ProjectPlan, type EpicOverview, type Epic } from '../project-plan-schema.js';
 import { InvalidJsonError, SchemaValidationError, NoResponseError } from '../errors/planner-errors.js';
+
+/**
+ * Normalizes typographic/curly quotes that models sometimes emit to their
+ * ASCII equivalents so JSON.parse() doesn't choke on them.
+ *
+ * Handles:
+ *  \u201C " → "   (LEFT DOUBLE QUOTATION MARK)
+ *  \u201D " → "   (RIGHT DOUBLE QUOTATION MARK)
+ *  \u2018 ' → '   (LEFT SINGLE QUOTATION MARK used as string delimiter)
+ *  \u2019 ' → '   (RIGHT SINGLE QUOTATION MARK used as string delimiter)
+ */
+export function normalizeJsonQuotes(s: string): string {
+  return s
+    .replace(/\u201C/g, '"')
+    .replace(/\u201D/g, '"')
+    .replace(/\u2018/g, "'")
+    .replace(/\u2019/g, "'");
+}
 
 /**
  * Scans text character-by-character to extract the outermost valid JSON object.
@@ -18,18 +36,22 @@ export class TruncatedJsonError extends Error {
 }
 
 export function extractOutermostJSON(text: string): string | null {
+  // Normalize curly/smart quotes up-front so the internal JSON.parse
+  // validation doesn't reject otherwise-valid candidates.
+  const normalized = normalizeJsonQuotes(text);
+
   let depth = 0;
   let start = -1;
 
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
+  for (let i = 0; i < normalized.length; i++) {
+    const ch = normalized[i];
     if (ch === '{') {
       if (depth === 0) start = i;
       depth++;
     } else if (ch === '}') {
       depth--;
       if (depth === 0 && start !== -1) {
-        const candidate = text.slice(start, i + 1);
+        const candidate = normalized.slice(start, i + 1);
         try {
           JSON.parse(candidate);
           return candidate;
@@ -43,17 +65,18 @@ export function extractOutermostJSON(text: string): string | null {
 
   // If we ended mid-object the output was truncated
   if (depth > 0 && start !== -1) {
-    throw new TruncatedJsonError(text.slice(start));
+    throw new TruncatedJsonError(normalized.slice(start));
   }
 
   return null;
 }
 
 /**
- * Extracts and validates a ProjectPlan from an agent's text response.
+ * Extracts a raw parsed JSON object from agent text.
+ * Tries markdown code blocks first, then bracket-balanced scan.
+ * Throws InvalidJsonError or TruncatedJsonError on failure.
  */
-export function extractPlanFromResponse(text: string): ProjectPlan {
-  // Extract JSON from markdown blocks if available
+function extractRawJson(text: string): any {
   const blockRegex = /```(?:json)?\s*([\s\S]*?)```/g;
   let match;
   let parsed: any = null;
@@ -61,25 +84,24 @@ export function extractPlanFromResponse(text: string): ProjectPlan {
 
   while ((match = blockRegex.exec(text)) !== null) {
     try {
-      parsed = JSON.parse(match[1]!);
-      break; // Found valid JSON block
+      parsed = JSON.parse(normalizeJsonQuotes(match[1]!));
+      break;
     } catch (err) {
       lastParserError = err as Error;
     }
   }
 
-  // Fallback: use bracket-balanced JSON extraction
   if (!parsed) {
     let jsonStr: string | null = null;
     try {
       jsonStr = extractOutermostJSON(text);
     } catch (err) {
-      if (err instanceof TruncatedJsonError) throw err; // propagate truncation clearly
+      if (err instanceof TruncatedJsonError) throw err;
       lastParserError = err as Error;
     }
     if (jsonStr) {
       try {
-        parsed = JSON.parse(jsonStr);
+        parsed = JSON.parse(normalizeJsonQuotes(jsonStr));
       } catch (err) {
         lastParserError = err as Error;
       }
@@ -92,15 +114,46 @@ export function extractPlanFromResponse(text: string): ProjectPlan {
       text
     );
   }
-  
+
+  return parsed;
+}
+
+/**
+ * Extracts and validates a ProjectPlan from an agent's text response.
+ */
+export function extractPlanFromResponse(text: string): ProjectPlan {
+  const parsed = extractRawJson(text);
   try {
     return ProjectPlanSchema.parse(parsed);
   } catch (err) {
     const zodError = err as any;
-    throw new SchemaValidationError(
-      `Invalid plan format: ${zodError.message}`,
-      zodError.errors || []
-    );
+    throw new SchemaValidationError(`Invalid plan format: ${zodError.message}`, zodError.errors || []);
+  }
+}
+
+/**
+ * Extracts and validates an EpicOverview (Phase 1 response — no work items).
+ */
+export function extractEpicOverview(text: string): EpicOverview {
+  const parsed = extractRawJson(text);
+  try {
+    return EpicOverviewSchema.parse(parsed);
+  } catch (err) {
+    const zodError = err as any;
+    throw new SchemaValidationError(`Invalid epic overview: ${zodError.message}`, zodError.errors || []);
+  }
+}
+
+/**
+ * Extracts and validates a single Epic with work items (Phase 2 response).
+ */
+export function extractSingleEpic(text: string): Epic {
+  const parsed = extractRawJson(text);
+  try {
+    return EpicSchema.parse(parsed);
+  } catch (err) {
+    const zodError = err as any;
+    throw new SchemaValidationError(`Invalid epic: ${zodError.message}`, zodError.errors || []);
   }
 }
 

@@ -442,7 +442,8 @@ describe('planProject', () => {
     const result = await planProject('UI Plan', mockModelRouter, '/tmp/test', uiContext);
 
     expect(result.plan?.summary).toBe('Test UI');
-    expect(uiContext.editor).toHaveBeenCalled();
+    // editor is no longer called — the new flow shows a confirm after the overview phase
+    expect(uiContext.editor).not.toHaveBeenCalled();
     expect(uiContext.confirm).toHaveBeenCalled();
     expect(mockFs.writeFileSync).toHaveBeenCalled();
   });
@@ -535,12 +536,12 @@ describe('planProject', () => {
     (createSubAgentSession as any).mockResolvedValue(mockSession);
 
     await expect(planProject('Build something', mockModelRouter, '/tmp/test'))
-      .rejects.toThrow('Invalid plan format after retry');
+      .rejects.toThrow('No valid JSON found after retry for: phase1-overview');
 
     expect(mockSession.prompt).toHaveBeenCalledTimes(2);
   });
 
-  it('cancels planning if user rejects the editor review', async () => {
+  it('cancels planning if user rejects the confirm dialog', async () => {
     const { planProject } = await import('../../src/agents/project-planner.js');
     const { createSubAgentSession } = await import('../../src/subagent/factory.js');
 
@@ -550,17 +551,17 @@ describe('planProject', () => {
       messages: [{ role: 'assistant', content: '{"reasoning": "Test reasoning", "summary": "Test", "epics": [], "architecturalDecisions": []}' }]
     };
     (createSubAgentSession as any).mockResolvedValue(mockSession);
-    
+
     const uiContext = {
       input: vi.fn(),
       notify: vi.fn(),
-      editor: vi.fn().mockResolvedValue(null), // Cancelled
-      confirm: vi.fn(),
+      editor: vi.fn(),
+      confirm: vi.fn().mockResolvedValue(false), // User declines
     };
 
     const result = await planProject('UI Plan', mockModelRouter, '/tmp/test', uiContext);
 
-    expect(result.summary).toBe('Plan review cancelled by user.');
+    expect(result.summary).toBe('Planning cancelled by user.');
     // Plan files (WorkItems/) must not be written — only the session debug dump is allowed.
     const planFilesWritten = (mockFs.writeFileSync as any).mock.calls.filter(
       (args: any[]) => typeof args[0] === 'string' && (args[0].includes('WorkItems') || args[0].includes('epic-') || args[0].includes('_overview'))

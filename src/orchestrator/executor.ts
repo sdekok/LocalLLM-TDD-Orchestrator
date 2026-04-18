@@ -304,7 +304,7 @@ export class WorkflowExecutor {
               });
 
               this.state.updateSubtask(task.id, { phase: undefined });
-              break;
+              continue;
             }
 
             // Commit passing code
@@ -375,7 +375,7 @@ export class WorkflowExecutor {
               });
 
               this.state.updateSubtask(task.id, { phase: undefined });
-              break;
+              continue;
             }
 
             approved = true;
@@ -423,7 +423,7 @@ export class WorkflowExecutor {
           id: task.id,
           task: failedTask,
           feedback: failureMessage,
-          isCircuitBroken: true,
+          isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES,
           canRollback: true,
           originalBranch
         });

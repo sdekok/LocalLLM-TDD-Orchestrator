@@ -2,9 +2,9 @@ import { createSubAgentSession } from '../subagent/factory.js';
 import { PROJECT_PLANNER_PROMPT } from '../subagent/prompts.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
-import { ProjectPlanSchema, type ProjectPlan } from './project-plan-schema.js';
-import { generatePlanMarkdown } from './components/markdown-generator.js';
-import { extractPlanFromResponse, TruncatedJsonError } from './components/response-extractor.js';
+import { type ProjectPlan, type EpicOverview, type Epic } from './project-plan-schema.js';
+import { generatePlanMarkdown, formatWorkItemMarkdown } from './components/markdown-generator.js';
+import { extractPlanFromResponse, extractEpicOverview, extractSingleEpic } from './components/response-extractor.js';
 export { generatePlanMarkdown };
 export { extractPlanFromResponse } from './components/response-extractor.js';
 import * as fs from 'fs';
@@ -84,50 +84,10 @@ export async function planProject(
   }
 
   logger.info(`Sub-agent session created, starting to send prompt...`);
-  logger.info(`Prompt length: ${request.length} characters`);
-  logger.info(`Sending prompt to agent: ${request.substring(0, 200)}...`);
 
   try {
-    // Send the initial prompt
-    logger.info(`Calling session.prompt() - waiting for model response...`);
-    logger.info(`Prompt being sent: ${request.substring(0, 300)}...`);
-    const promptStart = Date.now();
-    await session.prompt(request);
-    const promptDuration = Date.now() - promptStart;
-    logger.info(`session.prompt() completed in ${promptDuration}ms`);
-    
-    // Get the last assistant message and extract JSON
-    const messages = session.messages;
-    logger.info(`Total messages in session: ${messages.length}`);
-    messages.forEach((msg, idx) => {
-      logger.info(`Message ${idx}: role=${msg.role}, constructor=${msg.constructor?.name}`);
-      const hasContent = 'content' in msg;
-      if (hasContent) {
-        const content = (msg as any).content;
-        logger.info(`  Content is ${Array.isArray(content) ? 'array' : 'string'} with ${Array.isArray(content) ? content.length : 0} items`);
-        if (Array.isArray(content) && content.length > 0) {
-          logger.info(`  Content types: ${content.map((c: any) => c.type).join(', ')}`);
-        }
-      }
-    });
-    
-    const assistantMessages = messages.filter(m => m.role === 'assistant');
-    logger.info(`Assistant messages found: ${assistantMessages.length}`);
-    
-    const lastAssistantMessage = assistantMessages.pop();
+    // ── Shared helpers ────────────────────────────────────────────────────────
 
-    if (!lastAssistantMessage) {
-      throw new Error('Agent did not produce any response.');
-    }
-    
-
-
-    /**
-     * Extract all text from a message, combining text blocks and thinking blocks.
-     * Only falls back to thinking if text blocks are absent or all empty — avoids
-     * returning an empty string when the model emits a blank text block followed
-     * by a thinking block that contains the actual JSON.
-     */
     const extractText = (msg: any): string => {
       if (typeof msg.content === 'string') return msg.content;
       if (!Array.isArray(msg.content)) return '';
@@ -138,32 +98,6 @@ export async function planProject(
         .trim();
     };
 
-    /**
-     * Scan all assistant messages (newest first) for a valid plan.
-     * The JSON may appear in any turn — e.g. the model reasoned in a thinking
-     * block and then produced JSON in a prior text block.
-     */
-    const findPlanInMessages = (msgs: any[]): ProjectPlan | null => {
-      const assistantMsgs = [...msgs].filter(m => m.role === 'assistant').reverse();
-      for (const msg of assistantMsgs) {
-        const text = extractText(msg);
-        if (!text) continue;
-        try {
-          return extractPlanFromResponse(text);
-        } catch {
-          // not this message
-        }
-      }
-      return null;
-    };
-
-    const lastMsgContent = (lastAssistantMessage as any).content;
-    logger.info(`Last assistant message content types: ${Array.isArray(lastMsgContent) ? lastMsgContent.map((c: any) => c.type).join(', ') : typeof lastMsgContent}`);
-    let assistantText = extractText(lastAssistantMessage);
-    logger.info(`[PLANNER] Extracted text length: ${assistantText.length} chars`);
-
-    /** Dump full session messages to a timestamped file for debugging. */
-    /** Write full session (thinking + text) to a timestamped JSON file and log each block. */
     const dumpSessionMessages = (label: string) => {
       try {
         const dumpDir = path.join(cwd, '.tdd-workflow', 'logs');
@@ -174,7 +108,6 @@ export async function planProject(
       } catch (e) {
         logger.warn(`[PLANNER] Failed to write session dump: ${(e as Error).message}`);
       }
-      // Log each assistant block to the main log so it's visible without opening the dump file
       const assistantMsgs = (session.messages as any[]).filter(m => m.role === 'assistant');
       assistantMsgs.forEach((msg, msgIdx) => {
         const blocks: any[] = Array.isArray(msg.content) ? msg.content : [];
@@ -190,86 +123,125 @@ export async function planProject(
       });
     };
 
-    // Always dump after the initial prompt so there's always a record
-    dumpSessionMessages('initial-response');
+    /** Scan all assistant messages newest-first for a valid T. */
+    const findInMessages = <T>(msgs: any[], extractor: (text: string) => T): T | null => {
+      const assistantMsgs = [...msgs].filter(m => m.role === 'assistant').reverse();
+      for (const msg of assistantMsgs) {
+        const text = extractText(msg);
+        if (!text) continue;
+        try { return extractor(text); } catch { /* not this message */ }
+      }
+      return null;
+    };
 
-    // Parse and validate the JSON. If the model didn't return JSON (common with passthrough
-    // mode chat models), send a follow-up prompt that explicitly requests structured output.
-    let plan: ProjectPlan;
+    /** Send a prompt, scan for T, retry once with schema hint if missing. */
+    const promptAndFind = async <T>(
+      promptText: string,
+      extractor: (text: string) => T,
+      schemaHint: string,
+      dumpLabel: string,
+    ): Promise<T> => {
+      const start = Date.now();
+      await session.prompt(promptText);
+      logger.info(`[PLANNER] ${dumpLabel} completed in ${Date.now() - start}ms`);
+      dumpSessionMessages(dumpLabel);
 
-    // First: scan all messages — the plan might be in an earlier turn
-    const foundPlan = findPlanInMessages(messages);
-    if (foundPlan) {
-      plan = foundPlan;
-    } else {
-      logger.info(`[PLANNER] No JSON found in any message — sending follow-up prompt.`);
-      const schemaHint = `{"summary":"string","epics":[{"title":"string","slug":"string","description":"string","workItems":[{"id":"string","title":"string","description":"string","acceptance":["string"],"tests":["string"]}]}],"architecturalDecisions":["string"]}`;
-      await session.prompt(
-        `Your previous response did not contain a valid JSON plan.\n\n` +
-        `Please respond with ONLY a JSON object — no prose, no markdown fences — that matches this shape:\n${schemaHint}\n\n` +
-        `Use the exploration you already did. Output the JSON now.`
+      let result = findInMessages(session.messages, extractor);
+      if (!result) {
+        logger.info(`[PLANNER] No JSON found after ${dumpLabel} — retrying.`);
+        await session.prompt(
+          `Your response did not contain valid JSON. ` +
+          `Reply with ONLY a JSON object matching this shape:\n${schemaHint}`
+        );
+        dumpSessionMessages(`${dumpLabel}-retry`);
+        result = findInMessages(session.messages, extractor);
+        if (!result) {
+          throw new Error(`No valid JSON found after retry for: ${dumpLabel}`);
+        }
+      }
+      return result;
+    };
+
+    // ── Phase 1: Epic overview ────────────────────────────────────────────────
+
+    const OVERVIEW_HINT = `{"summary":"...","architecturalDecisions":["..."],"epics":[{"title":"...","slug":"...","description":"..."}]}`;
+
+    const overview: EpicOverview = await promptAndFind(
+      `${request}\n\nReturn the epic overview JSON now. No work items yet — just the epic list.`,
+      extractEpicOverview,
+      OVERVIEW_HINT,
+      'phase1-overview',
+    );
+
+    logger.info(`[PLANNER] Overview: ${overview.epics.length} epics`);
+    uiContext?.chatMessage?.(`📋 Overview ready: ${overview.epics.length} epics planned.`);
+
+    // Optional UI confirm after overview
+    if (uiContext) {
+      const epicList = overview.epics.map((e, i) => `${i + 1}. ${e.title}`).join('\n');
+      const confirmed = await uiContext.confirm(
+        `Plan has ${overview.epics.length} epics:\n${epicList}\n\nProceed to generate work items?`
+      );
+      if (!confirmed) return { summary: 'Planning cancelled by user.' };
+    }
+
+    // Write overview file immediately
+    const workItemsDir = path.join(cwd, 'WorkItems');
+    if (!fs.existsSync(workItemsDir)) fs.mkdirSync(workItemsDir, { recursive: true });
+
+    fs.writeFileSync(
+      path.join(workItemsDir, '_overview.md'),
+      `# Project Overview\n\n${overview.summary}\n\n## Architectural Decisions\n\n` +
+      overview.architecturalDecisions.map(d => `- ${d}`).join('\n')
+    );
+
+    if (overview.architecturalDecisions.length > 0) {
+      await appendArchitecturalDecisions(overview.architecturalDecisions, cwd);
+    }
+
+    // ── Phase 2: Work items per epic ─────────────────────────────────────────
+
+    const EPIC_HINT = `{"title":"...","slug":"...","description":"...","workItems":[{"id":"WI-N","title":"...","description":"one sentence","acceptance":["..."],"tests":["Unit: ..."]}]}`;
+
+    const completedEpics: Epic[] = [];
+
+    for (let i = 0; i < overview.epics.length; i++) {
+      const epicStub = overview.epics[i]!;
+      const epicNum = String(i + 1).padStart(2, '0');
+      logger.info(`[PLANNER] Fetching work items for epic ${epicNum}: ${epicStub.title}`);
+      uiContext?.chatMessage?.(`⏳ Epic ${i + 1}/${overview.epics.length}: ${epicStub.title}`);
+
+      const epic: Epic = await promptAndFind(
+        `Return the work items JSON for epic ${i + 1}: "${epicStub.title}" (slug: "${epicStub.slug}"). ` +
+        `This epic only. Include all work item fields.`,
+        extractSingleEpic,
+        EPIC_HINT,
+        `phase2-epic-${epicStub.slug}`,
       );
 
-      const retryMessages = session.messages.filter((m: any) => m.role === 'assistant');
-      const retryMessage = retryMessages[retryMessages.length - 1];
-      if (!retryMessage) {
-        throw new Error('Agent did not produce a response on retry.');
-      }
-      assistantText = extractText(retryMessage);
-      dumpSessionMessages('retry-response');
+      // Write epic file immediately
+      const filename = `epic-${epicNum}-${epic.slug}.md`;
+      let epicMd = `# Epic: ${epic.title}\n\n## Summary\n${epic.description}\n\n`;
+      if (epic.securityStrategy) epicMd += `## Security Strategy\n${epic.securityStrategy}\n\n`;
+      if (epic.testStrategy) epicMd += `## Testing Strategy\n${epic.testStrategy}\n\n`;
+      epicMd += `## Work Items\n\n`;
+      epic.workItems.forEach(wi => { epicMd += formatWorkItemMarkdown(wi).join('\n'); });
+      fs.writeFileSync(path.join(workItemsDir, filename), epicMd);
 
-      // Scan all messages again for a valid plan
-      const retryPlan = findPlanInMessages(session.messages);
-      if (retryPlan) {
-        plan = retryPlan;
-      } else {
-        let lastErr: Error = new Error('No JSON found');
-        try { extractPlanFromResponse(assistantText); } catch (e) { lastErr = e as Error; }
-        if (lastErr instanceof TruncatedJsonError) {
-          throw new Error(
-            `Model output was truncated — the plan JSON was cut off mid-stream. ` +
-            `This usually means maxOutputTokens is too low for the size of plan requested. ` +
-            `Check models.config.json or ask for a smaller plan.`
-          );
-        }
-        throw new Error(`Invalid plan format after retry: ${lastErr.message}. Raw output:\n${assistantText.substring(0, 500)}`);
-      }
+      completedEpics.push(epic);
+      logger.info(`[PLANNER] Epic ${epicNum} written: ${filename} (${epic.workItems.length} work items)`);
+      uiContext?.chatMessage?.(`✅ Epic ${i + 1}: ${epic.title} — ${epic.workItems.length} work items`);
     }
 
-    // If UI context is provided, show the plan for review
-    if (uiContext) {
-      const planMarkdown = generatePlanMarkdown(plan);
-      const edited = await uiContext.editor('Review Plan:', planMarkdown);
-      if (edited === null) {
-        return { summary: 'Plan review cancelled by user.' };
-      }
-      // TODO: Parse edited markdown back to JSON if needed
-      
-      // Confirm before writing files
-      const confirmed = await uiContext.confirm(`Create WorkItems/ directory with ${plan.epics.length} epics?`);
-      if (!confirmed) {
-        return { summary: 'Plan approved but file writing cancelled.' };
-      }
-
-      // Write the plan files
-      await writePlanFiles(plan, cwd);
-      
-      // Append architectural decisions to agents.md
-      if (plan.architecturalDecisions.length > 0) {
-        await appendArchitecturalDecisions(plan.architecturalDecisions, cwd);
-      }
-    } else {
-      // No UI context - just write the files directly
-      await writePlanFiles(plan, cwd);
-      
-      // Append architectural decisions to agents.md
-      if (plan.architecturalDecisions.length > 0) {
-        await appendArchitecturalDecisions(plan.architecturalDecisions, cwd);
-      }
-    }
+    // Assemble full plan for callers that need it
+    const plan: ProjectPlan = {
+      summary: overview.summary,
+      architecturalDecisions: overview.architecturalDecisions,
+      epics: completedEpics,
+    };
 
     return {
-      summary: `Project planning complete. Created ${plan.epics.length} epics in WorkItems/.`,
+      summary: `Project planning complete. Created ${completedEpics.length} epics in WorkItems/.`,
       plan,
     };
   } finally {
@@ -338,33 +310,9 @@ export async function writePlanFiles(plan: ProjectPlan, cwd: string): Promise<vo
     }
     
     epicMd += `## Work Items\n\n`;
-    
+
     epic.workItems.forEach(wi => {
-      epicMd += `### ${wi.id}: ${wi.title}\n\n`;
-      epicMd += `**Description**: ${wi.description}\n\n`;
-      epicMd += `**Acceptance Criteria**:\n`;
-      wi.acceptance.forEach(a => {
-        epicMd += `- ${a}\n`;
-      });
-      epicMd += `\n`;
-      
-      if (wi.security) {
-        epicMd += `**Security Considerations**: ${wi.security}\n\n`;
-      }
-      
-      if (wi.tests && wi.tests.length > 0) {
-        epicMd += `**Recommended Tests**:\n`;
-        wi.tests.forEach(t => {
-          epicMd += `- ${t}\n`;
-        });
-        epicMd += `\n`;
-      }
-      
-      if (wi.devNotes) {
-        epicMd += `**Developer Notes**: ${wi.devNotes}\n\n`;
-      }
-      
-      epicMd += `---\n\n`;
+      epicMd += formatWorkItemMarkdown(wi).join('\n');
     });
     
     fs.writeFileSync(epicPath, epicMd);
