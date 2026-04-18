@@ -88,7 +88,7 @@ export default function(pi: ExtensionAPI) {
 
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
-          chatMessage: (content) => postToChat(content, 'tdd-progress'),
+          chatMessage: (content) => postToChat(content),
         });
 
         // Bind UI events
