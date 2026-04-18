@@ -468,7 +468,7 @@ export class WorkflowExecutor {
         // Post failure summary to chat with inspection pointers
         const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
         this.chatMessage?.(
-          `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempt${MAX_ATTEMPTS === 1 ? '' : 's'}: ${task.description}\n\n` +
+          `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
           `**Feedback:** ${feedbackPreview}\n\n` +
           `**Inspect:** branch \`${branchName}\` has the last attempt's changes\n` +
           `State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\``
