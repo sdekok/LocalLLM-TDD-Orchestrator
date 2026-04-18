@@ -112,15 +112,52 @@ export class WorkflowExecutor {
           chatMessage(`**[${label}]** ${ae.content}`);
         }
       } else if (event.type === 'tool_execution_start') {
-        const firstArg = event.args && typeof event.args === 'object'
-          ? Object.values(event.args as Record<string, unknown>).find(v => typeof v === 'string') as string | undefined
-          : undefined;
-        const argHint = firstArg
-          ? `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}`
-          : '';
-        chatMessage(`**[${label}]** 🔧 \`${event.toolName}\`${argHint}`);
+        const toolName: string = event.toolName;
+        const args = (event.args && typeof event.args === 'object') ? event.args as Record<string, unknown> : {};
+        let msg = `**[${label}]** 🔧 \`${toolName}\``;
+
+        if (toolName === 'write') {
+          const filePath = (args['path'] ?? args['file_path'] ?? '') as string;
+          const content = (args['content'] ?? '') as string;
+          msg += `: ${filePath}`;
+          if (content) {
+            const preview = content.length > 400 ? content.substring(0, 400) + '\n…' : content;
+            msg += `\n\`\`\`\n${preview}\n\`\`\``;
+          }
+        } else if (toolName === 'edit') {
+          const filePath = (args['path'] ?? args['file_path'] ?? '') as string;
+          const edits: Array<{ oldText: string; newText: string }> = Array.isArray(args['edits'])
+            ? args['edits'] as Array<{ oldText: string; newText: string }>
+            : (args['oldText'] != null ? [{ oldText: args['oldText'] as string, newText: (args['newText'] ?? '') as string }] : []);
+          msg += `: ${filePath}`;
+          for (const edit of edits.slice(0, 2)) {
+            const oldPreview = edit.oldText.length > 120 ? edit.oldText.substring(0, 120) + '…' : edit.oldText;
+            const newPreview = edit.newText.length > 120 ? edit.newText.substring(0, 120) + '…' : edit.newText;
+            msg += `\n\`\`\`diff\n- ${oldPreview.replace(/\n/g, '\n- ')}\n+ ${newPreview.replace(/\n/g, '\n+ ')}\n\`\`\``;
+          }
+          if (edits.length > 2) msg += `\n_…and ${edits.length - 2} more edit(s)_`;
+        } else {
+          const firstArg = Object.values(args).find(v => typeof v === 'string') as string | undefined;
+          if (firstArg) msg += `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}`;
+        }
+
+        chatMessage(msg);
       }
     });
+  }
+
+  /** Post a full task checklist with live status icons so users can track progress. */
+  private postChecklistUpdate(currentTaskId?: string): void {
+    const subtasks = this.state.getState().subtasks;
+    const completed = subtasks.filter(t => t.status === 'completed').length;
+    const lines = subtasks.map(t => {
+      if (t.status === 'completed') return `✅ **${t.id}**: ${t.description}`;
+      if (t.status === 'failed')    return `❌ **${t.id}**: ${t.description}`;
+      if (t.id === currentTaskId || t.status === 'in_progress')
+        return `🔄 **${t.id}**: ${t.description}`;
+      return `⬜ **${t.id}**: ${t.description}`;
+    });
+    this.chatMessage?.(`📋 **Progress** ${completed}/${subtasks.length}:\n${lines.join('\n')}`);
   }
 
   async startNew(request: string): Promise<void> {
@@ -230,6 +267,7 @@ export class WorkflowExecutor {
       if (task.status !== 'in_progress') {
         this.state.updateSubtask(task.id, { status: 'in_progress' });
         this.events.emit('taskStarted', { id: task.id, description: task.description });
+        this.postChecklistUpdate(task.id);
       }
 
       const taskStartTime = Date.now();
@@ -379,6 +417,13 @@ export class WorkflowExecutor {
                 isError: true
               });
 
+              if (attempt < MAX_ATTEMPTS) {
+                const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
+                this.chatMessage?.(
+                  `**[${task.id}]** ❌ Quality gates failed (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\`\`\`\n${fbPreview}\n\`\`\``
+                );
+              }
+
               this.state.updateSubtask(task.id, { phase: undefined });
               continue;
             }
@@ -451,6 +496,13 @@ export class WorkflowExecutor {
                 isError: true
               });
 
+              if (attempt < MAX_ATTEMPTS) {
+                const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
+                this.chatMessage?.(
+                  `**[${task.id}]** ❌ Review rejected (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\n${fbPreview}`
+                );
+              }
+
               this.state.updateSubtask(task.id, { phase: undefined });
               continue;
             }
@@ -475,8 +527,8 @@ export class WorkflowExecutor {
               phase: undefined
             });
             logger.info(`Task ${task.id} completed and merged!`);
-            this.chatMessage?.(`✅ **${task.id}** completed (attempt ${attempt}): ${task.description}`);
             const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+            this.postChecklistUpdate();
             if (completedTask) {
               this.events.emit('taskCompleted', { id: task.id, task: completedTask });
             }

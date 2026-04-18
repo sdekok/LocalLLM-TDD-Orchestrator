@@ -1,0 +1,24 @@
+{
+  "success": true,
+  "clones": [
+    {
+      "fileA": "src/interfaces/pi/index.ts",
+      "startA": 249,
+      "fileB": "src/interfaces/pi/index.ts",
+      "startB": 202,
+      "lines": 6,
+      "tokens": 0
+    },
+    {
+      "fileA": "src/analysis/cpp-analyzer.ts",
+      "startA": 83,
+      "fileB": "src/analysis/csharp-analyzer.ts",
+      "startB": 79,
+      "lines": 18,
+      "tokens": 0
+    }
+  ],
+  "duplicatedLines": 22,
+  "totalLines": 6188,
+  "percentage": 0.36
+}

@@ -1,0 +1,11 @@
+{
+  "items": [
+    {
+      "type": "TODO",
+      "message": "Parse edited markdown back to JSON if needed",
+      "file": "src/agents/project-planner.ts",
+      "line": 170,
+      "column": 9
+    }
+  ]
+}

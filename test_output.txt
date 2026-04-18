@@ -1,0 +1,65 @@
+
+> tdd-agentic-workflow@2.0.0 test
+> vitest run
+
+
+[1m[46m RUN [49m[22m [36mv4.1.2 [39m[90m/home/stephen/dev/tdd-pi-plugin[39m
+
+ [32m✓[39m tests/llm/model-router.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 30[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/sandbox.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 30[2mms[22m[39m
+ [32m✓[39m tests/search/searxng.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+[tdd-workflow] warn message
+[tdd-workflow] error message
+[tdd-workflow] should appear
+ [32m✓[39m tests/utils/logger.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 28[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/state.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 48[2mms[22m[39m
+ [32m✓[39m tests/analysis/cpp-analyzer.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 70[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/test-runner.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 27[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/epic-loader.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 40[2mms[22m[39m
+[tdd-workflow] Search failed during planning: Error: Search failed
+ [32m✓[39m tests/agents/planner.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mruns the full planning flow without UI context
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 148
+[DEBUG] Last assistant raw message content: [
+  {
+    "type": "text",
+    "text": "Here is the plan: ```json\n{\n  \"reasoning\": \"Test reasoning\",\n  \"summary\": \"Test project\",\n  \"epics\": [],\n  \"architecturalDecisions\": [\"Dec 1\"]\n}\n```"
+  }
+]
+[DEBUG] Checking all assistant messages:
+
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mruns the full planning flow with UI context and approval
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 108
+[DEBUG] Last assistant raw message content: "```json\n{\"reasoning\": \"Test reasoning\", \"summary\": \"Test UI\", \"epics\": [], \"architecturalDecisions\": []}\n```"
+[DEBUG] Checking all assistant messages:
+
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mcancels planning if user rejects the editor review
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 93
+[DEBUG] Last assistant raw message content: "{\"reasoning\": \"Test reasoning\", \"summary\": \"Test\", \"epics\": [], \"architecturalDecisions\": []}"
+[DEBUG] Checking all assistant messages:
+
+ [32m✓[39m tests/agents/project-planner.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 105[2mms[22m[39m
+ [32m✓[39m tests/llm/client.test.ts [2m([22m[2m10 tests[22m[2m)[22m[32m 22[2mms[22m[39m
+ [32m✓[39m tests/llm/model-tuning.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 32[2mms[22m[39m
+ [32m✓[39m tests/analysis/csharp-analyzer.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 410[2mms[22m[39m
+     [33m[2m✓[22m[39m analyzes exports and imports correctly [33m 395[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/quality-gates.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/integration.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 489[2mms[22m[39m
+ [32m✓[39m tests/agents/researcher.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 30[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/executor-refinement.test.ts [2m([22m[2m2 tests[22m[2m)[22m[32m 17[2mms[22m[39m
+ [32m✓[39m tests/subagent/research-tools.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 261[2mms[22m[39m
+ [32m✓[39m tests/orchestrator/executor.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 6[2mms[22m[39m
+ [32m✓[39m tests/analysis/analyzer.test.ts [2m([22m[2m16 tests[22m[2m)[22m[33m 2861[2mms[22m[39m
+     [33m[2m✓[22m[39m analyzes exports [33m 781[2mms[22m[39m
+ [32m✓[39m tests/subagent/factory.test.ts [2m([22m[2m2 tests[22m[2m)[22m[33m 4031[2mms[22m[39m
+     [33m[2m✓[22m[39m spawns a session with the correct system prompt [33m 2016[2mms[22m[39m
+     [33m[2m✓[22m[39m sets thinking level based on model profile [33m 2006[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m21 passed[39m[22m[90m (21)[39m
+[2m      Tests [22m [1m[32m151 passed[39m[22m[90m (151)[39m
+[2m   Start at [22m 11:50:09
+[2m   Duration [22m 5.40s[2m (transform 5.37s, setup 0ms, import 14.57s, tests 8.60s, environment 10ms)[22m
+

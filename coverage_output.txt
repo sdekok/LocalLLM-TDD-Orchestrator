@@ -1,0 +1,55 @@
+
+[1m[46m RUN [49m[22m [36mv4.1.2 [39m[90m/home/stephen/dev/tdd-pi-plugin[39m
+      [2mCoverage enabled with [22m[33mv8[39m
+
+[tdd-workflow] Search failed during planning: Error: Search failed
+ [32m✓[39m tests/agents/planner.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mruns the full planning flow without UI context
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 115
+[DEBUG] Last assistant raw message content: [
+  {
+    "type": "text",
+    "text": "Here is the plan: ```json\n{\n  \"summary\": \"Test project\",\n  \"epics\": [],\n  \"architecturalDecisions\": [\"Dec 1\"]\n}\n```"
+  }
+]
+[DEBUG] Checking all assistant messages:
+
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mruns the full planning flow with UI context and approval
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 77
+[DEBUG] Last assistant raw message content: "```json\n{\"summary\": \"Test UI\", \"epics\": [], \"architecturalDecisions\": []}\n```"
+[DEBUG] Checking all assistant messages:
+
+[90mstdout[2m | tests/agents/project-planner.test.ts[2m > [22m[2mplanProject[2m > [22m[2mcancels planning if user rejects the editor review
+[22m[39m[DEBUG] Planner session completed. Total messages: 1
+[DEBUG] Last assistant response length: 62
+[DEBUG] Last assistant raw message content: "{\"summary\": \"Test\", \"epics\": [], \"architecturalDecisions\": []}"
+[DEBUG] Checking all assistant messages:
+
+ [32m✓[39m tests/agents/project-planner.test.ts [2m([22m[2m18 tests[22m[2m)[22m[32m 70[2mms[22m[39m
+ [32m✓[39m tests/agents/researcher.test.ts [2m([22m[2m6 tests[22m[2m)[22m[32m 19[2mms[22m[39m
+
+[2m Test Files [22m [1m[32m3 passed[39m[22m[90m (3)[39m
+[2m      Tests [22m [1m[32m27 passed[39m[22m[90m (27)[39m
+[2m   Start at [22m 10:19:36
+[2m   Duration [22m 1.27s[2m (transform 292ms, setup 0ms, import 1.23s, tests 104ms, environment 0ms)[22m
+
+[34m % [39m[2mCoverage report from [22m[33mv8[39m
+-------------------|---------|----------|---------|---------|-------------------
+File               | % Stmts | % Branch | % Funcs | % Lines | Uncovered Line #s 
+-------------------|---------|----------|---------|---------|-------------------
+All files          |   67.75 |    51.67 |   61.29 |   68.98 |                   
+ agents            |   90.17 |    74.15 |   93.75 |   89.73 |                   
+  planner.ts       |     100 |      100 |     100 |     100 |                   
+  ...lan-schema.ts |     100 |      100 |     100 |     100 |                   
+  ...ct-planner.ts |      88 |     72.6 |    92.3 |   87.34 | ...82,294,330,358 
+  researcher.ts    |   95.23 |       75 |     100 |   95.23 | 72,96             
+ llm               |   12.85 |     6.97 |   14.28 |   14.75 |                   
+  model-router.ts  |   12.85 |     6.97 |   14.28 |   14.75 | ...46,150,162-218 
+ subagent          |   28.57 |        0 |      25 |   29.62 |                   
+  prompts.ts       |     100 |      100 |     100 |     100 |                   
+  ...arch-tools.ts |   16.66 |        0 |      25 |   17.39 | 36-71             
+ utils             |   58.82 |    72.72 |   41.66 |    60.6 |                   
+  logger.ts        |   58.82 |    72.72 |   41.66 |    60.6 | 38,41-56,74-75    
+-------------------|---------|----------|---------|---------|-------------------

@@ -570,6 +570,154 @@ describe('planProject', () => {
   });
 });
 
+describe('planProject — chatMessage streaming via uiContext', () => {
+  const mockFs = fs as any;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Build a mock session that:
+   * 1. Captures the subscribe listener so tests can fire events at it.
+   * 2. Returns a valid plan on prompt() so planProject completes normally.
+   */
+  function makePlannerSession() {
+    let listener: ((event: any) => void) | null = null;
+    const validPlanJson =
+      '{"reasoning":"r","summary":"Streaming Test","epics":[],"architecturalDecisions":[]}';
+    const messagesStore = [
+      {
+        role: 'assistant',
+        content: [{ type: 'text', text: validPlanJson }],
+      },
+    ];
+    const session = {
+      prompt: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+      subscribe: vi.fn((fn: (event: any) => void) => {
+        listener = fn;
+        return () => { listener = null; };
+      }),
+      get messages() { return messagesStore; },
+    };
+    const fire = (event: any) => { if (listener) listener(event); };
+    return { session, fire };
+  }
+
+  it('posts Thinking… immediately when thinking_start fires', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { session, fire } = makePlannerSession();
+    (createSubAgentSession as any).mockResolvedValue(session);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const chatMessage = vi.fn();
+    // Intercept subscribe to fire a thinking_start right away when prompt is called
+    session.prompt.mockImplementation(async () => {
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_start' } });
+    });
+
+    await planProject('Build something', new (await import('../../src/llm/model-router.js')).ModelRouter({
+      models: { 'test-model': { name: 'T', ggufFilename: 'test.gguf', provider: 'local', contextWindow: 8192, maxOutputTokens: 1024, architecture: 'dense', speed: 'fast', enableThinking: false } },
+      routing: { 'project-plan': 'test-model' },
+    }), '/tmp/test', { input: vi.fn(), notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), chatMessage });
+
+    const thinkingCall = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('Thinking'));
+    expect(thinkingCall).toBeDefined();
+    expect(thinkingCall![0]).toContain('💭');
+  });
+
+  it('posts a chunk when thinking_delta exceeds 800 chars', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { session, fire } = makePlannerSession();
+    (createSubAgentSession as any).mockResolvedValue(session);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const chatMessage = vi.fn();
+    session.prompt.mockImplementation(async () => {
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_start' } });
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'x'.repeat(900) } });
+    });
+
+    await planProject('Build something', new (await import('../../src/llm/model-router.js')).ModelRouter({
+      models: { 'test-model': { name: 'T', ggufFilename: 'test.gguf', provider: 'local', contextWindow: 8192, maxOutputTokens: 1024, architecture: 'dense', speed: 'fast', enableThinking: false } },
+      routing: { 'project-plan': 'test-model' },
+    }), '/tmp/test', { input: vi.fn(), notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), chatMessage });
+
+    // thinking_start + at least one chunk from thinking_delta
+    const chunkCalls = chatMessage.mock.calls.filter((c: any[]) => (c[0] as string).includes('💭'));
+    expect(chunkCalls.length).toBeGreaterThanOrEqual(2); // start notification + content chunk
+  });
+
+  it('flushes remaining thinking content on thinking_end', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { session, fire } = makePlannerSession();
+    (createSubAgentSession as any).mockResolvedValue(session);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const chatMessage = vi.fn();
+    session.prompt.mockImplementation(async () => {
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_start' } });
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', delta: 'short thought' } });
+      fire({ type: 'message_update', assistantMessageEvent: { type: 'thinking_end', content: 'short thought' } });
+    });
+
+    await planProject('Build something', new (await import('../../src/llm/model-router.js')).ModelRouter({
+      models: { 'test-model': { name: 'T', ggufFilename: 'test.gguf', provider: 'local', contextWindow: 8192, maxOutputTokens: 1024, architecture: 'dense', speed: 'fast', enableThinking: false } },
+      routing: { 'project-plan': 'test-model' },
+    }), '/tmp/test', { input: vi.fn(), notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), chatMessage });
+
+    const flushCall = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('short thought'));
+    expect(flushCall).toBeDefined();
+  });
+
+  it('posts tool calls to chatMessage', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { session, fire } = makePlannerSession();
+    (createSubAgentSession as any).mockResolvedValue(session);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    const chatMessage = vi.fn();
+    session.prompt.mockImplementation(async () => {
+      fire({ type: 'tool_execution_start', toolName: 'web_search', args: { query: 'best practices' } });
+    });
+
+    await planProject('Build something', new (await import('../../src/llm/model-router.js')).ModelRouter({
+      models: { 'test-model': { name: 'T', ggufFilename: 'test.gguf', provider: 'local', contextWindow: 8192, maxOutputTokens: 1024, architecture: 'dense', speed: 'fast', enableThinking: false } },
+      routing: { 'project-plan': 'test-model' },
+    }), '/tmp/test', { input: vi.fn(), notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true), chatMessage });
+
+    const toolCall = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('web_search'));
+    expect(toolCall).toBeDefined();
+    expect(toolCall![0]).toContain('🔧');
+  });
+
+  it('does not call subscribe when chatMessage is absent in uiContext', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { session } = makePlannerSession();
+    (createSubAgentSession as any).mockResolvedValue(session);
+    mockFs.existsSync.mockReturnValue(true);
+    mockFs.readdirSync.mockReturnValue([]);
+
+    // uiContext without chatMessage
+    await planProject('Build something', new (await import('../../src/llm/model-router.js')).ModelRouter({
+      models: { 'test-model': { name: 'T', ggufFilename: 'test.gguf', provider: 'local', contextWindow: 8192, maxOutputTokens: 1024, architecture: 'dense', speed: 'fast', enableThinking: false } },
+      routing: { 'project-plan': 'test-model' },
+    }), '/tmp/test', { input: vi.fn(), notify: vi.fn(), confirm: vi.fn().mockResolvedValue(true) });
+
+    expect(session.subscribe).not.toHaveBeenCalled();
+  });
+});
+
 describe('generatePlanMarkdown', () => {
   it('generates correct markdown for a plan', async () => {
     const { generatePlanMarkdown } = await import('../../src/agents/project-planner.js');
