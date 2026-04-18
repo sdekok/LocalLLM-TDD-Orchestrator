@@ -69,7 +69,8 @@ Inside any project, use the slash commands:
 
 - **Setup**: `/setup` — configure model routing interactively
 - **Plan**: `/plan "Build a secure login system"` — decomposes into Epics/WorkItems
-- **Implement**: `/tdd 1` — loads from `WorkItems/` and executes
+- **Implement**: `/tdd 1` — loads Epic 1 from `WorkItems/` and executes
+- **Resume**: `/tdd 1 retry` — retry failed tasks and continue; `/tdd 1 continue` — skip failed and continue
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
 - **Analyze**: `/analyze` — architectural blueprinting
 
@@ -144,10 +145,12 @@ The easiest way to create or update either file is via `/setup` in Pi. You can a
 
 | Guard | What It Catches | Behavior |
 |---|---|---|
-| **Max attempts** (3/task) | Persistent failures | Marks task as failed, moves to next |
+| **Max attempts** (3/task) | Persistent failures | Marks task failed, stops workflow — awaits `/tdd <n> retry\|continue` |
 | **Output similarity** (>90%) | Agent stuck in a loop | Bails immediately |
 | **Time budget** (10 min/task) | LLM hangs, runaway tool calls | Breaks the attempt loop |
 | **Circuit breaker** (3 failures) | Systemic problems | Stops entire workflow |
+
+When a task fails the workflow stops and posts a chat message explaining what to do next. The failed branch is preserved for inspection — nothing is cleaned up automatically.
 
 ## Multi-Language Support
 
@@ -193,3 +196,4 @@ npm run dev          # Watch mode
 | `TDD_WORKFLOW_CONFIG_DIR` | — | Override config file search directory |
 | `LENS_FAIL_POLICY` | `fail-closed` | `fail-open` skips the Lens gate on crash; `fail-closed` treats a crash as a failure |
 | `TDD_SLOT_RECOVERY_MS` | `5000` | Milliseconds to wait after sub-agent disposal before reusing the slot |
+| `TDD_MCP_STARTUP_MS` | `5000` | Milliseconds to wait for MCP servers (context-mode, searxng) to register tools after session creation |

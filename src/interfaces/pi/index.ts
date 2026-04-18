@@ -70,8 +70,19 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('tdd', {
-    description: 'Start a new Agentic TDD Epic',
+    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> continue',
     handler: async (args: string, ctx) => {
+      if (!args) {
+        args = await ctx.ui.input('Enter TDD Epic number or description (append "retry" or "continue" to resume):') || '';
+        if (!args) return;
+      }
+
+      // Parse subcommand: "/tdd 1 retry" | "/tdd 1 continue" | "/tdd 1"
+      const parts = args.trim().split(/\s+/);
+      const epicRef = parts[0] ?? '';
+      const subcommand = parts[1]?.toLowerCase();
+      const isResume = subcommand === 'retry' || subcommand === 'continue';
+
       // Lazy init orchestrator state
       if (!stateManager) {
         stateManager = new StateManager(ctx.cwd);
@@ -104,36 +115,47 @@ export default function(pi: ExtensionAPI) {
           ctx.ui.notify(`✅ [TDD] Task completed: ${data.id}`, 'info');
         });
 
-        executor.events.on('taskFailed', async (data: { id: string, feedback: string, isCircuitBroken: boolean, originalBranch?: string }) => {
-          ctx.ui.notify(`❌ [TDD] Task failed: ${data.id}. Feedback:\n${data.feedback}`, 'error');
-
-          if (data.isCircuitBroken) {
-            ctx.ui.setStatus('tdd', undefined);
-            ctx.ui.notify('Circuit breaker tripped. Workflow paused.', 'warning');
-          }
+        executor.events.on('taskFailed', async (data: { id: string, feedback: string }) => {
+          ctx.ui.notify(`❌ [TDD] Task failed: ${data.id}`, 'error');
+          ctx.ui.setStatus('tdd', undefined);
         });
       }
 
-      if (!args) {
-        args = await ctx.ui.input('Enter TDD Epic description:') || '';
-        if (!args) return;
-      }
+      const runAndReport = (promise: Promise<void>) => {
+        ctx.ui.notify('TDD Workflow running in background...', 'info');
+        promise.then(() => {
+          const summary = stateManager!.getSummary();
+          ctx.ui.setStatus('tdd', undefined);
+          if (summary.failed > 0 || summary.pending > 0) {
+            ctx.ui.notify(
+              `⏸ TDD paused — ${summary.failed} failed, ${summary.pending} pending, ${summary.completed} done.`,
+              'warning'
+            );
+          } else {
+            ctx.ui.notify(`🎉 TDD Epic Complete! ${summary.completed} subtasks implemented.`, 'info');
+          }
+        }).catch((err: any) => {
+          ctx.ui.setStatus('tdd', undefined);
+          ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
+        });
+      };
 
-      ctx.ui.notify('TDD Workflow starting in background processing...', 'info');
-
-      // Async start (executor.startNew calls stateManager.initWorkflow internally)
-      executor!.startNew(args).then(() => {
-        const summary = stateManager!.getSummary();
-        ctx.ui.setStatus('tdd', undefined); // Clear status
-        if (summary.pending === 0 && summary.failed === 0) {
-          ctx.ui.notify(`🎉 TDD Epic Complete! ${summary.completed} subtasks implemented.`, 'info');
-        } else {
-          ctx.ui.notify(`⚠️ TDD Epic Paused. ${summary.failed} failed, ${summary.pending} pending.`, 'warning');
+      if (isResume) {
+        if (!stateManager.hasWorkflow()) {
+          ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
+          return;
         }
-      }).catch((err: any) => {
-        ctx.ui.setStatus('tdd', undefined);
-        ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
-      });
+        const retryFailed = subcommand === 'retry';
+        postToChat(
+          retryFailed
+            ? `🔄 Retrying failed tasks for epic **${epicRef}**…`
+            : `▶️ Continuing epic **${epicRef}** (skipping failed tasks)…`,
+          'tdd-progress'
+        );
+        runAndReport(executor!.resume(retryFailed));
+      } else {
+        runAndReport(executor!.startNew(epicRef));
+      }
     }
   });
 

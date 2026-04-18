@@ -485,13 +485,14 @@ export class WorkflowExecutor {
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
 
-        // Post failure summary to chat with inspection pointers
+        // Post failure summary to chat with inspection pointers and resume instructions
+        const epicRef = this.state.getState().original_request.trim();
         const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
         this.chatMessage?.(
           `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
           `**Feedback:** ${feedbackPreview}\n\n` +
-          `**Inspect:** branch \`${branchName}\` has the last attempt's changes\n` +
-          `State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\``
+          `**Inspect:** branch \`${branchName}\` · State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\`\n\n` +
+          `**Next step:** \`/tdd ${epicRef} retry\` to retry failed tasks, or \`/tdd ${epicRef} continue\` to skip and proceed.`
         );
 
         this.events.emit('taskFailed', {
@@ -501,6 +502,9 @@ export class WorkflowExecutor {
           isCircuitBroken: consecutiveFailures >= MAX_CONSECUTIVE_FAILURES,
           originalBranch
         });
+
+        // Stop the workflow — user must explicitly resume via /tdd <epic> retry|continue
+        break;
       }
     }
   }
