@@ -654,6 +654,62 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(reviewerPromptArg).not.toContain('Implementer Notes');
   });
 
+  it('collectAgentQuestions returns null when questions.md does not exist', async () => {
+    const result = await (executor as any).collectAgentQuestions('Implementer WI-1');
+    expect(result).toBeNull();
+  });
+
+  it('collectAgentQuestions posts questions to chat and waits for input when file exists', async () => {
+    const chatMessage = vi.fn();
+    const waitForInput = vi.fn().mockResolvedValue('Use soft-delete. UUID for new records.');
+    (executor as any).chatMessage = chatMessage;
+    (executor as any).waitForInput = waitForInput;
+
+    const tddDir = path.join(projectDir, '.tdd-workflow');
+    fs.mkdirSync(tddDir, { recursive: true });
+    fs.writeFileSync(path.join(tddDir, 'questions.md'), '1. Soft-delete or hard-delete?\n2. UUID or sequential IDs?');
+
+    const result = await (executor as any).collectAgentQuestions('Implementer WI-1');
+
+    expect(chatMessage).toHaveBeenCalledOnce();
+    expect(chatMessage.mock.calls[0][0]).toContain('Soft-delete or hard-delete');
+    expect(waitForInput).toHaveBeenCalledOnce();
+    expect(result).toContain('Use soft-delete');
+    expect(result).toContain('User answers to agent questions');
+
+    // File should be deleted after reading
+    expect(fs.existsSync(path.join(tddDir, 'questions.md'))).toBe(false);
+  });
+
+  it('collectAgentQuestions returns null when user cancels (waitForInput returns null)', async () => {
+    const waitForInput = vi.fn().mockResolvedValue(null);
+    (executor as any).waitForInput = waitForInput;
+
+    const tddDir = path.join(projectDir, '.tdd-workflow');
+    fs.mkdirSync(tddDir, { recursive: true });
+    fs.writeFileSync(path.join(tddDir, 'questions.md'), '1. What should I do?');
+
+    const result = await (executor as any).collectAgentQuestions('Implementer WI-1');
+    expect(result).toBeNull();
+  });
+
+  it('collectAgentQuestions logs a warning and skips when no waitForInput is wired', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+    (executor as any).waitForInput = null;
+
+    const tddDir = path.join(projectDir, '.tdd-workflow');
+    fs.mkdirSync(tddDir, { recursive: true });
+    fs.writeFileSync(path.join(tddDir, 'questions.md'), '1. No handler configured');
+
+    const result = await (executor as any).collectAgentQuestions('Implementer WI-1');
+
+    expect(result).toBeNull();
+    // Should still post the questions to chat as an informational message
+    expect(chatMessage).toHaveBeenCalledOnce();
+    expect(chatMessage.mock.calls[0][0]).toContain('no input handler');
+  });
+
   it('processQueue captures reviewText from text_end stream events (reasoning model path)', async () => {
     // Reasoning models emit text via text_end stream events rather than populating
     // message_end content — verify the executor uses accumulated stream text for verdict parsing.

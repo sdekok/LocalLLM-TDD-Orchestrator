@@ -47,6 +47,14 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
    - Any design decisions or trade-offs you made
    - Anything non-obvious the reviewer should know (e.g. why you chose this approach over an alternative, known limitations, intentional omissions)
    - Any pre-existing issues you encountered but left alone (out of scope)
+9. **Questions** _(rare — only when truly stuck)_: If you encounter a decision that is genuinely ambiguous and has material impact on the implementation, write your questions to \`.tdd-workflow/questions.md\` using \`write\`. The orchestrator will surface them to the user and inject the answers into your next attempt.
+
+   **Before writing a question you MUST:**
+   - Search the web for best practices or industry standards — if there's a clear answer, use it.
+   - Check existing codebase conventions — if there's a clear pattern, follow it.
+   - Write down your best-guess assumption and proceed with it anyway — don't block on uncertainty.
+
+   Format: numbered list, one question per line, include your assumption so the user can correct rather than guess.
 
 ### Requirements & Context
 **Acceptance Criteria**:
@@ -95,6 +103,9 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
    - Adherence to project architecture and coding standards.
    - Security vulnerabilities (Injection, RBAC, Data Leakage).
    - Missing or fragile tests (check the test logic, not just if they pass).
+
+### Clarification Questions _(rare)_
+If something in the diff or codebase is genuinely ambiguous and your verdict depends on the answer, write your questions to \`.tdd-workflow/questions.md\` using \`write\` before returning your verdict. The orchestrator will get answers and inject them into the next attempt. Only ask if you cannot resolve the ambiguity from the diff, the codebase, or the task description.
 
 ### Your Output Format
 Your final message MUST end with a structured verdict in this format:

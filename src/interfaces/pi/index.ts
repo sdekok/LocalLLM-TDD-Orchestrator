@@ -101,6 +101,10 @@ export default function(pi: ExtensionAPI) {
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
           chatMessage: (content) => postToChat(content, 'tdd-progress'),
+          waitForInput: async (prompt: string) => {
+            postToChat(`💬 ${prompt}`, 'tdd-question');
+            return await waitForChatInput();
+          },
         });
 
         // Bind UI events
@@ -292,6 +296,10 @@ export default function(pi: ExtensionAPI) {
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
           chatMessage: (content) => postToChat(content, 'tdd-progress'),
+          waitForInput: async (prompt: string) => {
+            postToChat(`💬 ${prompt}`, 'tdd-question');
+            return await waitForChatInput();
+          },
         });
 
         executor.events.on('taskStarted', (data: { description: string }) => {

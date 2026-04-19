@@ -17,6 +17,14 @@ export interface ExecutorOptions {
   searchClient?: SearchClient | null;
   /** Optional callback to post messages into the Pi chat history. */
   chatMessage?: (content: string) => void;
+  /**
+   * Optional callback to ask the user a question and await their reply.
+   * Used when an agent writes questions to .tdd-workflow/questions.md.
+   * The timeout races only cover agent sessions — user interaction time
+   * is outside the race so it never counts against the agent budget.
+   * Returns null if the user cancels or no handler is wired.
+   */
+  waitForInput?: (prompt: string) => Promise<string | null>;
 }
 
 const MAX_ATTEMPTS = 5;
@@ -69,6 +77,7 @@ export class WorkflowExecutor {
   private sandbox: Sandbox;
   private searchClient: SearchClient | null;
   private chatMessage: ((content: string) => void) | null;
+  private waitForInput: ((prompt: string) => Promise<string | null>) | null;
   public events = new EventEmitter();
 
   constructor(
@@ -81,6 +90,7 @@ export class WorkflowExecutor {
     this.sandbox = new Sandbox(state.projectDir);
     this.searchClient = options?.searchClient || null;
     this.chatMessage = options?.chatMessage || null;
+    this.waitForInput = options?.waitForInput || null;
   }
 
   /**
@@ -160,6 +170,45 @@ export class WorkflowExecutor {
       return `⬜ **${t.id}**: ${t.description}`;
     });
     this.chatMessage?.(`📋 **Progress** ${completed}/${subtasks.length}:\n${lines.join('\n')}`);
+  }
+
+  /**
+   * Read .tdd-workflow/questions.md if an agent wrote it, post the questions to
+   * chat, wait for the user's answer (outside the agent timeout), clear the file,
+   * and return the answers string to be injected into the next attempt's feedback.
+   * Returns null when there are no questions or no waitForInput handler is wired.
+   */
+  private async collectAgentQuestions(label: string): Promise<string | null> {
+    const questionsPath = path.join(this.state.projectDir, '.tdd-workflow', 'questions.md');
+    let questions: string;
+    try {
+      if (!fs.existsSync(questionsPath)) return null;
+      questions = fs.readFileSync(questionsPath, 'utf-8').trim();
+      if (!questions) return null;
+    } catch {
+      return null;
+    }
+
+    // Clear immediately so stale questions don't bleed into the next attempt
+    try { fs.unlinkSync(questionsPath); } catch { /* non-fatal */ }
+
+    if (!this.waitForInput) {
+      // No handler wired — log and skip
+      getLogger().warn(`[${label}] Agent posted questions but no waitForInput handler is configured.`);
+      this.chatMessage?.(`❓ **[${label}]** Agent has questions but no input handler is configured:\n\n${questions}`);
+      return null;
+    }
+
+    this.chatMessage?.(
+      `❓ **[${label}]** Agent has questions. Please answer below — the workflow will resume after your reply.\n\n${questions}`
+    );
+
+    const answer = await this.waitForInput(
+      `Answer the ${label}'s questions above and press Enter:`
+    );
+    if (!answer?.trim()) return null;
+
+    return `**User answers to agent questions:**\n${answer.trim()}`;
   }
 
   async startNew(request: string): Promise<void> {
@@ -384,6 +433,13 @@ export class WorkflowExecutor {
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
 
+            // Collect any questions the implementer wrote (outside the timeout — user
+            // interaction time doesn't count against the agent's session budget).
+            const implementerAnswers = await this.collectAgentQuestions(`Implementer ${task.id}`);
+            if (implementerAnswers) {
+              feedback = feedback ? `${feedback}\n\n${implementerAnswers}` : implementerAnswers;
+            }
+
             // Capture diff for loop detection and reviewer context
             currentDiff = '';
             try {
@@ -570,6 +626,9 @@ export class WorkflowExecutor {
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
 
+            // Collect any questions the reviewer wrote (outside the timeout)
+            const reviewerAnswers = await this.collectAgentQuestions(`Reviewer ${task.id}`);
+
             // Parse Reviewer Verdict
             const isApproved = /APPROVED:\s*true/i.test(reviewText);
             const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
@@ -577,7 +636,9 @@ export class WorkflowExecutor {
 
             if (!isApproved) {
               logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
-              feedback = reviewerFeedback;
+              feedback = reviewerAnswers
+                ? `${reviewerFeedback}\n\n${reviewerAnswers}`
+                : reviewerFeedback;
 
               // Emit detailed feedback for TUI
               this.events.emit('taskProgress', {
