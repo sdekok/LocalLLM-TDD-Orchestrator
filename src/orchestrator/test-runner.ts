@@ -100,10 +100,12 @@ export class VitestRunner extends BaseTestRunner {
   }
 
   async runCoverage(projectDir: string, timeoutMs: number): Promise<TestResult> {
-    // We use --reporter=json-summary so it's easier to parse programmatically
+    // @vitest/coverage-v8 writes coverage-summary.json to the coverage/ directory
+    // automatically — no extra reporter flag needed (json-summary is not a built-in
+    // in vitest v4 and causes a startup crash if specified).
     const { stdout, stderr, passed } = await this.execWithTimeout(
-      'npx vitest run --coverage --reporter=default --reporter=json-summary', 
-      projectDir, 
+      'npx vitest run --coverage',
+      projectDir,
       timeoutMs
     );
     const output = stdout + '\n' + stderr;
