@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import * as fs from 'fs';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
@@ -537,12 +538,23 @@ export class WorkflowExecutor {
               const reviewerTimeout = new Promise<never>((_, reject) =>
                 setTimeout(() => reject(new Error(`Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`)), MAX_REVIEWER_DURATION_MS)
               );
-              // Give the reviewer the git diff so it doesn't have to discover changes
-              // itself — it can focus on depth of analysis rather than file discovery.
+              // Read implementer notes if the agent wrote them
+              let implementerNotes = '';
+              try {
+                const notesPath = path.join(this.state.projectDir, '.tdd-workflow', 'implementation-notes.md');
+                if (fs.existsSync(notesPath)) {
+                  implementerNotes = fs.readFileSync(notesPath, 'utf-8').trim();
+                }
+              } catch { /* non-fatal */ }
+
+              // Build reviewer prompt: notes first (context), then diff (evidence)
+              const notesSummary = implementerNotes
+                ? `\n\n## Implementer Notes\n${implementerNotes}`
+                : '';
               const diffSummary = changedFiles.length > 0
                 ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
                 : '';
-              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${diffSummary}`), reviewerTimeout]);
+              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${diffSummary}`), reviewerTimeout]);
             } finally {
               reviewerSession.dispose();
               logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');

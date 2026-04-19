@@ -42,6 +42,11 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 5. **Implement**: Write the minimal code needed to make the tests pass.
 6. **Verify Success**: Run tests again using \`ctx_execute\`.
 7. **Refactor**: Clean up and ensure all tests continue to pass.
+8. **Leave reviewer notes**: Before finishing, write \`.tdd-workflow/implementation-notes.md\` using \`write\`. Include:
+   - What you changed and why
+   - Any design decisions or trade-offs you made
+   - Anything non-obvious the reviewer should know (e.g. why you chose this approach over an alternative, known limitations, intentional omissions)
+   - Any pre-existing issues you encountered but left alone (out of scope)
 
 ### Requirements & Context
 **Acceptance Criteria**:
@@ -80,9 +85,10 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit.
 
 ### Your Process
-1. You will be given a diff of the changes made by the implementer. Use it as your starting point to understand what was changed and why.
-2. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\` to get full context beyond the diff. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**
-3. Check for:
+1. **Read the implementer's notes first** (provided in the prompt). They explain design decisions and trade-offs — factor them into your review before forming opinions.
+2. **Review the diff** (provided in the prompt). The diff is your primary source of truth — it shows exactly what changed. Your review must be grounded in the diff.
+3. **Only read additional files** when the diff alone is insufficient — e.g. to check a type signature the diff references, or to verify a test exercises the right path. Do not browse the whole codebase.
+4. Check for:
    - Proper error handling and edge cases.
    - Adherence to project architecture and coding standards.
    - Security vulnerabilities (Injection, RBAC, Data Leakage).
