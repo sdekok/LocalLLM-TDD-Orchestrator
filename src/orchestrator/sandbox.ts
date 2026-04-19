@@ -152,6 +152,66 @@ export class Sandbox {
   }
 
   /**
+   * Checkout a branch, tolerating uncommitted changes in .tdd-workflow/ runtime files
+   * (state.json, logs). These files are managed by the orchestrator at runtime and may
+   * have diverged from HEAD since the last commit. Restoring them to HEAD before the
+   * switch is safe — the orchestrator holds the authoritative state in memory.
+   */
+  private async safeCheckout(branch: string): Promise<void> {
+    const safeBranch = sanitizeBranchName(branch);
+    try {
+      await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+    } catch (err) {
+      const msg = String(err);
+      if (!msg.includes('would be overwritten by checkout')) throw err;
+
+      // Restore runtime files to HEAD so the checkout can proceed.
+      for (const f of ['.tdd-workflow/state.json', '.tdd-workflow/logs']) {
+        try {
+          await execFileAsync('git', ['checkout', 'HEAD', '--', f], { cwd: this.projectDir, ...EXEC_OPTS });
+        } catch { /* file/dir may not be tracked on this branch */ }
+      }
+      await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+    }
+  }
+
+  /**
+   * Ensure the working tree is on a base branch (not a leftover tdd-workflow/* task branch).
+   * A previous workflow that failed mid-flight may have left the repo on a task branch.
+   * Treating that branch as the "original" would cause the next workflow's merges to
+   * target the wrong branch. Returns the resolved base branch name.
+   */
+  async ensureOnBaseBranch(): Promise<string> {
+    const logger = getLogger();
+    const current = await this.getCurrentBranch();
+    if (!current.startsWith('tdd-workflow/')) return current;
+
+    logger.warn(`[Sandbox] Repo is on task branch "${current}" — locating base branch before starting workflow`);
+
+    // Prefer the remote's default branch; fall back through common names.
+    let baseBranch = 'main';
+    try {
+      const { stdout } = await execFileAsync(
+        'git', ['symbolic-ref', 'refs/remotes/origin/HEAD'],
+        { cwd: this.projectDir, ...EXEC_OPTS }
+      );
+      baseBranch = stdout.trim().replace('refs/remotes/origin/', '');
+    } catch {
+      for (const candidate of ['main', 'master', 'develop']) {
+        try {
+          await execFileAsync('git', ['rev-parse', '--verify', candidate], { cwd: this.projectDir, ...EXEC_OPTS });
+          baseBranch = candidate;
+          break;
+        } catch { /* try next */ }
+      }
+    }
+
+    await this.safeCheckout(baseBranch);
+    logger.info(`[Sandbox] Switched from task branch "${current}" to base branch "${baseBranch}"`);
+    return baseBranch;
+  }
+
+  /**
    * Roll back the sandbox — discard all uncommitted changes and return to original branch.
    * originalBranch is validated before use.
    */
@@ -162,7 +222,7 @@ export class Sandbox {
       // Switch back to the original branch only — no clean, no restore.
       // Any WIP from the failed task remains on its sandbox branch so the
       // user can inspect, debug, or hand it to another agent.
-      await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+      await this.safeCheckout(safeBranch);
       logger.info(`Returned to ${safeBranch} — sandbox branch preserved for inspection`);
     } catch (err) {
       logger.error(`Could not switch back to ${safeBranch}: ${err}`);
@@ -177,7 +237,7 @@ export class Sandbox {
     const logger = getLogger();
     const safeSandbox = sanitizeBranchName(sandboxBranch);
     const safeOriginal = sanitizeBranchName(originalBranch);
-    await execFileAsync('git', ['checkout', safeOriginal], { cwd: this.projectDir, ...EXEC_OPTS });
+    await this.safeCheckout(safeOriginal);
     await execFileAsync('git', ['merge', safeSandbox, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
     await execFileAsync('git', ['branch', '-d', safeSandbox], { cwd: this.projectDir, ...EXEC_OPTS });
     logger.info(`Merged ${safeSandbox} into ${safeOriginal}`);

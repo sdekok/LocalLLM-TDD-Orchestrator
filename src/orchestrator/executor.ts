@@ -311,6 +311,15 @@ export class WorkflowExecutor {
     const logger = getLogger();
     let consecutiveFailures = 0;
 
+    // If a previous workflow left the repo on a tdd-workflow/* branch, switch to the
+    // base branch before we do anything — otherwise every task's "original branch"
+    // would be a stale task branch and merges would target the wrong base.
+    try {
+      await this.sandbox.ensureOnBaseBranch();
+    } catch (err) {
+      logger.warn(`[processQueue] Could not ensure base branch: ${err}`);
+    }
+
     // Capture the git HEAD before any agents run.
     // Used by the final workflow reviewer to diff the full cumulative changes.
     let workflowStartSha = '';
@@ -1124,10 +1133,16 @@ export class WorkflowExecutor {
     }
 
     const plan = subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
-    this.chatMessage?.(
-      `🔍 **${task.id}** refined into ${subPlan.subtasks.length} implementation steps:\n${plan}`
-    );
     logger.info(`Task ${task.id} refined into ${subPlan.subtasks.length} steps`);
+
+    // Only post the refinement summary when the planner actually decomposed the task into
+    // multiple steps. A single-step result is effectively a pass-through — posting it would
+    // just duplicate the checklist entry the user already saw.
+    if (subPlan.subtasks.length > 1) {
+      this.chatMessage?.(
+        `🔍 **${task.id}** refined into ${subPlan.subtasks.length} implementation steps:\n${plan}`
+      );
+    }
 
     return `Task: ${task.description}\n\nTechnical Plan:\n${plan}`;
   }
