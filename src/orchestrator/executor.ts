@@ -19,7 +19,7 @@ export interface ExecutorOptions {
 }
 
 const MAX_ATTEMPTS = 3;
-const MAX_TASK_DURATION_MS = 10 * 60 * 1000;  // 10 minutes per subtask
+const MAX_ATTEMPT_DURATION_MS = 20 * 60 * 1000;  // 20 minutes per attempt (implement + review)
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
@@ -292,7 +292,6 @@ export class WorkflowExecutor {
         this.postChecklistUpdate(task.id);
       }
 
-      const taskStartTime = Date.now();
       const originalBranch = await this.sandbox.getCurrentBranch();
       const branchName = `tdd-workflow/${task.id.substring(0, 12)}`;
       let approved = false;
@@ -303,12 +302,9 @@ export class WorkflowExecutor {
       let lastAttemptBlockedByPreexisting = false;
       const startAttempt = task.attempts || 1;
       for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
-        const elapsed = Date.now() - taskStartTime;
-        if (elapsed > MAX_TASK_DURATION_MS) { // MAX_TASK_DURATION_MS total budget per subtask
-          logger.error(`Task ${task.id} timed out.`);
-          feedback = `Task exceeded time budget of ${MAX_TASK_DURATION_MS / 60000} minutes`;
-          break;
-        }
+        // Each attempt (implement + review cycle) gets its own time budget.
+        // A single slow run must not prevent retries from firing.
+        const attemptStartTime = Date.now();
 
         logger.info(`Attempt ${attempt}/${MAX_ATTEMPTS}`);
         this.state.updateSubtask(task.id, { attempts: attempt });
@@ -507,6 +503,16 @@ export class WorkflowExecutor {
               phase: 'quality-gates',
               message: `✅ Quality gates passed! ${coverageInfo}`
             });
+          }
+
+          // Guard: abort before starting the reviewer if this attempt has already
+          // overrun its budget (implementer took too long). A hung implementer
+          // should not consume the reviewer's slot too.
+          if (Date.now() - attemptStartTime > MAX_ATTEMPT_DURATION_MS) {
+            logger.error(`Task ${task.id} attempt ${attempt} timed out after implementer phase.`);
+            feedback = `Attempt ${attempt} exceeded the ${MAX_ATTEMPT_DURATION_MS / 60000}-minute budget (implementer phase). Will retry with fresh context.`;
+            this.state.updateSubtask(task.id, { phase: undefined });
+            continue;
           }
 
           // Phase 4: Reviewing
