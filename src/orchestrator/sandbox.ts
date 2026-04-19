@@ -72,10 +72,9 @@ export class Sandbox {
       });
       logger.info(`Created sandbox branch: ${safeBranch}`);
     } catch {
-      await execFileAsync('git', ['checkout', safeBranch], {
-        cwd: this.projectDir,
-        ...EXEC_OPTS,
-      });
+      // Branch already exists — check it out via safeCheckout so that runtime files
+      // (.tdd-workflow/state.json, etc.) don't block the switch on retry attempts.
+      await this.safeCheckout(safeBranch);
       logger.info(`Checked out existing branch: ${safeBranch}`);
     }
   }
@@ -152,29 +151,53 @@ export class Sandbox {
   }
 
   /**
-   * Checkout a branch, tolerating uncommitted changes in runtime-managed files
-   * (.tdd-workflow/, .pi-lens/cache/, etc.).
+   * Checkout a branch, tolerating runtime-managed files that block the switch.
    *
-   * The "restore file to HEAD then retry" pattern doesn't work here because the
-   * orchestrator continuously appends to the log file — by the time the second
-   * checkout runs the file is modified again. Instead we use --force, which is
-   * safe in both call sites:
-   *   - mergeAndCleanup: the implementer has already committed via bash; only
-   *     runtime files remain uncommitted in the working tree.
-   *   - rollback: any committed implementer work lives on the sandbox branch HEAD
-   *     and is preserved there; uncommitted WIP from a crashed implementer is
-   *     acceptable to discard.
+   * Two distinct git errors can occur:
+   *
+   * 1. "Your local changes to the following files would be overwritten" — tracked
+   *    files with uncommitted modifications (e.g. log file grew since last commit).
+   *    Fix: --force discards the local changes and switches cleanly.
+   *
+   * 2. "The following untracked working tree files would be overwritten" — a file
+   *    exists locally but is not tracked on the current branch, and the target
+   *    branch has that file committed. --force does NOT help here; we must delete
+   *    the untracked file first.
+   *    Fix: parse the file list from the error, delete those paths, then retry.
+   *
+   * Both fixes are safe because the only files that fall into these categories
+   * are orchestrator-managed runtime artifacts (.tdd-workflow/state.json, logs,
+   * .pi-lens/cache/) that are recreated on every run.
    */
-  private async safeCheckout(branch: string): Promise<void> {
+  async safeCheckout(branch: string): Promise<void> {
     const safeBranch = sanitizeBranchName(branch);
     try {
       await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
     } catch (err) {
       const msg = String(err);
-      if (!msg.includes('would be overwritten by checkout')) throw err;
+      const logger = getLogger();
 
-      getLogger().info(`[safeCheckout] Runtime-file conflict switching to "${safeBranch}" — retrying with --force`);
-      await execFileAsync('git', ['checkout', '--force', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+      if (msg.includes('Your local changes') && msg.includes('would be overwritten by checkout')) {
+        // Tracked files with local modifications — --force discards them
+        logger.info(`[safeCheckout] Tracked-file conflict switching to "${safeBranch}" — retrying with --force`);
+        await execFileAsync('git', ['checkout', '--force', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+
+      } else if (msg.includes('untracked working tree files would be overwritten')) {
+        // Untracked files that would be overwritten — delete them then retry
+        const blockingFiles = [...msg.matchAll(/^\s+(.+)$/gm)]
+          .map(m => m[1]!.trim())
+          .filter(f => f.length > 0 && !f.startsWith('Please') && !f.startsWith('error:')
+                    && !f.startsWith('Aborting') && !f.startsWith('hint'));
+
+        logger.info(`[safeCheckout] Untracked-file conflict switching to "${safeBranch}" — removing ${blockingFiles.length} file(s): ${blockingFiles.join(', ')}`);
+        for (const f of blockingFiles) {
+          try { fs.unlinkSync(path.join(this.projectDir, f)); } catch { /* already gone */ }
+        }
+        await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+
+      } else {
+        throw err;
+      }
     }
   }
 
