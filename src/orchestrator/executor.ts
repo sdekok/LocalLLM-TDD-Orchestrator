@@ -252,6 +252,25 @@ export class WorkflowExecutor {
     const logger = getLogger();
     let consecutiveFailures = 0;
 
+    // Capture which blocking gates are already failing before any agent runs.
+    // Post-implementer, only NEW failures (not in this baseline) are counted.
+    let baselineFailingGates = new Set<string>();
+    try {
+      const baseline = await runQualityGates(this.state.projectDir);
+      if (!baseline.allBlockingPassed) {
+        baselineFailingGates = new Set(
+          baseline.gates.filter(g => g.blocking && !g.passed).map(g => g.gate)
+        );
+        logger.info(`Baseline blocking gate failures: ${[...baselineFailingGates].join(', ')}`);
+        this.chatMessage?.(
+          `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${[...baselineFailingGates].join(', ')}**. ` +
+          `These will not block task completion.`
+        );
+      }
+    } catch (err) {
+      logger.warn(`Could not capture quality gate baseline: ${err}`);
+    }
+
     while (true) {
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         logger.error(`Circuit breaker: ${consecutiveFailures} consecutive task failures.`);
@@ -278,6 +297,7 @@ export class WorkflowExecutor {
 
       let lastAttemptDiff = '';
       let changedFiles: string[] = [];
+      let lastAttemptBlockedByPreexisting = false;
       const startAttempt = task.attempts || 1;
       for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
         const elapsed = Date.now() - taskStartTime;
@@ -383,7 +403,7 @@ export class WorkflowExecutor {
               // Non-fatal — skip loop detection / pre-existing check if diff fails
             }
 
-            if (lastAttemptDiff && currentDiff) {
+            if (lastAttemptDiff && currentDiff && !lastAttemptBlockedByPreexisting) {
               const similarity = outputSimilarity(lastAttemptDiff, currentDiff);
               if (similarity > SIMILARITY_THRESHOLD) {
                 logger.warn(`Loop detected: attempt ${attempt} output is ${(similarity * 100).toFixed(0)}% similar to previous attempt. Bailing early.`);
@@ -398,6 +418,7 @@ export class WorkflowExecutor {
                 break;
               }
             }
+            lastAttemptBlockedByPreexisting = false; // reset for next iteration
             lastAttemptDiff = currentDiff;
           }
 
@@ -420,58 +441,53 @@ export class WorkflowExecutor {
             }
 
             if (!qualityReport.allBlockingPassed) {
-              feedback = formatGateFailures(qualityReport);
+              // Filter out gates that were already failing before any agent ran (baseline).
+              // Only new failures introduced by this agent's changes block the task.
+              const newBlockingFailures = qualityReport.gates.filter(
+                g => g.blocking && !g.passed && !baselineFailingGates.has(g.gate)
+              );
 
-              // Detect pre-existing lens failures: if every file mentioned in the lens
-              // output is NOT in the agent's changed set, these errors pre-date this task.
-              if (changedFiles.length > 0) {
-                const lensGate = qualityReport.gates.find(g => g.gate === 'lens' && !g.passed);
-                if (lensGate) {
-                  // Extract bare filenames/paths from lines like:
-                  //   [LSP] libs/shared-contracts/bin/export-schemas.ts: 7 error(s)
-                  //   libs/shared-contracts/bin/export-schemas.ts(3,1): error ...
-                  const mentionedFiles = [...lensGate.output.matchAll(/(?:^\[LSP\]\s+|^|\s)([\w./-]+\.(ts|tsx|js|jsx|cs|cpp|h))\b/gm)]
-                    .map(m => m[1]!)
-                    .filter(Boolean);
-                  if (mentionedFiles.length > 0) {
-                    const allOutOfScope = mentionedFiles.every(
-                      mf => !changedFiles.some(cf => cf.endsWith(mf) || mf.endsWith(cf))
-                    );
-                    if (allOutOfScope) {
-                      const fileList = [...new Set(mentionedFiles)].slice(0, 3).join(', ');
-                      const note =
-                        `⚠️ PRE-EXISTING ISSUE DETECTED: The lens errors below are in files you did NOT modify ` +
-                        `(${fileList}). These errors pre-date your changes and are outside the scope of this task.\n` +
-                        `Do NOT attempt to fix them. Instead: (1) confirm your own changes are correct and tests pass, ` +
-                        `(2) note the pre-existing errors in a code comment if relevant, (3) respond with a summary of ` +
-                        `what you implemented — the orchestrator will note this and proceed.\n\n`;
-                      feedback = note + feedback;
-                      logger.info(`Lens failures appear to be pre-existing (files not in diff): ${fileList}`);
-                    }
-                  }
-                }
-              }
-
-              logger.info(`Quality gates failed:\n${feedback.substring(0, 300)}`);
-              
-              // Emit detailed feedback for TUI
-              this.events.emit('taskProgress', {
-                id: task.id,
-                attempt,
-                phase: 'quality-gates',
-                message: `❌ Quality gates failed. Feedback sent to agent.\n${feedback}`,
-                isError: true
-              });
-
-              if (attempt < MAX_ATTEMPTS) {
-                const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
+              if (newBlockingFailures.length === 0) {
+                // Every blocking failure is pre-existing — treat as passed.
+                const preexisting = [...baselineFailingGates].join(', ');
+                logger.info(`All blocking gate failures are pre-existing (${preexisting}) — treating as passed for this task.`);
                 this.chatMessage?.(
-                  `**[${task.id}]** ❌ Quality gates failed (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\`\`\`\n${fbPreview}\n\`\`\``
+                  `**[${task.id}]** ℹ️ All blocking failures (**${preexisting}**) are pre-existing — not caused by this task's changes. Proceeding.`
                 );
-              }
+                lastAttemptBlockedByPreexisting = true;
+                // Fall through to commit / reviewer as if gates passed.
+              } else {
+                // There are genuine new failures. Build feedback from those only.
+                feedback = formatGateFailures({
+                  ...qualityReport,
+                  gates: newBlockingFailures,
+                  allBlockingPassed: false,
+                });
 
-              this.state.updateSubtask(task.id, { phase: undefined });
-              continue;
+                logger.info(`Quality gates failed (new failures):\n${feedback.substring(0, 300)}`);
+
+                // Emit detailed feedback for TUI
+                this.events.emit('taskProgress', {
+                  id: task.id,
+                  attempt,
+                  phase: 'quality-gates',
+                  message: `❌ Quality gates failed. Feedback sent to agent.\n${feedback}`,
+                  isError: true
+                });
+
+                if (attempt < MAX_ATTEMPTS) {
+                  const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
+                  this.chatMessage?.(
+                    `**[${task.id}]** ❌ Quality gates failed (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\`\`\`\n${fbPreview}\n\`\`\``
+                  );
+                  lastAttemptBlockedByPreexisting = false;
+                } else {
+                  lastAttemptBlockedByPreexisting = false;
+                }
+
+                this.state.updateSubtask(task.id, { phase: undefined });
+                continue;
+              }
             }
 
             // Commit passing code
