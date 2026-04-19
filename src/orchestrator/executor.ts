@@ -80,6 +80,8 @@ export class WorkflowExecutor {
   private searchClient: SearchClient | null;
   private chatMessage: ((content: string) => void) | null;
   private waitForInput: ((prompt: string) => Promise<string | null>) | null;
+  /** Set by resume() so processQueue knows to keep existing task branches. */
+  private resumeMode = false;
   public events = new EventEmitter();
 
   constructor(
@@ -216,6 +218,7 @@ export class WorkflowExecutor {
   async startNew(request: string): Promise<void> {
     const logger = getLogger();
     logger.info(`Starting new workflow: ${request.substring(0, 100)}`);
+    this.resumeMode = false;
     this.state.initWorkflow(request);
 
     // 1. Check if the request refers to a pre-planned Epic.
@@ -297,11 +300,15 @@ export class WorkflowExecutor {
     }
 
     if (mode === 'retry') {
+      this.resumeMode = false;
       const resetFailed = this.state.resetFailedTasks();
       logger.info(`Retry mode: reset ${resetFailed} failed tasks (feedback cleared)`);
     } else if (mode === 'resume') {
+      this.resumeMode = true;
       const resumed = this.state.resumeFailedTasks();
-      logger.info(`Resume mode: reset ${resumed} failed tasks (feedback preserved)`);
+      logger.info(`Resume mode: reset ${resumed} failed tasks (feedback preserved, branch kept)`);
+    } else {
+      this.resumeMode = false;
     }
 
     await this.processQueue();
@@ -419,7 +426,11 @@ export class WorkflowExecutor {
 
           // Phase 2: Implementing
           if (!task.phase || task.phase === 'refining' || task.phase === 'implementing') {
-            await this.sandbox.createBranch(branchName);
+            // In resume mode, keep the existing branch on the first attempt so the
+            // implementer can patch its previous work. On subsequent attempts within
+            // the same run, recreate fresh. All other modes always recreate.
+            const keepExisting = this.resumeMode && attempt === 1;
+            await this.sandbox.createBranch(branchName, { keepExisting, baseBranch: originalBranch });
 
             // Clear stale implementation notes from any previous attempt so the reviewer
             // always reads notes that match the current diff, not a prior attempt's reasoning.

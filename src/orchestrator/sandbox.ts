@@ -39,7 +39,7 @@ export class Sandbox {
    * Create a git branch for sandboxed work.
    * Branch name is validated against a strict allowlist before use.
    */
-  async createBranch(branchName: string): Promise<void> {
+  async createBranch(branchName: string, options?: { keepExisting?: boolean; baseBranch?: string }): Promise<void> {
     const logger = getLogger();
     const safeBranch = sanitizeBranchName(branchName);
 
@@ -72,11 +72,26 @@ export class Sandbox {
       });
       logger.info(`Created sandbox branch: ${safeBranch}`);
     } catch {
-      // Branch already exists (leftover from a prior run or a previous attempt in this
-      // run). Delete and recreate it from the current HEAD so the implementer always
-      // starts from the latest merged code. A stale base is the main cause of merge
-      // conflicts when a later task independently creates files that an earlier task
-      // already added to the base branch.
+      // Branch already exists (leftover from a prior run or a previous attempt).
+      if (options?.keepExisting && options.baseBranch) {
+        // resume mode: switch to the existing branch and merge the base into it so
+        // the implementer can patch its previous work with the latest merged changes.
+        await this.safeCheckout(safeBranch);
+        const safeBase = sanitizeBranchName(options.baseBranch);
+        try {
+          await execFileAsync('git', ['merge', safeBase, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
+          logger.info(`Kept existing branch ${safeBranch} and merged latest ${safeBase} into it`);
+          return;
+        } catch {
+          // Merge conflict — can't safely reuse; fall through to recreate
+          try { await execFileAsync('git', ['merge', '--abort'], { cwd: this.projectDir, ...EXEC_OPTS }); } catch {}
+          logger.warn(`Could not merge ${safeBase} into ${safeBranch} (conflicts) — recreating from current HEAD`);
+          await this.safeCheckout(safeBase);
+        }
+      }
+
+      // Default: delete and recreate from current HEAD so the implementer always
+      // starts from the latest merged code (prevents stale-base merge conflicts).
       logger.info(`Branch ${safeBranch} already exists — recreating from current HEAD`);
       try {
         await execFileAsync('git', ['branch', '-D', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
