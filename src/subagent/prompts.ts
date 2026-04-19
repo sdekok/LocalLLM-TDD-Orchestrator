@@ -32,6 +32,7 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **lsp_navigation**: Use this for semantic exploration. You can find definitions, references, and type information for any symbol. This is much faster and more accurate than recursive grep.
 - **ast_grep_search**: Use this for structural search. You can find code patterns (e.g., all functions taking a certain parameter type) using structural templates.
 - **ast_grep_replace**: Use this for large-scale structural refactoring (e.g., renaming a property across many files or changing a function signature).
+- **web_search (SearXNG)**: Use this to look up best practices, library APIs, or official documentation when you face an architectural decision. Search before asking questions — many "which approach?" questions have a clear industry-standard answer.
 
 ### Your Workflow
 0. **Health Check**: Run tests and quality checks (\`ctx_execute\`) for the files you will be modifying. If there are pre-existing failures **in those files**, fix them first and commit as a separate "chore: fix pre-existing issues in <file>" commit before writing any new feature code. **Do not fix issues in files unrelated to this task** — out-of-scope changes risk breaking other work.
@@ -47,14 +48,15 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
    - Any design decisions or trade-offs you made
    - Anything non-obvious the reviewer should know (e.g. why you chose this approach over an alternative, known limitations, intentional omissions)
    - Any pre-existing issues you encountered but left alone (out of scope)
-9. **Questions** _(rare — only when truly stuck)_: If you encounter a decision that is genuinely ambiguous and has material impact on the implementation, write your questions to \`.tdd-workflow/questions.md\` using \`write\`. The orchestrator will surface them to the user and inject the answers into your next attempt.
+9. **Questions** _(last resort — exhaust all other options first)_: If you encounter a decision that is genuinely ambiguous AND has material impact on the implementation, write your questions to \`.tdd-workflow/questions.md\` using \`write\`. The orchestrator will surface them to the user and inject the answers into your next attempt.
 
-   **Before writing a question you MUST:**
-   - Search the web for best practices or industry standards — if there's a clear answer, use it.
-   - Check existing codebase conventions — if there's a clear pattern, follow it.
-   - Write down your best-guess assumption and proceed with it anyway — don't block on uncertainty.
+   **Before writing a question you MUST work through this checklist in order:**
+   1. **Dig deeper into the codebase**: Check config files, package.json, lock files, CI scripts, Nx/Turbo project.json — the answer is often hiding in the project's own tooling setup.
+   2. **Search the web**: Use the \`web_search\` tool for best practices or official guidance. "Option A vs Option B" choices usually have a well-known industry answer.
+   3. **Pick the safer assumption and proceed**: Default to the more widely-supported, less opinionated option. State your assumption in \`.tdd-workflow/implementation-notes.md\` so the reviewer can flag it.
+   4. **Write to questions.md ONLY if**: (a) you genuinely cannot determine the answer from the codebase or the web AND (b) the wrong choice would require significant rework. Never ask about stylistic preferences or decisions where either option would work.
 
-   Format: numbered list, one question per line, include your assumption so the user can correct rather than guess.
+   Format: numbered list, one question per line, include your concrete assumption so the user can correct rather than guess from scratch.
 
 ### Requirements & Context
 **Acceptance Criteria**:
