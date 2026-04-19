@@ -156,13 +156,20 @@ This means the reviewer always knows exactly what changed and why — it doesn't
 
 | Guard | What It Catches | Behavior |
 |---|---|---|
-| **Max attempts** (5/task) | Persistent failures | Marks task failed, stops workflow — awaits `/tdd <n> retry\|continue` |
+| **Max attempts** (5/task) | Persistent failures | Triggers the neutral arbiter before giving up |
+| **Arbiter** (after attempt 5) | Implementer/reviewer deadlock | Approves, grants up to 3 extra rounds, or escalates to you |
 | **Output similarity** (>90%) | Agent stuck in a loop | Bails immediately, before wasting the reviewer's time |
 | **Implementer timeout** (60 min) | Hung implementer session | Throws into the catch block; next attempt starts fresh |
 | **Reviewer timeout** (60 min) | Hung reviewer session | Same — independent of the implementer budget |
+| **Arbiter timeout** (20 min) | Hung arbiter session | Defaults to escalate |
 | **Circuit breaker** (3 consecutive failures) | Systemic problems | Stops entire workflow |
 
-Timeouts are enforced independently per agent via `Promise.race` — a slow implementer cannot eat the reviewer's budget. When a task fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+Timeouts are enforced independently per agent via `Promise.race`. When a task exhausts all attempts, the **neutral arbiter** reviews the final diff, quality gate status, and reviewer feedback, then decides:
+- **Approve** — QA passed and the reviewer was being too strict; merges as-is
+- **Continue N** — grants 1–3 extra implementation rounds
+- **Escalate** — posts the situation to Pi chat and waits for you to reply with `approve`, `continue 1–3`, or `stop`
+
+When a task ultimately fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
 
 ## Project Cleanup
 

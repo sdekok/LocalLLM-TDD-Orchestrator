@@ -9,7 +9,7 @@ import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
 import { EpicLoader, EpicPlan } from './epic-loader.js';
 import { createSubAgentSession } from '../subagent/factory.js';
-import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT } from '../subagent/prompts.js';
+import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT, ARBITER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
 import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
 
@@ -28,8 +28,10 @@ export interface ExecutorOptions {
 }
 
 const MAX_ATTEMPTS = 5;
+const MAX_ARBITER_EXTRA_ROUNDS = 3;            // Max extra rounds the arbiter may grant
 const MAX_IMPLEMENTER_DURATION_MS = 60 * 60 * 1000;  // 60 minutes for the implementer
 const MAX_REVIEWER_DURATION_MS    = 60 * 60 * 1000;  // 60 minutes for the reviewer
+const MAX_ARBITER_DURATION_MS     = 20 * 60 * 1000;  // 20 minutes for the arbiter
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
@@ -368,10 +370,23 @@ export class WorkflowExecutor {
       let currentDiff = '';
       let changedFiles: string[] = [];
       let lastAttemptBlockedByPreexisting = false;
+      let lastQualityGatesPassed = false; // tracks whether the latest committed state passed QA
       const startAttempt = task.attempts || 1;
-      for (let attempt = startAttempt; attempt <= MAX_ATTEMPTS && !approved; attempt++) {
 
-        logger.info(`Attempt ${attempt}/${MAX_ATTEMPTS}`);
+      // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
+      if (task.phase !== 'merging') {
+        // Two-pass outer loop: pass 0 = normal attempts, pass 1 = arbiter-granted extra rounds.
+        let arbiterExtraRounds = 0;
+        for (let pass = 0; pass <= 1 && !approved; pass++) {
+          if (pass === 1 && arbiterExtraRounds === 0) break;
+
+          const attemptStart = pass === 0 ? startAttempt : MAX_ATTEMPTS + 1;
+          const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : MAX_ATTEMPTS + arbiterExtraRounds;
+
+          for (let attempt = attemptStart; attempt <= attemptEnd && !approved; attempt++) {
+            const totalMax = attemptEnd; // used for chat messages
+
+        logger.info(`Attempt ${attempt}/${totalMax}`);
         this.state.updateSubtask(task.id, { attempts: attempt });
 
         try {
@@ -411,7 +426,7 @@ export class WorkflowExecutor {
 
             if (attempt > 1) {
               this.chatMessage?.(
-                `🔁 **[${task.id}]** Attempt ${attempt}/${MAX_ATTEMPTS} — agent is starting with the above feedback injected into its system prompt`
+                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — agent is starting with the above feedback injected into its system prompt`
               );
             }
 
@@ -556,15 +571,14 @@ export class WorkflowExecutor {
                   isError: true
                 });
 
-                if (attempt < MAX_ATTEMPTS) {
+                lastQualityGatesPassed = false;
+                if (attempt < totalMax) {
                   const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
                   this.chatMessage?.(
-                    `**[${task.id}]** ❌ Quality gates failed (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\`\`\`\n${fbPreview}\n\`\`\``
+                    `**[${task.id}]** ❌ Quality gates failed (attempt ${attempt}/${totalMax}) — sending to agent for retry:\n\`\`\`\n${fbPreview}\n\`\`\``
                   );
-                  lastAttemptBlockedByPreexisting = false;
-                } else {
-                  lastAttemptBlockedByPreexisting = false;
                 }
+                lastAttemptBlockedByPreexisting = false;
 
                 this.state.updateSubtask(task.id, { phase: undefined });
                 continue;
@@ -572,6 +586,7 @@ export class WorkflowExecutor {
             }
 
             // Commit passing code
+            lastQualityGatesPassed = true;
             await this.sandbox.commit(`TDD [Attempt ${attempt}]: ${task.description.substring(0, 50)}`, {
               attempt,
               gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
@@ -590,10 +605,11 @@ export class WorkflowExecutor {
           // Phase 4: Reviewing
           // For multi-task workflows (deferReview=true), skip per-subtask review.
           // A single final review runs after all subtasks complete (see runFinalWorkflowReview).
-          if (deferReview && task.phase !== 'merging') {
+          if (deferReview) {
+            // task.phase cannot be 'merging' here (we're inside the !merging guard)
             approved = true;
             this.state.updateSubtask(task.id, { phase: 'merging' });
-          } else if (!deferReview && (!task.phase || task.phase !== 'merging')) {
+          } else {
             this.state.updateSubtask(task.id, { phase: 'reviewing' });
             const subtask = task!;
             this.events.emit('taskProgress', {
@@ -681,10 +697,10 @@ export class WorkflowExecutor {
                 isError: true
               });
 
-              if (attempt < MAX_ATTEMPTS) {
+              if (attempt < totalMax) {
                 const fbPreview = feedback.length > 500 ? feedback.substring(0, 500) + '…' : feedback;
                 this.chatMessage?.(
-                  `**[${task.id}]** ❌ Review rejected (attempt ${attempt}/${MAX_ATTEMPTS}) — sending to agent for retry:\n\n${fbPreview}`
+                  `**[${task.id}]** ❌ Review rejected (attempt ${attempt}/${totalMax}) — sending to agent for retry:\n\n${fbPreview}`
                 );
               }
 
@@ -696,34 +712,70 @@ export class WorkflowExecutor {
             this.state.updateSubtask(task.id, { phase: 'merging' });
           }
 
-          // Phase 5: Merging
-          if (approved || task.phase === 'merging') {
-            this.events.emit('taskProgress', {
-              id: task.id,
-              attempt,
-              phase: 'merging',
-              message: 'Review approved! Merging changes into main branch...'
-            });
-            await this.sandbox.mergeAndCleanup(branchName, originalBranch);
-            this.state.updateSubtask(task.id, {
-              status: 'completed',
-              tests_written: true,
-              code_implemented: true,
-              phase: undefined
-            });
-            logger.info(`Task ${task.id} completed and merged!`);
-            const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
-            this.postChecklistUpdate();
-            if (completedTask) {
-              this.events.emit('taskCompleted', { id: task.id, task: completedTask });
-            }
-          }
+          // NOTE: Phase 5 (Merge) is outside the attempt loops — see below.
 
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
           try { await this.sandbox.rollback(originalBranch); } catch { }
         }
+          } // end inner attempt for-loop
+
+          // Between pass 0 and pass 1: run the arbiter to decide what happens next.
+          if (pass === 0 && !approved) {
+            const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed);
+            if (arbiterDecision.decision === 'approve') {
+              if (lastQualityGatesPassed) {
+                approved = true; // fall through to Phase 5 merge
+              } else {
+                // Can't approve if QA never passed — treat as escalation
+                this.chatMessage?.(`⚖️ **[${task.id}]** Arbiter wanted to approve but quality gates never passed — escalating to you.`);
+                const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback,
+                  `${arbiterDecision.rationale} (QA never passed — approval blocked)`);
+                if (userDecision.action === 'approve' && lastQualityGatesPassed) {
+                  approved = true;
+                } else if (userDecision.action === 'continue') {
+                  arbiterExtraRounds = userDecision.rounds;
+                }
+                // else stop: leave approved=false, loop exits, task fails
+              }
+            } else if (arbiterDecision.decision === 'continue') {
+              arbiterExtraRounds = arbiterDecision.rounds;
+            } else { // escalate
+              const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback, arbiterDecision.rationale);
+              if (userDecision.action === 'approve' && lastQualityGatesPassed) {
+                approved = true;
+              } else if (userDecision.action === 'continue') {
+                arbiterExtraRounds = userDecision.rounds;
+              }
+              // else stop: leave approved=false, loop exits, task fails
+            }
+          }
+        } // end outer pass for-loop
+      } // end if (task.phase !== 'merging')
+
+      // Phase 5: Merge — runs once approved (by reviewer, arbiter, or user) OR when resuming from 'merging' phase.
+      if (approved || task.phase === 'merging') {
+        this.events.emit('taskProgress', {
+          id: task.id,
+          attempt: task.attempts || 1,
+          phase: 'merging',
+          message: 'Review approved! Merging changes into main branch...'
+        });
+        await this.sandbox.mergeAndCleanup(branchName, originalBranch);
+        this.state.updateSubtask(task.id, {
+          status: 'completed',
+          tests_written: true,
+          code_implemented: true,
+          phase: undefined
+        });
+        logger.info(`Task ${task.id} completed and merged!`);
+        const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
+        this.postChecklistUpdate();
+        if (completedTask) {
+          this.events.emit('taskCompleted', { id: task.id, task: completedTask });
+        }
+        approved = true; // ensure correct path below for resuming tasks
       }
 
       if (approved) {
@@ -779,6 +831,121 @@ export class WorkflowExecutor {
    * A rejection here is advisory — all quality gates have already passed and changes are
    * merged. The feedback is posted to chat for the user to act on.
    */
+  /**
+   * Neutral arbiter: called when an implementer exhausts all normal attempts.
+   * It reviews the final diff and reviewer feedback and decides whether to approve,
+   * grant extra rounds, or escalate to the user.
+   */
+  private async runArbiter(
+    task: Subtask,
+    diff: string,
+    changedFiles: string[],
+    feedback: string,
+    qualityGatesPassed: boolean,
+  ): Promise<{ decision: 'approve' | 'continue' | 'escalate'; rounds: number; rationale: string }> {
+    const logger = getLogger();
+    this.chatMessage?.(`⚖️ **[${task.id}]** All ${MAX_ATTEMPTS} attempts exhausted — calling neutral arbiter…`);
+
+    const diffSummary = changedFiles.length > 0
+      ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${diff.length > 6000 ? diff.substring(0, 6000) + '\n… (truncated)' : diff}\n\`\`\``
+      : '\n\n## Diff\n(no diff captured)';
+
+    const arbiterPrompt =
+      `## Task\n${task.description}\n\n` +
+      `## Quality Gates\n${qualityGatesPassed ? '✅ Passed' : '❌ Failed — code has blocking quality issues'}\n\n` +
+      `## Reviewer\'s Final Feedback\n${feedback || '(no feedback recorded)'}` +
+      diffSummary;
+
+    const arbiterSession = await createSubAgentSession({
+      taskType: 'arbitrate',
+      systemPrompt: ARBITER_PROMPT,
+      cwd: this.state.projectDir,
+      modelRouter: this.modelRouter,
+      tools: 'none',
+    });
+    this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`);
+
+    let arbiterText = '';
+    try {
+      arbiterSession.subscribe((event: any) => {
+        if (event.type === 'message_update') {
+          const ae = event.assistantMessageEvent;
+          if (ae?.type === 'text_end' && ae.content?.trim()) arbiterText += ae.content;
+        } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !arbiterText) {
+          arbiterText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
+        }
+      });
+      const arbiterTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Arbiter timed out after ${MAX_ARBITER_DURATION_MS / 60000} minutes`)), MAX_ARBITER_DURATION_MS)
+      );
+      await Promise.race([arbiterSession.prompt(arbiterPrompt), arbiterTimeout]);
+    } catch (err) {
+      logger.warn(`Arbiter session error: ${err} — defaulting to escalate`);
+      return { decision: 'escalate', rounds: 0, rationale: `Arbiter failed: ${err}` };
+    } finally {
+      arbiterSession.dispose();
+      await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+    }
+
+    const decisionMatch = arbiterText.match(/DECISION:\s*(approve|continue|escalate)/i);
+    const roundsMatch   = arbiterText.match(/ROUNDS:\s*(\d+)/i);
+    const rationaleMatch = arbiterText.match(/RATIONALE:\s*(.+)/i);
+
+    const decision  = (decisionMatch?.[1]?.toLowerCase() ?? 'escalate') as 'approve' | 'continue' | 'escalate';
+    const rounds    = Math.min(parseInt(roundsMatch?.[1] ?? '1', 10), MAX_ARBITER_EXTRA_ROUNDS);
+    const rationale = rationaleMatch?.[1]?.trim() ?? 'Arbiter provided no rationale.';
+
+    logger.info(`Arbiter decision: ${decision} (rounds=${rounds}) — ${rationale}`);
+    this.chatMessage?.(`⚖️ **[${task.id}] Arbiter:** ${decision.toUpperCase()} — ${rationale}`);
+
+    return { decision, rounds, rationale };
+  }
+
+  /**
+   * Posts the arbiter's escalation to Pi chat and waits for the user to reply with
+   * one of: "approve", "continue N" (1-3), or "stop".
+   * Returns a structured action. Falls back to 'stop' when no waitForInput is wired.
+   */
+  private async handleArbiterEscalation(
+    task: Subtask,
+    diff: string,
+    feedback: string,
+    arbiterRationale: string,
+  ): Promise<{ action: 'approve' | 'continue' | 'stop'; rounds: number }> {
+    const diffPreview = diff.length > 1500 ? diff.substring(0, 1500) + '\n… (truncated)' : diff;
+    const feedbackPreview = feedback.length > 400 ? feedback.substring(0, 400) + '…' : feedback;
+
+    const msg =
+      `⚖️ **Arbiter: your input needed for ${task.id}**\n\n` +
+      `The task could not be resolved after ${MAX_ATTEMPTS} attempts.\n\n` +
+      `**Arbiter's assessment:** ${arbiterRationale}\n\n` +
+      `**Task:** ${task.description}\n\n` +
+      `**Reviewer\'s final feedback:**\n${feedbackPreview}\n\n` +
+      `**Diff preview:**\n\`\`\`diff\n${diffPreview}\n\`\`\`\n\n` +
+      `**Your options (reply with one):**\n` +
+      `- \`approve\` — accept the current implementation as-is\n` +
+      `- \`continue 1\` / \`continue 2\` / \`continue 3\` — grant more rounds\n` +
+      `- \`stop\` — mark as failed and move on`;
+
+    this.chatMessage?.(msg);
+
+    if (!this.waitForInput) {
+      getLogger().warn(`[${task.id}] Arbiter escalation: no waitForInput handler — defaulting to stop`);
+      return { action: 'stop', rounds: 0 };
+    }
+
+    const answer = await this.waitForInput(`Reply approve / continue N / stop for ${task.id}:`);
+    if (!answer?.trim()) return { action: 'stop', rounds: 0 };
+
+    const lower = answer.trim().toLowerCase();
+    if (lower === 'approve') return { action: 'approve', rounds: 0 };
+    const continueMatch = lower.match(/^continue\s+(\d+)$/);
+    if (continueMatch) {
+      return { action: 'continue', rounds: Math.min(parseInt(continueMatch[1]!, 10), MAX_ARBITER_EXTRA_ROUNDS) };
+    }
+    return { action: 'stop', rounds: 0 };
+  }
+
   private async runFinalWorkflowReview(workflowStartSha: string): Promise<void> {
     const logger = getLogger();
     const subtasks = this.state.getState().subtasks;

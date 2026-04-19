@@ -968,4 +968,139 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(warningMsg![0]).toContain('Missing error handling');
     expect(warningMsg![0]).toContain('All changes have been merged');
   });
+
+  // ── Arbiter tests ──────────────────────────────────────────────────────────
+
+  it('arbiter approves task after MAX_ATTEMPTS when QA passed and reviewer was too strict', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates, formatGateFailures } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    // Single-subtask → per-task review runs (no deferReview)
+    state.initWorkflow('epic-arbiter-approve');
+    state.setSubtasks([{ id: 'WI-1', description: 'Fix the thing' }]);
+
+    // QA always passes; reviewer always rejects (stubborn reviewer)
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    const { session: arbiterSession, fire: fireArbiter } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      callCount++;
+      if (opts.taskType === 'implement') return implSession;
+      if (opts.taskType === 'review') {
+        reviewerSession.prompt = vi.fn().mockImplementation(async () => {
+          fireReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: false\nFEEDBACK: Not happy with style' } });
+        });
+        return reviewerSession;
+      }
+      // taskType === 'arbitrate'
+      arbiterSession.prompt = vi.fn().mockImplementation(async () => {
+        fireArbiter({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DECISION: approve\nRATIONALE: Reviewer is being overly strict about style; QA passed.' } });
+      });
+      return arbiterSession;
+    });
+
+    await (executor as any).processQueue();
+
+    // Arbiter approved → task completed despite 5 reviewer rejections
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+    const arbiterMsg = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('Arbiter'));
+    expect(arbiterMsg).toBeDefined();
+  });
+
+  it('arbiter grants extra rounds and task completes in the additional attempt', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    state.initWorkflow('epic-arbiter-continue');
+    state.setSubtasks([{ id: 'WI-1', description: 'Fix the thing' }]);
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    const { session: implSession } = makeMockSession();
+    const { session: arbiterSession, fire: fireArbiter } = makeMockSession();
+    let reviewCallCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      if (opts.taskType === 'implement') return implSession;
+      if (opts.taskType === 'arbitrate') {
+        arbiterSession.prompt = vi.fn().mockImplementation(async () => {
+          fireArbiter({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DECISION: continue\nROUNDS: 1\nRATIONALE: One more attempt should fix the remaining issue.' } });
+        });
+        return arbiterSession;
+      }
+      // reviewer: reject for first 5 calls (normal rounds), approve on call 6 (extra round)
+      reviewCallCount++;
+      const { session: rev, fire: fireRev } = makeMockSession();
+      const approveThisOne = reviewCallCount > 5;
+      rev.prompt = vi.fn().mockImplementation(async () => {
+        const verdict = approveThisOne ? 'APPROVED: true\nFEEDBACK: Good now' : 'APPROVED: false\nFEEDBACK: Still issues';
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: verdict } });
+      });
+      return rev;
+    });
+
+    await (executor as any).processQueue();
+
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+  });
+
+  it('arbiter escalates to user who stops: task is marked failed', async () => {
+    const chatMessage = vi.fn();
+    const waitForInput = vi.fn().mockResolvedValue('stop');
+    (executor as any).chatMessage = chatMessage;
+    (executor as any).waitForInput = waitForInput;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    state.initWorkflow('epic-arbiter-escalate');
+    state.setSubtasks([{ id: 'WI-1', description: 'Fix the thing' }]);
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    const { session: implSession } = makeMockSession();
+    const { session: arbiterSession, fire: fireArbiter } = makeMockSession();
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      if (opts.taskType === 'implement') return implSession;
+      if (opts.taskType === 'arbitrate') {
+        arbiterSession.prompt = vi.fn().mockImplementation(async () => {
+          fireArbiter({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DECISION: escalate\nRATIONALE: Needs human judgment.' } });
+        });
+        return arbiterSession;
+      }
+      const { session: rev, fire: fireRev } = makeMockSession();
+      rev.prompt = vi.fn().mockImplementation(async () => {
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: false\nFEEDBACK: Rejected' } });
+      });
+      return rev;
+    });
+
+    const failed: string[] = [];
+    executor.events.on('taskFailed', (e: any) => failed.push(e.id));
+
+    await (executor as any).processQueue();
+
+    expect(failed).toContain('WI-1');
+    expect(state.getSubtask('WI-1')?.status).toBe('failed');
+    // User was consulted
+    expect(waitForInput).toHaveBeenCalled();
+  });
 });
