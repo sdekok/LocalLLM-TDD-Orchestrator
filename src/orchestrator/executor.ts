@@ -664,6 +664,31 @@ export class WorkflowExecutor {
                 ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
                 : '';
               await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${diffSummary}`), reviewerTimeout]);
+
+              // If the reviewer analysed but didn't produce the required verdict format,
+              // send a short follow-up asking it to emit only the structured lines.
+              if (!reviewText.includes('APPROVED:')) {
+                logger.warn(`[${task.id}] Reviewer missing structured verdict — sending format reminder`);
+                const savedReviewText = reviewText;
+                reviewText = ''; // reset accumulator so we only see the new response
+                try {
+                  await Promise.race([
+                    reviewerSession.prompt(
+                      'Your review above is missing the required structured verdict. ' +
+                      'Please output ONLY the following lines now, with no other text:\n\n' +
+                      'APPROVED: true/false\n' +
+                      'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
+                      'FEEDBACK: <your feedback>'
+                    ),
+                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), 90_000)),
+                  ]);
+                } catch {
+                  reviewText = savedReviewText; // retry failed — restore original
+                }
+                if (!reviewText.includes('APPROVED:')) {
+                  reviewText = savedReviewText; // retry still unstructured — restore
+                }
+              }
             } finally {
               reviewerSession.dispose();
               logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
@@ -1011,6 +1036,28 @@ export class WorkflowExecutor {
         ),
         reviewerTimeout,
       ]);
+
+      // Format reminder if structured verdict is missing
+      if (!reviewText.includes('APPROVED:')) {
+        logger.warn('[EXECUTOR] Final reviewer missing structured verdict — sending format reminder');
+        const savedReviewText = reviewText;
+        reviewText = '';
+        try {
+          await Promise.race([
+            reviewerSession.prompt(
+              'Your review above is missing the required structured verdict. ' +
+              'Please output ONLY the following lines now, with no other text:\n\n' +
+              'APPROVED: true/false\n' +
+              'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
+              'FEEDBACK: <your feedback>'
+            ),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), 90_000)),
+          ]);
+        } catch {
+          reviewText = savedReviewText;
+        }
+        if (!reviewText.includes('APPROVED:')) reviewText = savedReviewText;
+      }
     } finally {
       reviewerSession.dispose();
       logger.info('[EXECUTOR] Final reviewer disposed. Cooldown for slot recovery...');
