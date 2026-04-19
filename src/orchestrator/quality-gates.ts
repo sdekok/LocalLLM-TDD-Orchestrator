@@ -280,6 +280,46 @@ async function getSourceFiles(projectDir: string): Promise<string[]> {
 
 // ─── File Safety ─────────────────────────────────────────────────
 
+/**
+ * Built-in prefixes that are always allowed in file-safety checks.
+ * Projects can extend this list via package.json#tddConfig.fileSafetyAllowlist.
+ *
+ * Each entry is matched as a path prefix (e.g. "docs/" matches "docs/foo/bar.md").
+ * Entries without a trailing slash are matched exactly as a prefix, so "docs"
+ * would also match "docs-extra/". Always use a trailing slash for directory entries.
+ */
+const BUILTIN_SAFE_PREFIXES = [
+  'src/',
+  'tests/',
+  'test/',
+  '__tests__/',
+  'lib/',
+  'libs/',
+  'apps/',
+  'packages/',
+  'docs/',
+  'coverage/',
+  '.pi-lens/',
+  '.tdd-workflow/',
+];
+
+const BUILTIN_SAFE_PATTERNS = [
+  /^(package\.json|tsconfig\.json|\.eslintrc|vitest\.config|jest\.config)/,
+];
+
+function loadFileSafetyAllowlist(projectDir: string): string[] {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    const extra: unknown = pkg?.tddConfig?.fileSafetyAllowlist;
+    if (Array.isArray(extra)) {
+      return (extra as unknown[]).filter((e): e is string => typeof e === 'string');
+    }
+  } catch {
+    // No package.json or no tddConfig — fine
+  }
+  return [];
+}
+
 async function checkFileSafety(projectDir: string): Promise<GateResult> {
   try {
     let stdout: string;
@@ -302,25 +342,16 @@ async function checkFileSafety(projectDir: string): Promise<GateResult> {
       stdout = result.stdout;
     }
 
+    const extraPrefixes = loadFileSafetyAllowlist(projectDir);
+    const allPrefixes = [...BUILTIN_SAFE_PREFIXES, ...extraPrefixes];
+
     const unexpectedFiles = stdout
       .trim()
       .split('\n')
       .filter(Boolean)
       .filter((f) => {
-        return (
-          !f.startsWith('src/') &&
-          !f.startsWith('tests/') &&
-          !f.startsWith('test/') &&
-          !f.startsWith('__tests__/') &&
-          !f.startsWith('lib/') &&
-          !f.startsWith('libs/') &&
-          !f.startsWith('apps/') &&
-          !f.startsWith('packages/') &&
-          !f.startsWith('coverage/') &&
-          !f.startsWith('.pi-lens/') &&
-          !f.startsWith('.tdd-workflow/') &&
-          !f.match(/^(package\.json|tsconfig\.json|\.eslintrc|vitest\.config|jest\.config)/)
-        );
+        if (BUILTIN_SAFE_PATTERNS.some(re => re.test(f))) return false;
+        return !allPrefixes.some(prefix => f.startsWith(prefix));
       });
 
     return {
