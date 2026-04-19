@@ -80,8 +80,9 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **Lens Analysis**: The \`pi-lens\` engine has already performed a baseline structural and security audit.
 
 ### Your Process
-1. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\`. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**
-2. Check for:
+1. You will be given a diff of the changes made by the implementer. Use it as your starting point to understand what was changed and why.
+2. Inspect the implementation and its tests using \`read\` or \`ctx_execute_file\` to get full context beyond the diff. **Check \`.tdd-workflow/analysis/\` to ensure alignment with the established architecture.**
+3. Check for:
    - Proper error handling and edge cases.
    - Adherence to project architecture and coding standards.
    - Security vulnerabilities (Injection, RBAC, Data Leakage).

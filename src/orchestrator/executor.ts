@@ -299,6 +299,7 @@ export class WorkflowExecutor {
       let feedback = '';
 
       let lastAttemptDiff = '';
+      let currentDiff = '';
       let changedFiles: string[] = [];
       let lastAttemptBlockedByPreexisting = false;
       const startAttempt = task.attempts || 1;
@@ -382,8 +383,8 @@ export class WorkflowExecutor {
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
             }
 
-            // Capture diff for loop detection and pre-existing issue detection
-            let currentDiff = '';
+            // Capture diff for loop detection and reviewer context
+            currentDiff = '';
             try {
               const [diffResult, namesResult] = await Promise.all([
                 execFileAsync('git', ['diff', 'HEAD'], {
@@ -536,7 +537,12 @@ export class WorkflowExecutor {
               const reviewerTimeout = new Promise<never>((_, reject) =>
                 setTimeout(() => reject(new Error(`Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`)), MAX_REVIEWER_DURATION_MS)
               );
-              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}`), reviewerTimeout]);
+              // Give the reviewer the git diff so it doesn't have to discover changes
+              // itself — it can focus on depth of analysis rather than file discovery.
+              const diffSummary = changedFiles.length > 0
+                ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
+                : '';
+              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${diffSummary}`), reviewerTimeout]);
             } finally {
               reviewerSession.dispose();
               logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
