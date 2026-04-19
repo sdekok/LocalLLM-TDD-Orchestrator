@@ -614,8 +614,13 @@ export class WorkflowExecutor {
         const failedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         const failureMessage = `${feedback}\n\nWork halted for manual inspection on branch: ${branchName}`;
 
-        // Post failure summary to chat with inspection pointers and resume instructions
-        const epicRef = this.state.getState().original_request.trim();
+        // Post failure summary to chat with inspection pointers and resume instructions.
+        // Use only the first line of original_request as the epic ref — it may be a
+        // multiline brief (e.g. from /tdd:project-cleanup) and we don't want to embed it.
+        const rawRequest = this.state.getState().original_request.trim();
+        const epicRef = rawRequest.includes('\n')
+          ? rawRequest.split('\n')[0]!.substring(0, 60).trim()
+          : rawRequest.substring(0, 60).trim();
         const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
         this.chatMessage?.(
           `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempts: ${task.description}\n\n` +

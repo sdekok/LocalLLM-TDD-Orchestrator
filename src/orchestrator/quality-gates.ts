@@ -304,7 +304,9 @@ const BUILTIN_SAFE_PREFIXES = [
 ];
 
 const BUILTIN_SAFE_PATTERNS = [
-  /^(package\.json|tsconfig\.json|\.eslintrc|vitest\.config|jest\.config)/,
+  /^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb)/,
+  /^(tsconfig[^/]*\.json|\.eslintrc[^/]*|vitest\.config|jest\.config|prettier\.config)/,
+  /^\.(gitignore|npmignore|prettierignore|eslintignore|editorconfig|nvmrc|node-version)$/,
 ];
 
 function loadFileSafetyAllowlist(projectDir: string): string[] {
