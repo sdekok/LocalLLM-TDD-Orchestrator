@@ -257,14 +257,62 @@ export class Sandbox {
 
   /**
    * Merge sandbox branch into the original branch, then delete the sandbox branch.
-   * Both branch names are validated before use.
+   *
+   * Runtime files (.tdd-workflow/state.json, logs) that were committed by the
+   * implementer's `git add -A` can cause "both added" conflicts when two task
+   * branches created the file independently. Those are auto-resolved with --ours.
+   *
+   * Real code conflicts are not auto-resolved. The merge is aborted and a clear
+   * error is thrown so the caller can report it to the user.
    */
   async mergeAndCleanup(sandboxBranch: string, originalBranch: string): Promise<void> {
     const logger = getLogger();
     const safeSandbox = sanitizeBranchName(sandboxBranch);
     const safeOriginal = sanitizeBranchName(originalBranch);
     await this.safeCheckout(safeOriginal);
-    await execFileAsync('git', ['merge', safeSandbox, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
+    try {
+      await execFileAsync('git', ['merge', safeSandbox, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
+    } catch (mergeErr) {
+      const mergeMsg = String(mergeErr);
+      if (!mergeMsg.includes('CONFLICT') && !mergeMsg.includes('Automatic merge failed')) {
+        throw mergeErr; // Not a merge conflict — propagate as-is
+      }
+
+      // Resolve runtime-file conflicts automatically by keeping the base branch version.
+      const RUNTIME_PATHS = ['.tdd-workflow/state.json', '.tdd-workflow/logs'];
+      let autoResolved = 0;
+      for (const f of RUNTIME_PATHS) {
+        try {
+          await execFileAsync('git', ['checkout', '--ours', '--', f], { cwd: this.projectDir, ...EXEC_OPTS });
+          await execFileAsync('git', ['add', '--', f], { cwd: this.projectDir, ...EXEC_OPTS });
+          autoResolved++;
+        } catch { /* not a conflict, or file doesn't exist on either side */ }
+      }
+      if (autoResolved > 0) {
+        logger.info(`[mergeAndCleanup] Auto-resolved ${autoResolved} runtime-file conflict(s)`);
+      }
+
+      // Check whether any real conflicts remain
+      const { stdout: remaining } = await execFileAsync(
+        'git', ['diff', '--name-only', '--diff-filter=U'],
+        { cwd: this.projectDir, ...EXEC_OPTS }
+      );
+      const realConflicts = remaining.trim().split('\n').filter(Boolean);
+
+      if (realConflicts.length > 0) {
+        // Abort the merge so the repo is left in a clean state
+        try { await execFileAsync('git', ['merge', '--abort'], { cwd: this.projectDir, ...EXEC_OPTS }); } catch {}
+        throw new Error(
+          `Merge conflict in ${safeSandbox}: the following files conflict with the base branch and need manual resolution:\n` +
+          realConflicts.map(f => `  ${f}`).join('\n') + '\n\n' +
+          'This usually means two tasks modified or created the same file. ' +
+          'Resolve the conflicts on the base branch, then run /tdd resume.'
+        );
+      }
+
+      // All conflicts resolved — commit the merge
+      await execFileAsync('git', ['commit', '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
+    }
     await execFileAsync('git', ['branch', '-d', safeSandbox], { cwd: this.projectDir, ...EXEC_OPTS });
     logger.info(`Merged ${safeSandbox} into ${safeOriginal}`);
   }

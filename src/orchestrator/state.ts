@@ -40,6 +40,29 @@ export class StateManager {
     fs.mkdirSync(workflowDir, { recursive: true });
     this.stateFile = path.join(workflowDir, 'state.json');
     this.state = this.loadState();
+    this.ensureGitExclude(projectDir);
+  }
+
+  /**
+   * Add .tdd-workflow runtime files to .git/info/exclude so that
+   * `git add -A` (run by the implementer agent) never commits them.
+   * This is a per-repo, non-committed exclusion — it doesn't touch .gitignore.
+   */
+  private ensureGitExclude(projectDir: string): void {
+    const excludePath = path.join(projectDir, '.git', 'info', 'exclude');
+    const entries = [
+      '.tdd-workflow/state.json',
+      '.tdd-workflow/logs/',
+    ];
+    try {
+      let current = '';
+      try { current = fs.readFileSync(excludePath, 'utf-8'); } catch { /* file may not exist */ }
+      const toAdd = entries.filter(e => !current.includes(e));
+      if (toAdd.length > 0) {
+        fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+        fs.appendFileSync(excludePath, '\n# tdd-workflow runtime files (auto-added)\n' + toAdd.join('\n') + '\n');
+      }
+    } catch { /* non-fatal — just means the files may end up committed */ }
   }
 
   private loadState(): WorkflowState {
