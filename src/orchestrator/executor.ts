@@ -18,7 +18,7 @@ export interface ExecutorOptions {
   chatMessage?: (content: string) => void;
 }
 
-const MAX_ATTEMPTS = 3;
+const MAX_ATTEMPTS = 5;
 const MAX_IMPLEMENTER_DURATION_MS = 60 * 60 * 1000;  // 60 minutes for the implementer
 const MAX_REVIEWER_DURATION_MS    = 60 * 60 * 1000;  // 60 minutes for the reviewer
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
