@@ -660,7 +660,11 @@ export class WorkflowExecutor {
             // Parse Reviewer Verdict
             const isApproved = /APPROVED:\s*true/i.test(reviewText);
             const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-            const reviewerFeedback = (feedbackMatch && feedbackMatch[1]) ? feedbackMatch[1].trim() : reviewText;
+            // Only use the FEEDBACK: section as feedback — not the full review analysis.
+            // If the reviewer didn't follow the format, treat the whole session as a rejection
+            // with a clear message rather than dumping confusing analysis text into the implementer's prompt.
+            const reviewerFeedback = (feedbackMatch?.[1]?.trim())
+              || (reviewText.trim() ? `Reviewer rejected but did not follow the structured output format. Full review:\n${reviewText.substring(0, 600)}` : 'Reviewer session produced no output — possible timeout or crash.');
 
             if (!isApproved) {
               logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
@@ -851,7 +855,8 @@ export class WorkflowExecutor {
 
     const isApproved = /APPROVED:\s*true/i.test(reviewText);
     const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-    const reviewerFeedback = (feedbackMatch?.[1] ?? reviewText).trim();
+    const reviewerFeedback = (feedbackMatch?.[1]?.trim())
+      || (reviewText.trim() ? `Reviewer did not follow structured format. Full review:\n${reviewText.substring(0, 600)}` : 'Final reviewer session produced no output.');
 
     if (isApproved) {
       logger.info('Final workflow review: approved');

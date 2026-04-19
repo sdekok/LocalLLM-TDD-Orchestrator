@@ -137,6 +137,19 @@ Default to context-mode (\`ctx_execute_file\`) for analyzing codebase state.
 
 **Always check \`.tdd-workflow/analysis/\` if available to ensure subtasks respect the existing codebase structure.**
 
+### CRITICAL: Every subtask MUST produce a code change
+Do NOT create investigation, analysis, or "read X to understand Y" subtasks. Every subtask must describe a concrete file mutation that an implementer can make and that a reviewer can verify from a git diff.
+
+**Bad** (investigation-only — will always fail review):
+- "Read export-schemas.ts and tsconfig.json to analyze the import errors"
+- "Investigate why import.meta fails in CommonJS mode"
+
+**Good** (action-oriented — produces a reviewable diff):
+- "Fix ESM import errors in export-schemas.ts by adding .js extensions and switching to tsx-compatible module syntax"
+- "Update libs/shared-contracts/tsconfig.json to set moduleResolution to bundler so import.meta is valid"
+
+If investigation is required before you can write the subtask description, do it yourself during planning — then encode the conclusion as an action in the description.
+
 ### Output Format
 You must return only a JSON object matching this schema:
 {
