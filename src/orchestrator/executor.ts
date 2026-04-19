@@ -670,7 +670,9 @@ export class WorkflowExecutor {
               await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${diffSummary}`), reviewerTimeout]);
 
               // If the reviewer analysed but didn't produce the required verdict format,
-              // send a short follow-up asking it to emit only the structured lines.
+              // send a follow-up asking it to emit only the structured lines.
+              // Use a generous timeout — thinking models need several minutes even for short replies.
+              const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
               if (!reviewText.includes('APPROVED:')) {
                 logger.warn(`[${task.id}] Reviewer missing structured verdict — sending format reminder`);
                 const savedReviewText = reviewText;
@@ -678,13 +680,14 @@ export class WorkflowExecutor {
                 try {
                   await Promise.race([
                     reviewerSession.prompt(
-                      'Your review above is missing the required structured verdict. ' +
-                      'Please output ONLY the following lines now, with no other text:\n\n' +
+                      'STOP all tool calls. Do NOT read any more files.\n\n' +
+                      'Your review is complete but is missing the required structured verdict. ' +
+                      'Output ONLY these three lines right now — nothing else:\n\n' +
                       'APPROVED: true/false\n' +
                       'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-                      'FEEDBACK: <your feedback>'
+                      'FEEDBACK: <your feedback based on what you have already read>'
                     ),
-                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), 90_000)),
+                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), FORMAT_RETRY_TIMEOUT_MS)),
                   ]);
                 } catch {
                   reviewText = savedReviewText; // retry failed — restore original
@@ -1045,6 +1048,7 @@ export class WorkflowExecutor {
       ]);
 
       // Format reminder if structured verdict is missing
+      const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
       if (!reviewText.includes('APPROVED:')) {
         logger.warn('[EXECUTOR] Final reviewer missing structured verdict — sending format reminder');
         const savedReviewText = reviewText;
@@ -1052,13 +1056,14 @@ export class WorkflowExecutor {
         try {
           await Promise.race([
             reviewerSession.prompt(
-              'Your review above is missing the required structured verdict. ' +
-              'Please output ONLY the following lines now, with no other text:\n\n' +
+              'STOP all tool calls. Do NOT read any more files.\n\n' +
+              'Your review is complete but is missing the required structured verdict. ' +
+              'Output ONLY these three lines right now — nothing else:\n\n' +
               'APPROVED: true/false\n' +
               'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-              'FEEDBACK: <your feedback>'
+              'FEEDBACK: <your feedback based on what you have already read>'
             ),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), 90_000)),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), FORMAT_RETRY_TIMEOUT_MS)),
           ]);
         } catch {
           reviewText = savedReviewText;
