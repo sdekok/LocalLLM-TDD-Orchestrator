@@ -71,18 +71,18 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('tdd', {
-    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> continue',
+    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> resume | /tdd <epic> continue',
     handler: async (args: string, ctx) => {
       if (!args) {
-        args = await ctx.ui.input('Enter TDD Epic number or description (append "retry" or "continue" to resume):') || '';
+        args = await ctx.ui.input('Enter TDD Epic number or description (append "retry", "resume", or "continue" to resume):') || '';
         if (!args) return;
       }
 
-      // Parse subcommand: "/tdd 1 retry" | "/tdd 1 continue" | "/tdd 1"
+      // Parse subcommand: "/tdd 1 retry" | "/tdd 1 resume" | "/tdd 1 continue" | "/tdd 1"
       const parts = args.trim().split(/\s+/);
       const epicRef = parts[0] ?? '';
       const subcommand = parts[1]?.toLowerCase();
-      const isResume = subcommand === 'retry' || subcommand === 'continue';
+      const isResume = subcommand === 'retry' || subcommand === 'resume' || subcommand === 'continue';
 
       // Lazy init orchestrator state
       if (!stateManager) {
@@ -150,14 +150,16 @@ export default function(pi: ExtensionAPI) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
           return;
         }
-        const retryFailed = subcommand === 'retry';
-        postToChat(
-          retryFailed
-            ? `🔄 Retrying failed tasks for epic **${epicRef}**…`
-            : `▶️ Continuing epic **${epicRef}** (skipping failed tasks)…`,
-          'tdd-progress'
-        );
-        runAndReport(executor!.resume(retryFailed));
+        const mode = subcommand === 'retry' ? 'retry'
+          : subcommand === 'resume' ? 'resume'
+          : 'skip';
+        const modeLabel = mode === 'retry'
+          ? `🔄 Retrying failed tasks for epic **${epicRef}** (reviewer feedback cleared)…`
+          : mode === 'resume'
+          ? `▶️ Resuming failed tasks for epic **${epicRef}** (reviewer feedback preserved)…`
+          : `▶️ Continuing epic **${epicRef}** (skipping failed tasks)…`;
+        postToChat(modeLabel, 'tdd-progress');
+        runAndReport(executor!.resume(mode));
       } else {
         runAndReport(executor!.startNew(epicRef));
       }

@@ -136,7 +136,27 @@ export class StateManager {
       if (task.status === 'failed') {
         task.status = 'pending';
         task.attempts = 0;
+        task.phase = undefined;
         task.feedback = undefined;
+        count++;
+      }
+    }
+    if (count > 0) this.saveState();
+    return count;
+  }
+
+  /**
+   * Like resetFailedTasks but intentionally keeps `feedback` so the implementer
+   * can see what the reviewer said in the previous run.
+   */
+  resumeFailedTasks(): number {
+    let count = 0;
+    for (const task of this.state.subtasks) {
+      if (task.status === 'failed') {
+        task.status = 'pending';
+        task.attempts = 0;
+        task.phase = undefined;
+        // task.feedback intentionally preserved
         count++;
       }
     }

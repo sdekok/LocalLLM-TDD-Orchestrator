@@ -284,7 +284,7 @@ export class WorkflowExecutor {
     await this.processQueue();
   }
 
-  async resume(retryFailed = false): Promise<void> {
+  async resume(mode: 'skip' | 'retry' | 'resume' = 'skip'): Promise<void> {
     const logger = getLogger();
 
     if (!this.state.hasWorkflow()) {
@@ -296,9 +296,12 @@ export class WorkflowExecutor {
       logger.info(`Resume check: Found ${resetInterrupted} tasks already in progress.`);
     }
 
-    if (retryFailed) {
+    if (mode === 'retry') {
       const resetFailed = this.state.resetFailedTasks();
-      logger.info(`Reset ${resetFailed} failed tasks to pending`);
+      logger.info(`Retry mode: reset ${resetFailed} failed tasks (feedback cleared)`);
+    } else if (mode === 'resume') {
+      const resumed = this.state.resumeFailedTasks();
+      logger.info(`Resume mode: reset ${resumed} failed tasks (feedback preserved)`);
     }
 
     await this.processQueue();
@@ -364,7 +367,8 @@ export class WorkflowExecutor {
       const originalBranch = await this.sandbox.getCurrentBranch();
       const branchName = `tdd-workflow/${task.id.substring(0, 12)}`;
       let approved = false;
-      let feedback = '';
+      // Seed with any feedback preserved from a prior run (resume mode).
+      let feedback = task.feedback || '';
 
       let lastAttemptDiff = '';
       let currentDiff = '';
@@ -823,7 +827,10 @@ export class WorkflowExecutor {
           `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
           `**Feedback:** ${feedbackPreview}\n\n` +
           `**Inspect:** branch \`${branchName}\` · State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\`\n\n` +
-          `**Next step:** \`/tdd ${epicRef} retry\` to retry failed tasks, or \`/tdd ${epicRef} continue\` to skip and proceed.`
+          `**Next step:**\n` +
+          `- \`/tdd ${epicRef} resume\` — retry with reviewer feedback preserved _(recommended)_\n` +
+          `- \`/tdd ${epicRef} retry\` — retry with a clean slate (feedback cleared)\n` +
+          `- \`/tdd ${epicRef} continue\` — skip failed tasks and proceed`
         );
 
         this.events.emit('taskFailed', {
@@ -834,7 +841,7 @@ export class WorkflowExecutor {
           originalBranch
         });
 
-        // Stop the workflow — user must explicitly resume via /tdd <epic> retry|continue
+        // Stop the workflow — user must explicitly resume via /tdd <epic> resume|retry|continue
         break;
       }
     }

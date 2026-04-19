@@ -96,9 +96,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         type: 'object',
         properties: {
           projectDir: { type: 'string', description: 'Absolute path to the project root directory.' },
-          retryFailed: {
-            type: 'boolean',
-            description: 'If true, also retry tasks that previously failed after 3 attempts.',
+          mode: {
+            type: 'string',
+            enum: ['skip', 'retry', 'resume'],
+            description: '"resume" keeps reviewer feedback from prior run (recommended). "retry" wipes feedback and starts fresh. "skip" skips failed tasks and continues with pending ones.',
           },
         },
         required: ['projectDir'],
@@ -165,11 +166,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   if (toolName === 'resume_tdd_workflow') {
     const projectDir = resolveProjectDir(args.projectDir as string);
-    const retryFailed = (args.retryFailed as boolean) || false;
+    const mode = (args.mode as 'skip' | 'retry' | 'resume') || 'skip';
     const { executor } = await getOrCreate(projectDir);
 
     const resumeId = randomUUID();
-    executor.resume(retryFailed).catch((err: unknown) => {
+    executor.resume(mode).catch((err: unknown) => {
       getLogger().error(`Resume ${resumeId} failed: ${err instanceof Error ? err.message : String(err)}`);
     });
 
@@ -177,7 +178,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       content: [
         {
           type: 'text',
-          text: `Workflow resumed (id: ${resumeId})\nProject: ${projectDir} (retryFailed: ${retryFailed})\nUse check_workflow_status to monitor progress.`,
+          text: `Workflow resumed (id: ${resumeId})\nProject: ${projectDir} (mode: ${mode})\nUse check_workflow_status to monitor progress.`,
         },
       ],
     };

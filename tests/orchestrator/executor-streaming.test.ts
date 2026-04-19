@@ -438,34 +438,54 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     await expect(executor.resume()).rejects.toThrow(/No workflow state found/);
   });
 
-  it('resume(false) calls processQueue without resetting failed tasks', async () => {
+  it('resume("skip") calls processQueue without resetting failed tasks', async () => {
     state.initWorkflow('test');
     state.setSubtasks([{ id: 'WI-1', description: 'Task' }]);
     state.updateSubtask('WI-1', { status: 'failed' });
 
     (executor as any).processQueue = vi.fn().mockResolvedValue(undefined);
     const resetFailed = vi.spyOn(state, 'resetFailedTasks');
+    const resumeFailed = vi.spyOn(state, 'resumeFailedTasks');
 
-    await executor.resume(false);
+    await executor.resume('skip');
 
     expect(resetFailed).not.toHaveBeenCalled();
+    expect(resumeFailed).not.toHaveBeenCalled();
     expect((executor as any).processQueue).toHaveBeenCalledOnce();
   });
 
-  it('resume(true) resets failed tasks before calling processQueue', async () => {
+  it('resume("retry") resets failed tasks (clears feedback) before calling processQueue', async () => {
     state.initWorkflow('test');
     state.setSubtasks([{ id: 'WI-1', description: 'Task' }]);
-    state.updateSubtask('WI-1', { status: 'failed' });
+    state.updateSubtask('WI-1', { status: 'failed', feedback: 'old feedback' });
 
     (executor as any).processQueue = vi.fn().mockResolvedValue(undefined);
     const resetFailed = vi.spyOn(state, 'resetFailedTasks');
 
-    await executor.resume(true);
+    await executor.resume('retry');
 
     expect(resetFailed).toHaveBeenCalledOnce();
     expect((executor as any).processQueue).toHaveBeenCalledOnce();
-    // After retry, WI-1 should be back to pending
+    // After retry, WI-1 should be back to pending with feedback cleared
     expect(state.getSubtask('WI-1')?.status).toBe('pending');
+    expect(state.getSubtask('WI-1')?.feedback).toBeUndefined();
+  });
+
+  it('resume("resume") resets failed tasks but preserves feedback', async () => {
+    state.initWorkflow('test');
+    state.setSubtasks([{ id: 'WI-1', description: 'Task' }]);
+    state.updateSubtask('WI-1', { status: 'failed', feedback: 'reviewer said X' });
+
+    (executor as any).processQueue = vi.fn().mockResolvedValue(undefined);
+    const resumeFailed = vi.spyOn(state, 'resumeFailedTasks');
+
+    await executor.resume('resume');
+
+    expect(resumeFailed).toHaveBeenCalledOnce();
+    expect((executor as any).processQueue).toHaveBeenCalledOnce();
+    // After resume, WI-1 should be pending but feedback preserved
+    expect(state.getSubtask('WI-1')?.status).toBe('pending');
+    expect(state.getSubtask('WI-1')?.feedback).toBe('reviewer said X');
   });
 
   it('processQueue stops after first task failure and emits taskFailed', async () => {
