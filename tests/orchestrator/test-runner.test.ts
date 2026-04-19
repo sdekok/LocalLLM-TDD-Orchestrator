@@ -41,6 +41,18 @@ describe('VitestRunner', () => {
     expect(result.coverage?.statements).toBe(85.5);
   });
 
+  it('runCoverage does not use --reporter=json-summary (crashes vitest v4)', async () => {
+    const { exec } = await import('child_process');
+    let capturedCmd = '';
+    (exec as any).mockImplementation((cmd: string, _opts: any, callback: any) => {
+      capturedCmd = cmd;
+      callback(null, { stdout: '', stderr: '' });
+    });
+    await runner.runCoverage('/mock/project', 5000);
+    expect(capturedCmd).not.toContain('json-summary');
+    expect(capturedCmd).toContain('--coverage');
+  });
+
   it('prefers JSON coverage if available', async () => {
     (fs.existsSync as any).mockReturnValue(true);
     (fs.readFileSync as any).mockReturnValue(JSON.stringify({

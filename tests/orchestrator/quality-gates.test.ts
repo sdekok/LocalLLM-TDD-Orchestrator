@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { QualityReport, runQualityGates, getLensFailPolicy } from '../../src/orchestrator/quality-gates.js';
+import { QualityReport, runQualityGates, getLensFailPolicy, loadFileSafetyAllowlist } from '../../src/orchestrator/quality-gates.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -199,6 +199,56 @@ describe('runGate: execFile (no shell) command execution', () => {
 
     // Should not throw — the gate pipeline continues with empty pkg config
     await expect(runQualityGates(tmpDir)).resolves.not.toThrow();
+  });
+});
+
+// ─── loadFileSafetyAllowlist ──────────────────────────────────────
+
+describe('loadFileSafetyAllowlist', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'allowlist-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('returns empty array when package.json has no tddConfig', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({ name: 'test' }));
+    expect(loadFileSafetyAllowlist(tmpDir)).toEqual([]);
+  });
+
+  it('returns prefixes from tddConfig.fileSafetyAllowlist', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({
+      name: 'test',
+      tddConfig: { fileSafetyAllowlist: ['scripts/', 'config/', 'fixtures/'] },
+    }));
+    expect(loadFileSafetyAllowlist(tmpDir)).toEqual(['scripts/', 'config/', 'fixtures/']);
+  });
+
+  it('filters out non-string entries', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({
+      tddConfig: { fileSafetyAllowlist: ['scripts/', 42, null, true, 'config/'] },
+    }));
+    expect(loadFileSafetyAllowlist(tmpDir)).toEqual(['scripts/', 'config/']);
+  });
+
+  it('returns empty array when fileSafetyAllowlist is not an array', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), JSON.stringify({
+      tddConfig: { fileSafetyAllowlist: 'scripts/' },
+    }));
+    expect(loadFileSafetyAllowlist(tmpDir)).toEqual([]);
+  });
+
+  it('returns empty array when package.json is missing', () => {
+    expect(loadFileSafetyAllowlist(path.join(tmpDir, 'nonexistent'))).toEqual([]);
+  });
+
+  it('returns empty array when package.json is malformed JSON', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{ invalid }');
+    expect(loadFileSafetyAllowlist(tmpDir)).toEqual([]);
   });
 });
 

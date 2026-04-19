@@ -71,6 +71,7 @@ Inside any project, use the slash commands:
 - **Plan**: `/plan "Build a secure login system"` — decomposes into Epics/WorkItems
 - **Implement**: `/tdd 1` — loads Epic 1 from `WorkItems/` and executes
 - **Resume**: `/tdd 1 retry` — retry failed tasks and continue; `/tdd 1 continue` — skip failed and continue
+- **Cleanup**: `/tdd:project-cleanup` — scan all quality gates, then run a TDD workflow to fix every pre-existing failure
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
 - **Analyze**: `/analyze` — architectural blueprinting
 
@@ -141,16 +142,33 @@ The easiest way to create or update either file is via `/setup` in Pi. You can a
 
 > `models.config.json` and `models.config.local.json` are listed in `.gitignore` to prevent accidental secret commits.
 
+## Implementer → Reviewer Handoff
+
+The implementer and reviewer are separate agents that communicate through structured artifacts, not shared memory:
+
+1. **Implementation notes** — at the end of its session the implementer writes `.tdd-workflow/implementation-notes.md` explaining design decisions, trade-offs, and any pre-existing issues it left alone intentionally.
+2. **Git diff** — the executor captures `git diff HEAD` after the implementer finishes and injects it (plus a changed-file list) directly into the reviewer's prompt.
+3. **Scoped review** — the reviewer is instructed to treat the diff as its primary source of truth and only read additional files when the diff alone is insufficient to evaluate a type or test path.
+
+This means the reviewer always knows exactly what changed and why — it doesn't need to discover changes by exploring the filesystem.
+
 ## Safety & Runaway Protection
 
 | Guard | What It Catches | Behavior |
 |---|---|---|
-| **Max attempts** (3/task) | Persistent failures | Marks task failed, stops workflow — awaits `/tdd <n> retry\|continue` |
-| **Output similarity** (>90%) | Agent stuck in a loop | Bails immediately |
-| **Time budget** (10 min/task) | LLM hangs, runaway tool calls | Breaks the attempt loop |
-| **Circuit breaker** (3 failures) | Systemic problems | Stops entire workflow |
+| **Max attempts** (5/task) | Persistent failures | Marks task failed, stops workflow — awaits `/tdd <n> retry\|continue` |
+| **Output similarity** (>90%) | Agent stuck in a loop | Bails immediately, before wasting the reviewer's time |
+| **Implementer timeout** (60 min) | Hung implementer session | Throws into the catch block; next attempt starts fresh |
+| **Reviewer timeout** (60 min) | Hung reviewer session | Same — independent of the implementer budget |
+| **Circuit breaker** (3 consecutive failures) | Systemic problems | Stops entire workflow |
 
-When a task fails the workflow stops and posts a chat message explaining what to do next. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+Timeouts are enforced independently per agent via `Promise.race` — a slow implementer cannot eat the reviewer's budget. When a task fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+
+## Project Cleanup
+
+`/tdd:project-cleanup` runs quality gates before any agent starts, summarises every failing gate in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
+
+The implementer is instructed to only fix failures in files it is already modifying, so cleanup stays scoped and doesn't cause unrelated drift.
 
 ## Multi-Language Support
 
@@ -184,6 +202,28 @@ npm run build:csharp # Build the Roslyn C# analyzer (requires .NET 10 SDK)
 npm run build:all    # Full build
 npm run dev          # Watch mode
 ```
+
+## Project Config (`tddConfig` in `package.json`)
+
+Optional settings can be placed in the `tddConfig` key of the project's `package.json`:
+
+```json
+"tddConfig": {
+  "coverageThresholds": {
+    "lines": 80,
+    "functions": 80,
+    "branches": 70
+  },
+  "fileSafetyAllowlist": ["scripts/", "config/", "fixtures/", "e2e/"]
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `coverageThresholds.lines` | `80` | Minimum line coverage % |
+| `coverageThresholds.functions` | `80` | Minimum function coverage % |
+| `coverageThresholds.branches` | `70` | Minimum branch coverage % |
+| `fileSafetyAllowlist` | `[]` | Extra path prefixes (e.g. `"scripts/"`) the file-safety gate should not flag. Built-in safe prefixes include `src/`, `tests/`, `libs/`, `apps/`, `packages/`, `docs/`, `coverage/`, `.pi-lens/`, `.tdd-workflow/`, and common root files (`.gitignore`, lock files, `tsconfig*.json`). |
 
 ## Environment Variables
 

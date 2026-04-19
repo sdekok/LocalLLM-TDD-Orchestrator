@@ -309,7 +309,7 @@ const BUILTIN_SAFE_PATTERNS = [
   /^\.(gitignore|npmignore|prettierignore|eslintignore|editorconfig|nvmrc|node-version)$/,
 ];
 
-function loadFileSafetyAllowlist(projectDir: string): string[] {
+export function loadFileSafetyAllowlist(projectDir: string): string[] {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
     const extra: unknown = pkg?.tddConfig?.fileSafetyAllowlist;

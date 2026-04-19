@@ -22,6 +22,11 @@ vi.mock('../../src/agents/planner.js', () => ({
   planAndBreakdown: vi.fn(),
 }));
 
+vi.mock('../../src/utils/exec.js', () => ({
+  execFileAsync: vi.fn().mockResolvedValue({ stdout: '', stderr: '' }),
+  DEFAULT_MAX_BUFFER: 10 * 1024 * 1024,
+}));
+
 vi.mock('../../src/orchestrator/quality-gates.js', () => ({
   runQualityGates: vi.fn(),
   detectTestCommand: vi.fn(),
@@ -525,6 +530,128 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(msg).toContain('/tdd 2 retry');
     expect(msg).toContain('/tdd 2 continue');
     expect(msg).toContain('Inspect:');
+  });
+
+  it('processQueue passes git diff and changed files to reviewer prompt', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+
+    state.initWorkflow('epic-diff');
+    state.setSubtasks([{ id: 'WI-1', description: 'Diff task' }]);
+
+    // Git diff returns a real-looking diff
+    (execFileAsync as any).mockImplementation(async (_cmd: string, args: string[]) => {
+      if (args.includes('--name-only')) return { stdout: 'src/foo.ts\n', stderr: '' };
+      return { stdout: 'diff --git a/src/foo.ts b/src/foo.ts\n+added line\n', stderr: '' };
+    });
+
+    const reviewText = 'APPROVED: true\nFEEDBACK: Looks good';
+    let reviewerPromptArg = '';
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return implSession;
+      reviewerSession.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        reviewerPromptArg = prompt;
+        fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: reviewText }] } });
+      });
+      return reviewerSession;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Diff task', subtasks: [] });
+
+    await (executor as any).processQueue();
+
+    expect(reviewerPromptArg).toContain('src/foo.ts');
+    expect(reviewerPromptArg).toContain('+added line');
+    expect(reviewerPromptArg).toContain('Changed Files');
+    expect(reviewerPromptArg).toContain('Diff');
+  });
+
+  it('processQueue includes implementation-notes.md content in reviewer prompt when the file exists', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+
+    // Write implementation notes
+    const tddDir = path.join(projectDir, '.tdd-workflow');
+    fs.mkdirSync(tddDir, { recursive: true });
+    fs.writeFileSync(path.join(tddDir, 'implementation-notes.md'), 'Chose approach X because Y. Trade-off: Z.');
+
+    state.initWorkflow('epic-notes');
+    state.setSubtasks([{ id: 'WI-1', description: 'Notes task' }]);
+
+    const reviewText = 'APPROVED: true\nFEEDBACK: Great';
+    let reviewerPromptArg = '';
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return implSession;
+      reviewerSession.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        reviewerPromptArg = prompt;
+        fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: reviewText }] } });
+      });
+      return reviewerSession;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Notes task', subtasks: [] });
+
+    await (executor as any).processQueue();
+
+    expect(reviewerPromptArg).toContain('Implementer Notes');
+    expect(reviewerPromptArg).toContain('Chose approach X because Y');
+  });
+
+  it('processQueue omits Implementer Notes section when notes file is absent', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+
+    state.initWorkflow('epic-nonotes');
+    state.setSubtasks([{ id: 'WI-1', description: 'No-notes task' }]);
+
+    const reviewText = 'APPROVED: true\nFEEDBACK: Fine';
+    let reviewerPromptArg = '';
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return implSession;
+      reviewerSession.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        reviewerPromptArg = prompt;
+        fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: reviewText }] } });
+      });
+      return reviewerSession;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'No-notes task', subtasks: [] });
+
+    await (executor as any).processQueue();
+
+    expect(reviewerPromptArg).not.toContain('Implementer Notes');
   });
 
   it('processQueue posts completion chatMessage on success', async () => {
