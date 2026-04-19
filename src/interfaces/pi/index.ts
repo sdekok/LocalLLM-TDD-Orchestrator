@@ -17,6 +17,7 @@ import {
 } from '../../llm/model-router.js';
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
+import { runQualityGates } from '../../orchestrator/quality-gates.js';
 import { planProject } from '../../agents/project-planner.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
@@ -226,6 +227,104 @@ export default function(pi: ExtensionAPI) {
         const e = err as Error;
         ctx.ui.notify(`Planning failed: ${e.message}`, 'error');
       }
+    }
+  });
+
+  pi.registerCommand('tdd:project-cleanup', {
+    description: 'Audit quality gates across the whole project and create a TDD workflow to fix all pre-existing failures.',
+    handler: async (_args: string, ctx) => {
+      ctx.ui.notify('Scanning project for quality gate failures…', 'info');
+      ctx.ui.setStatus('tdd-cleanup', '🔍 Running quality gates…');
+
+      let report;
+      try {
+        report = await runQualityGates(ctx.cwd);
+      } catch (err) {
+        ctx.ui.setStatus('tdd-cleanup', undefined);
+        ctx.ui.notify(`Quality gate scan failed: ${(err as Error).message}`, 'error');
+        return;
+      }
+
+      ctx.ui.setStatus('tdd-cleanup', undefined);
+
+      const failures = report.gates.filter(g => !g.passed);
+      if (failures.length === 0) {
+        ctx.ui.notify('✅ All quality gates pass — nothing to clean up!', 'info');
+        postToChat('✅ **Project Cleanup** — all quality gates pass. No cleanup needed.', 'tdd-progress');
+        return;
+      }
+
+      // Summarise what's broken
+      const failureSummary = failures
+        .map(g => `- **${g.gate}** (${g.blocking ? 'BLOCKING' : 'warning'}): ${g.output.split('\n')[0]}`)
+        .join('\n');
+
+      postToChat(
+        `🧹 **Project Cleanup** — found ${failures.length} failing gate${failures.length === 1 ? '' : 's'}:\n${failureSummary}\n\nStarting cleanup workflow…`,
+        'tdd-progress'
+      );
+
+      // Build a structured cleanup request for the on-the-fly planner.
+      // Include the full gate output so the planner can assign the right files to each subtask.
+      const cleanupRequest =
+        `Fix all pre-existing quality gate failures in this project.\n\n` +
+        `## Failing Gates\n\n` +
+        failures.map(g =>
+          `### ${g.gate.toUpperCase()} (${g.blocking ? 'BLOCKING' : 'warning'})\n${g.output}`
+        ).join('\n\n') +
+        `\n\n## Rules\n` +
+        `- Fix ONLY what is explicitly listed above. Do not refactor unrelated code.\n` +
+        `- Each subtask should be scoped to a single package or file group.\n` +
+        `- Commit fixes separately from any feature work.`;
+
+      // Lazy-init the same executor used by /tdd so event wiring is shared.
+      if (!stateManager) {
+        stateManager = new StateManager(ctx.cwd);
+        const modelRouter = new ModelRouter(null, ctx.cwd);
+        if (modelRouter.isPassthrough) {
+          ctx.ui.notify(
+            "⚠️  No models.config.json found — using Pi's active model for cleanup agents.",
+            'warning'
+          );
+        }
+        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+
+        executor = new WorkflowExecutor(stateManager, modelRouter, {
+          searchClient,
+          chatMessage: (content) => postToChat(content, 'tdd-progress'),
+        });
+
+        executor.events.on('taskStarted', (data: { description: string }) => {
+          ctx.ui.setStatus('tdd-cleanup', `🧹 [Cleanup] ${data.description.substring(0, 40)}…`);
+        });
+        executor.events.on('taskProgress', (data: { attempt: number; message: string }) => {
+          ctx.ui.setStatus('tdd-cleanup', `🧹 [Cleanup] Attempt ${data.attempt}: ${data.message}`);
+        });
+        executor.events.on('taskCompleted', (data: { id: string }) => {
+          ctx.ui.notify(`✅ [Cleanup] Fixed: ${data.id}`, 'info');
+        });
+        executor.events.on('taskFailed', (data: { id: string }) => {
+          ctx.ui.notify(`❌ [Cleanup] Could not fix: ${data.id}`, 'error');
+          ctx.ui.setStatus('tdd-cleanup', undefined);
+        });
+      }
+
+      ctx.ui.notify('Cleanup workflow running in background…', 'info');
+      executor!.startNew(cleanupRequest).then(() => {
+        const summary = stateManager!.getSummary();
+        ctx.ui.setStatus('tdd-cleanup', undefined);
+        if (summary.failed > 0 || summary.pending > 0) {
+          ctx.ui.notify(
+            `⏸ Cleanup paused — ${summary.failed} failed, ${summary.pending} pending, ${summary.completed} fixed.`,
+            'warning'
+          );
+        } else {
+          ctx.ui.notify(`🎉 Project cleanup complete! ${summary.completed} issue${summary.completed === 1 ? '' : 's'} fixed.`, 'info');
+        }
+      }).catch((err: any) => {
+        ctx.ui.setStatus('tdd-cleanup', undefined);
+        ctx.ui.notify(`🔥 Cleanup engine error: ${err.message}`, 'error');
+      });
     }
   });
 

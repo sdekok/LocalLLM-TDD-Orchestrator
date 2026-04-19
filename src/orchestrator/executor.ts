@@ -165,9 +165,12 @@ export class WorkflowExecutor {
     logger.info(`Starting new workflow: ${request.substring(0, 100)}`);
     this.state.initWorkflow(request);
 
-    // 1. Check if the request refers to a pre-planned Epic
+    // 1. Check if the request refers to a pre-planned Epic.
+    // Skip the lookup for multiline/long requests — they are inline briefs (e.g. cleanup),
+    // not epic references, and findEpic() throws on strings containing path separators.
     const epicLoader = new EpicLoader(this.state.projectDir);
-    const epicPath = epicLoader.findEpic(request);
+    const mightBeEpicRef = !request.includes('\n') && request.length < 120;
+    const epicPath = mightBeEpicRef ? epicLoader.findEpic(request) : null;
     let epic: EpicPlan | null = null;
 
     if (epicPath) {

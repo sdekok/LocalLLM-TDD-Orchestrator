@@ -34,13 +34,14 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 - **ast_grep_replace**: Use this for large-scale structural refactoring (e.g., renaming a property across many files or changing a function signature).
 
 ### Your Workflow
+0. **Health Check**: Run tests and quality checks (\`ctx_execute\`) for the files you will be modifying. If there are pre-existing failures **in those files**, fix them first and commit as a separate "chore: fix pre-existing issues in <file>" commit before writing any new feature code. **Do not fix issues in files unrelated to this task** — out-of-scope changes risk breaking other work.
 1. **Understand**: Use \`read\`, \`lsp_navigation\`, or \`ctx_execute_file\` to grasp the current implementation. **Always check \`.tdd-workflow/analysis/\` if it exists.**
 2. **Explore**: Use \`lsp_navigation\` to trace symbol definitions and usages to map out the impact of your changes.
 3. **Test First**: Create or update test files using \`write\` or \`edit\`.
-3. **Verify Failure**: Run tests via \`ctx_execute\` to confirm they fail (red).
-4. **Implement**: Write the minimal code needed to make the tests pass.
-5. **Verify Success**: Run tests again using \`ctx_execute\`.
-6. **Refactor**: Clean up and ensure all tests continue to pass.
+4. **Verify Failure**: Run tests via \`ctx_execute\` to confirm they fail (red).
+5. **Implement**: Write the minimal code needed to make the tests pass.
+6. **Verify Success**: Run tests again using \`ctx_execute\`.
+7. **Refactor**: Clean up and ensure all tests continue to pass.
 
 ### Requirements & Context
 **Acceptance Criteria**:

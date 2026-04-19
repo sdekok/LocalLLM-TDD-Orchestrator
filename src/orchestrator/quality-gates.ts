@@ -313,7 +313,12 @@ async function checkFileSafety(projectDir: string): Promise<GateResult> {
           !f.startsWith('test/') &&
           !f.startsWith('__tests__/') &&
           !f.startsWith('lib/') &&
+          !f.startsWith('libs/') &&
+          !f.startsWith('apps/') &&
+          !f.startsWith('packages/') &&
           !f.startsWith('coverage/') &&
+          !f.startsWith('.pi-lens/') &&
+          !f.startsWith('.tdd-workflow/') &&
           !f.match(/^(package\.json|tsconfig\.json|\.eslintrc|vitest\.config|jest\.config)/)
         );
       });
