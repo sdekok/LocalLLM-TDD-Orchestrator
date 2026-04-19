@@ -72,10 +72,17 @@ export class Sandbox {
       });
       logger.info(`Created sandbox branch: ${safeBranch}`);
     } catch {
-      // Branch already exists — check it out via safeCheckout so that runtime files
-      // (.tdd-workflow/state.json, etc.) don't block the switch on retry attempts.
-      await this.safeCheckout(safeBranch);
-      logger.info(`Checked out existing branch: ${safeBranch}`);
+      // Branch already exists (leftover from a prior run or a previous attempt in this
+      // run). Delete and recreate it from the current HEAD so the implementer always
+      // starts from the latest merged code. A stale base is the main cause of merge
+      // conflicts when a later task independently creates files that an earlier task
+      // already added to the base branch.
+      logger.info(`Branch ${safeBranch} already exists — recreating from current HEAD`);
+      try {
+        await execFileAsync('git', ['branch', '-D', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+      } catch { /* branch may have been deleted already */ }
+      await execFileAsync('git', ['checkout', '-b', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
+      logger.info(`Recreated sandbox branch: ${safeBranch}`);
     }
   }
 
