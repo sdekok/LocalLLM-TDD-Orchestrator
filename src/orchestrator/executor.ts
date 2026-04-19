@@ -306,6 +306,22 @@ export class WorkflowExecutor {
     const logger = getLogger();
     let consecutiveFailures = 0;
 
+    // Capture the git HEAD before any agents run.
+    // Used by the final workflow reviewer to diff the full cumulative changes.
+    let workflowStartSha = '';
+    try {
+      const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
+        cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+      });
+      workflowStartSha = stdout.trim();
+    } catch { /* non-fatal — final review will use a best-effort diff */ }
+
+    // For multi-task workflows, skip per-subtask review and run a single final review
+    // after all subtasks complete. This prevents the reviewer from seeing a codebase
+    // in a partially-fixed state and rejecting valid incremental work.
+    const totalSubtasks = this.state.getState().subtasks.length;
+    const deferReview = totalSubtasks > 1;
+
     // Capture which blocking gates are already failing before any agent runs.
     // Post-implementer, only NEW failures (not in this baseline) are counted.
     let baselineFailingGates = new Set<string>();
@@ -376,6 +392,13 @@ export class WorkflowExecutor {
           // Phase 2: Implementing
           if (!task.phase || task.phase === 'refining' || task.phase === 'implementing') {
             await this.sandbox.createBranch(branchName);
+
+            // Clear stale implementation notes from any previous attempt so the reviewer
+            // always reads notes that match the current diff, not a prior attempt's reasoning.
+            try {
+              const notesPath = path.join(this.state.projectDir, '.tdd-workflow', 'implementation-notes.md');
+              if (fs.existsSync(notesPath)) fs.unlinkSync(notesPath);
+            } catch { /* non-fatal */ }
             this.state.updateSubtask(task.id, { phase: 'implementing' });
             this.events.emit('taskProgress', {
               id: task.id,
@@ -565,7 +588,12 @@ export class WorkflowExecutor {
           }
 
           // Phase 4: Reviewing
-          if (!task.phase || task.phase !== 'merging') {
+          // For multi-task workflows (deferReview=true), skip per-subtask review.
+          // A single final review runs after all subtasks complete (see runFinalWorkflowReview).
+          if (deferReview && task.phase !== 'merging') {
+            approved = true;
+            this.state.updateSubtask(task.id, { phase: 'merging' });
+          } else if (!deferReview && (!task.phase || task.phase !== 'merging')) {
             this.state.updateSubtask(task.id, { phase: 'reviewing' });
             const subtask = task!;
             this.events.emit('taskProgress', {
@@ -728,6 +756,115 @@ export class WorkflowExecutor {
         // Stop the workflow — user must explicitly resume via /tdd <epic> retry|continue
         break;
       }
+    }
+
+    // Final review for multi-task workflows: one reviewer sees the complete cumulative diff
+    // rather than each subtask being reviewed in a partially-fixed state.
+    if (deferReview) {
+      const allCompleted = this.state.getState().subtasks.every(t => t.status === 'completed');
+      if (allCompleted) {
+        await this.runFinalWorkflowReview(workflowStartSha);
+      }
+    }
+  }
+
+  /**
+   * Run a single reviewer over the full cumulative diff produced by a multi-task workflow.
+   * Called after all subtasks complete instead of per-subtask review, so the reviewer
+   * sees a coherent finished state rather than a partially-fixed codebase.
+   * A rejection here is advisory — all quality gates have already passed and changes are
+   * merged. The feedback is posted to chat for the user to act on.
+   */
+  private async runFinalWorkflowReview(workflowStartSha: string): Promise<void> {
+    const logger = getLogger();
+    const subtasks = this.state.getState().subtasks;
+
+    this.chatMessage?.(`🔍 **Final Review** — reviewing all ${subtasks.length} task(s) together…`);
+    this.events.emit('taskProgress', { id: 'final-review', phase: 'reviewing', message: 'Running final workflow review…' });
+
+    // Build cumulative diff from the start of the workflow to current HEAD
+    let cumulativeDiff = '';
+    let changedFiles: string[] = [];
+    try {
+      const ref = workflowStartSha || 'HEAD~1';
+      const [diffResult, namesResult] = await Promise.all([
+        execFileAsync('git', ['diff', ref], {
+          cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+        execFileAsync('git', ['diff', '--name-only', ref], {
+          cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+      ]);
+      cumulativeDiff = diffResult.stdout;
+      changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
+    } catch { /* non-fatal */ }
+
+    // Collect implementation notes from the last subtask's implementer
+    let implementerNotes = '';
+    try {
+      const notesPath = path.join(this.state.projectDir, '.tdd-workflow', 'implementation-notes.md');
+      if (fs.existsSync(notesPath)) implementerNotes = fs.readFileSync(notesPath, 'utf-8').trim();
+    } catch { /* non-fatal */ }
+
+    const subtaskSummary = subtasks.map(t => `- **${t.id}**: ${t.description}`).join('\n');
+    const notesSummary = implementerNotes ? `\n\n## Implementer Notes (last task)\n${implementerNotes}` : '';
+    const diffSummary = changedFiles.length > 0
+      ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Cumulative Diff\n\`\`\`diff\n${cumulativeDiff.length > 8000 ? cumulativeDiff.substring(0, 8000) + '\n… (truncated)' : cumulativeDiff}\n\`\`\``
+      : '';
+
+    const reviewerSession = await createSubAgentSession({
+      taskType: 'review',
+      systemPrompt: REVIEWER_PROMPT,
+      cwd: this.state.projectDir,
+      modelRouter: this.modelRouter,
+      tools: 'review',
+    });
+    this.subscribeToSession(reviewerSession, 'Final Review');
+
+    let reviewText = '';
+    try {
+      reviewerSession.subscribe((event: any) => {
+        if (event.type === 'message_update') {
+          const ae = event.assistantMessageEvent;
+          if (ae?.type === 'text_end' && ae.content?.trim()) reviewText += ae.content;
+        } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !reviewText) {
+          reviewText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
+        }
+      });
+      const reviewerTimeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error(`Final reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`)), MAX_REVIEWER_DURATION_MS)
+      );
+      await Promise.race([
+        reviewerSession.prompt(
+          `Review the complete workflow.\n\n## Tasks Completed\n${subtaskSummary}${notesSummary}${diffSummary}`
+        ),
+        reviewerTimeout,
+      ]);
+    } finally {
+      reviewerSession.dispose();
+      logger.info('[EXECUTOR] Final reviewer disposed. Cooldown for slot recovery...');
+      await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+    }
+
+    // Collect any questions the reviewer wrote
+    await this.collectAgentQuestions('Final Reviewer');
+
+    const isApproved = /APPROVED:\s*true/i.test(reviewText);
+    const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
+    const reviewerFeedback = (feedbackMatch?.[1] ?? reviewText).trim();
+
+    if (isApproved) {
+      logger.info('Final workflow review: approved');
+      this.chatMessage?.(`✅ **Final Review Approved** — ${subtasks.length} task(s) completed and reviewed.\n\n${reviewerFeedback}`);
+      this.events.emit('workflowCompleted', { subtasks, reviewerFeedback });
+    } else {
+      logger.warn(`Final workflow review: rejected — ${reviewerFeedback.substring(0, 200)}`);
+      // Advisory only — all quality gates passed and changes are merged
+      this.chatMessage?.(
+        `⚠️ **Final Review: concerns raised** — all quality gates passed but the reviewer has feedback:\n\n${reviewerFeedback}\n\n` +
+        `All changes have been merged. Use \`/tdd\` with the specific feedback to address reviewer concerns.`
+      );
+      this.events.emit('workflowReviewWarning', { subtasks, reviewerFeedback });
     }
   }
 

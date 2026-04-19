@@ -481,8 +481,18 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     const { session } = makeMockSession();
     (createSubAgentSession as any).mockResolvedValue(session);
 
-    // Gates always fail → exhausts MAX_ATTEMPTS
-    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: false, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+    // Gates always fail → exhausts MAX_ATTEMPTS.
+    // Baseline (first call) passes so the per-task tsc failure is not treated as pre-existing.
+    // Per-task calls include a blocking gate so newBlockingFailures.length > 0 and the task
+    // truly fails rather than being skipped as "all pre-existing baseline failures".
+    (runQualityGates as any)
+      .mockResolvedValueOnce({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined }) // baseline
+      .mockResolvedValue({  // per-task calls
+        allBlockingPassed: false,
+        gates: [{ gate: 'tsc', passed: false, blocking: true }],
+        testMetrics: undefined,
+        coverageMetrics: undefined,
+      });
     (formatGateFailures as any).mockReturnValue('tsc errors');
 
     const failed: string[] = [];
@@ -585,11 +595,6 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     const { execFileAsync } = await import('../../src/utils/exec.js');
     (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
 
-    // Write implementation notes
-    const tddDir = path.join(projectDir, '.tdd-workflow');
-    fs.mkdirSync(tddDir, { recursive: true });
-    fs.writeFileSync(path.join(tddDir, 'implementation-notes.md'), 'Chose approach X because Y. Trade-off: Z.');
-
     state.initWorkflow('epic-notes');
     state.setSubtasks([{ id: 'WI-1', description: 'Notes task' }]);
 
@@ -600,7 +605,17 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     let callCount = 0;
     (createSubAgentSession as any).mockImplementation(async () => {
       callCount++;
-      if (callCount === 1) return implSession;
+      if (callCount === 1) {
+        // Simulate the implementer writing implementation notes during its session.
+        // Notes are cleared at the start of the implementing phase, so they must be
+        // written by the implementer itself (not pre-created before processQueue runs).
+        implSession.prompt = vi.fn().mockImplementation(async () => {
+          const tddDir = path.join(projectDir, '.tdd-workflow');
+          fs.mkdirSync(tddDir, { recursive: true });
+          fs.writeFileSync(path.join(tddDir, 'implementation-notes.md'), 'Chose approach X because Y. Trade-off: Z.');
+        });
+        return implSession;
+      }
       reviewerSession.prompt = vi.fn().mockImplementation(async (prompt: string) => {
         reviewerPromptArg = prompt;
         fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: reviewText }] } });
@@ -803,5 +818,154 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(checklistMsg).toBeDefined();
     expect(checklistMsg![0]).toContain('Progress');
     expect(state.getSubtask('WI-1')?.status).toBe('completed');
+  });
+
+  it('deferred review: per-task reviewer is skipped for multi-task workflows', async () => {
+    // With 2+ subtasks, no per-task reviewer should be created.
+    // The createSubAgentSession call count should equal the number of implementer sessions only.
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    state.initWorkflow('epic-deferred');
+    state.setSubtasks([
+      { id: 'WI-1', description: 'Task one' },
+      { id: 'WI-2', description: 'Task two' },
+    ]);
+
+    const sessionCreations: string[] = [];
+    const { session: impl1 } = makeMockSession();
+    const { session: impl2 } = makeMockSession();
+    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      callCount++;
+      if (opts.taskType === 'implement') {
+        sessionCreations.push('implementer');
+        return callCount === 1 ? impl1 : impl2;
+      }
+      // taskType === 'review' → final reviewer
+      sessionCreations.push('reviewer');
+      finalReviewer.prompt = vi.fn().mockImplementation(async () => {
+        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: All good' } });
+      });
+      return finalReviewer;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    // Two implementer sessions, then one final reviewer — no per-task reviewers
+    expect(sessionCreations).toEqual(['implementer', 'implementer', 'reviewer']);
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+    expect(state.getSubtask('WI-2')?.status).toBe('completed');
+  });
+
+  it('deferred review: final reviewer receives cumulative diff and approved message is posted to chat', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    // Simulate git: rev-parse for start SHA, then diff output for the final review.
+    // Per-task diffs use 'HEAD'; final-review diffs use the captured SHA 'abc123'.
+    (execFileAsync as any).mockImplementation(async (_cmd: string, args: string[]) => {
+      if (args[0] === 'rev-parse') return { stdout: 'abc123', stderr: '' };
+      // git diff abc123 (cumulative, no --name-only)
+      if (args[0] === 'diff' && args.includes('abc123') && !args.includes('--name-only')) return { stdout: '+cumulative change', stderr: '' };
+      // git diff --name-only abc123 (cumulative, with --name-only)
+      if (args[0] === 'diff' && args.includes('abc123') && args.includes('--name-only')) return { stdout: 'src/foo.ts', stderr: '' };
+      return { stdout: '', stderr: '' };
+    });
+
+    state.initWorkflow('epic-cumulative');
+    state.setSubtasks([
+      { id: 'WI-1', description: 'Task one' },
+      { id: 'WI-2', description: 'Task two' },
+    ]);
+
+    const { session: impl1 } = makeMockSession();
+    const { session: impl2 } = makeMockSession();
+    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
+    let finalReviewerPromptArg = '';
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      callCount++;
+      if (opts.taskType === 'implement') return callCount === 1 ? impl1 : impl2;
+      finalReviewer.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        finalReviewerPromptArg = prompt;
+        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: Looks great overall' } });
+      });
+      return finalReviewer;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    // Final reviewer prompt should contain cumulative diff from workflowStartSha
+    expect(finalReviewerPromptArg).toContain('Cumulative Diff');
+    expect(finalReviewerPromptArg).toContain('+cumulative change');
+    expect(finalReviewerPromptArg).toContain('src/foo.ts');
+
+    // Approved message should be posted to chat
+    const approvedMsg = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('Final Review Approved'));
+    expect(approvedMsg).toBeDefined();
+  });
+
+  it('deferred review: advisory warning posted when final reviewer rejects (changes already merged)', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+
+    state.initWorkflow('epic-advisory');
+    state.setSubtasks([
+      { id: 'WI-1', description: 'Task one' },
+      { id: 'WI-2', description: 'Task two' },
+    ]);
+
+    const { session: impl1 } = makeMockSession();
+    const { session: impl2 } = makeMockSession();
+    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      callCount++;
+      if (opts.taskType === 'implement') return callCount === 1 ? impl1 : impl2;
+      finalReviewer.prompt = vi.fn().mockImplementation(async () => {
+        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: false\nFEEDBACK: Missing error handling in foo.ts' } });
+      });
+      return finalReviewer;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    // Both tasks should still be completed (quality gates passed)
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+    expect(state.getSubtask('WI-2')?.status).toBe('completed');
+
+    // Advisory warning should be posted (not a hard failure)
+    const warningMsg = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('Final Review: concerns raised'));
+    expect(warningMsg).toBeDefined();
+    expect(warningMsg![0]).toContain('Missing error handling');
+    expect(warningMsg![0]).toContain('All changes have been merged');
   });
 });
