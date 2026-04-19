@@ -530,9 +530,18 @@ export class WorkflowExecutor {
 
             let reviewText = '';
             try {
-              reviewerSession.subscribe((event) => {
-                if (event.type === 'message_end' && event.message.role === 'assistant') {
-                  reviewText = event.message.content.find(c => c.type === 'text')?.text || '';
+              // Capture review text from text_end stream events — more reliable than
+              // message_end content array, which may be empty on reasoning models that
+              // return thinking blocks instead of text blocks in the final message object.
+              reviewerSession.subscribe((event: any) => {
+                if (event.type === 'message_update') {
+                  const ae = event.assistantMessageEvent;
+                  if (ae?.type === 'text_end' && ae.content?.trim()) {
+                    reviewText += ae.content;
+                  }
+                } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !reviewText) {
+                  // Fallback for non-streaming / non-reasoning sessions
+                  reviewText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
                 }
               });
               const reviewerTimeout = new Promise<never>((_, reject) =>

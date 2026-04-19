@@ -64,6 +64,8 @@ Default to context-mode for ALL commands. Only use Bash for guaranteed-small-out
 ### Feedback Handling
 {feedbackContext}
 
+**You are operating autonomously. Never ask the user for confirmation, approval, or guidance — just execute. If you identify issues, fix them. If you have a plan, carry it out.**
+
 When you have successfully implemented the task and verified it with tests, provide a concise summary of your changes.`;
 
 /**

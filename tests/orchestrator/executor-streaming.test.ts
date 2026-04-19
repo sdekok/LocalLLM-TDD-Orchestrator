@@ -654,6 +654,45 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(reviewerPromptArg).not.toContain('Implementer Notes');
   });
 
+  it('processQueue captures reviewText from text_end stream events (reasoning model path)', async () => {
+    // Reasoning models emit text via text_end stream events rather than populating
+    // message_end content — verify the executor uses accumulated stream text for verdict parsing.
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+
+    state.initWorkflow('epic-stream');
+    state.setSubtasks([{ id: 'WI-1', description: 'Stream review task' }]);
+
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return implSession;
+      reviewerSession.prompt = vi.fn().mockImplementation(async () => {
+        // Emit text via message_update/text_end (stream path) — no message_end content
+        fireReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: Streaming verdict' } });
+        // message_end with EMPTY content array (reasoning model behaviour)
+        fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [] } });
+      });
+      return reviewerSession;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Stream review task', subtasks: [] });
+
+    await (executor as any).processQueue();
+
+    // Task should be completed — the streaming text_end path parsed APPROVED: true
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+  });
+
   it('processQueue posts completion chatMessage on success', async () => {
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;
