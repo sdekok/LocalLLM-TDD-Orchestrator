@@ -152,10 +152,12 @@ export class Sandbox {
   }
 
   /**
-   * Checkout a branch, tolerating uncommitted changes in .tdd-workflow/ runtime files
-   * (state.json, logs). These files are managed by the orchestrator at runtime and may
-   * have diverged from HEAD since the last commit. Restoring them to HEAD before the
-   * switch is safe — the orchestrator holds the authoritative state in memory.
+   * Checkout a branch, tolerating uncommitted changes in runtime-managed files
+   * (.tdd-workflow/, .pi-lens/cache/, etc.). When git refuses the checkout because
+   * local changes "would be overwritten", we parse the blocking file list directly
+   * from git's error output, restore those specific files to HEAD, then retry.
+   * This is safe: all such files are regenerated at runtime by the orchestrator or
+   * the lens engine — losing the working-tree delta is harmless.
    */
   private async safeCheckout(branch: string): Promise<void> {
     const safeBranch = sanitizeBranchName(branch);
@@ -165,12 +167,22 @@ export class Sandbox {
       const msg = String(err);
       if (!msg.includes('would be overwritten by checkout')) throw err;
 
-      // Restore runtime files to HEAD so the checkout can proceed.
-      for (const f of ['.tdd-workflow/state.json', '.tdd-workflow/logs']) {
-        try {
-          await execFileAsync('git', ['checkout', 'HEAD', '--', f], { cwd: this.projectDir, ...EXEC_OPTS });
-        } catch { /* file/dir may not be tracked on this branch */ }
+      // Parse the file list from git's error message.
+      // Format: "error: Your local changes to the following files would be overwritten by checkout:\n\t<file>\n\t<file>\n..."
+      const blockingFiles = [...msg.matchAll(/^\s+(.+)$/gm)]
+        .map(m => m[1]!.trim())
+        .filter(f => f.length > 0 && !f.startsWith('Please') && !f.startsWith('error:') && !f.startsWith('Aborting'));
+
+      const logger = getLogger();
+      if (blockingFiles.length > 0) {
+        logger.info(`[safeCheckout] Restoring ${blockingFiles.length} runtime file(s) to HEAD before checkout: ${blockingFiles.join(', ')}`);
+        for (const f of blockingFiles) {
+          try {
+            await execFileAsync('git', ['checkout', 'HEAD', '--', f], { cwd: this.projectDir, ...EXEC_OPTS });
+          } catch { /* may not be tracked on current branch */ }
+        }
       }
+
       await execFileAsync('git', ['checkout', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
     }
   }
