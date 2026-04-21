@@ -384,6 +384,84 @@ export default function(pi: ExtensionAPI) {
     }
   });
 
+  pi.registerCommand('tdd:pause', {
+    description: 'Gracefully pause the active TDD workflow after the current agent turn. WIP branch is preserved; use /tdd:resume to continue.',
+    handler: async (_args: string, ctx) => {
+      if (!executor) {
+        ctx.ui.notify('No TDD workflow is currently running.', 'warning');
+        return;
+      }
+      if (executor.isInterrupted()) {
+        ctx.ui.notify('An interrupt is already pending. Wait for it to complete.', 'warning');
+        return;
+      }
+      executor.requestPause();
+      ctx.ui.notify('Pause requested — the workflow will stop after the current agent turn.', 'info');
+    },
+  });
+
+  pi.registerCommand('tdd:stop', {
+    description: 'Immediately stop the active TDD workflow: abort the running agent, roll back the current task, and reset it to pending. Other tasks are untouched.',
+    handler: async (_args: string, ctx) => {
+      if (!executor) {
+        ctx.ui.notify('No TDD workflow is currently running.', 'warning');
+        return;
+      }
+      executor.requestStop();
+      ctx.ui.notify('Stop requested — rolling back the current task.', 'info');
+    },
+  });
+
+  pi.registerCommand('tdd:resume', {
+    description: 'Resume a previously paused TDD workflow. Picks up paused tasks with their WIP branch + feedback intact.',
+    handler: async (_args: string, ctx) => {
+      if (!stateManager) {
+        stateManager = new StateManager(ctx.cwd);
+      }
+      if (!stateManager.hasWorkflow()) {
+        ctx.ui.notify('No workflow state found in this project. Use /tdd to start one.', 'warning');
+        return;
+      }
+      if (!stateManager.hasPausedTasks()) {
+        ctx.ui.notify('No paused tasks to resume. Use /tdd <epic> resume to retry failed tasks.', 'info');
+        return;
+      }
+
+      // Lazily construct executor with the same wiring as /tdd if it isn't already.
+      if (!executor) {
+        const modelRouter = new ModelRouter(null, ctx.cwd);
+        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+        executor = new WorkflowExecutor(stateManager, modelRouter, {
+          searchClient,
+          chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
+          waitForInput: async (prompt: string) => {
+            postToChat(`💬 ${prompt}`, 'tdd-question');
+            return await waitForChatInput();
+          },
+        });
+      }
+
+      ctx.ui.notify('Resuming paused workflow…', 'info');
+      postToChat('▶️ Resuming paused workflow…', 'tdd-progress');
+      executor.resume('skip').then(() => {
+        const summary = stateManager!.getSummary();
+        ctx.ui.setStatus('tdd', undefined);
+        if (summary.failed > 0 || summary.pending > 0 || summary.paused > 0) {
+          ctx.ui.notify(
+            `⏸ TDD paused/incomplete — ${summary.failed} failed, ${summary.paused} paused, ${summary.pending} pending, ${summary.completed} done.`,
+            'warning'
+          );
+        } else {
+          ctx.ui.notify(`🎉 TDD Epic Complete! ${summary.completed} subtasks implemented.`, 'info');
+        }
+      }).catch((err: any) => {
+        ctx.ui.setStatus('tdd', undefined);
+        cancelChatInput();
+        ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
+      });
+    },
+  });
+
   pi.registerCommand('tdd:test', {
     description: 'Run the test suite and report failing tests',
     handler: async (_args: string, ctx) => {

@@ -142,6 +142,29 @@ export class WorkflowExecutor {
   private resumeMode = false;
   /** When set, processQueue only runs the task with this ID. */
   private singleTaskId: string | null = null;
+  /**
+   * User-initiated interrupt flags. `requestPause()` / `requestStop()` set
+   * these; poll points inside processQueue check them and exit gracefully.
+   *
+   *  - pauseRequested: finish the current agent prompt, then mark the current
+   *    task `paused` (attempts + feedback preserved) and exit. Resumable via
+   *    `/tdd N resume` (or `/tdd:resume`).
+   *  - stopRequested: immediately dispose the active session to abort the
+   *    in-flight prompt, roll back the task branch to base, reset the task
+   *    to `pending` with attempts=0, and exit. The repo looks like the task
+   *    never ran.
+   *
+   * stop trumps pause: if both are set, we take the stop path.
+   */
+  private pauseRequested = false;
+  private stopRequested = false;
+  /**
+   * The currently-running implementer session (if any), exposed so that
+   * stop/pause can dispose it from outside the task loop. Assigned/cleared
+   * at session lifetime boundaries inside processQueue.
+   */
+  private activeImplementerSession: AgentSession | null = null;
+  private activeImplementerHandle: { dispose(): void } | null = null;
   public events = new EventEmitter();
 
   constructor(
@@ -155,6 +178,45 @@ export class WorkflowExecutor {
     this.searchClient = options?.searchClient || null;
     this.chatMessage = options?.chatMessage || null;
     this.waitForInput = options?.waitForInput || null;
+  }
+
+  /**
+   * Graceful interrupt: finish the current agent prompt, then mark the running
+   * task `paused` and exit the workflow. Resumable via `/tdd N resume` (or
+   * `/tdd:resume`). Idempotent — calling multiple times has no additional
+   * effect until the executor picks it up at the next poll point.
+   */
+  requestPause(): void {
+    if (this.pauseRequested || this.stopRequested) return;
+    this.pauseRequested = true;
+    getLogger().info('[EXECUTOR] Pause requested — will stop at next phase boundary');
+    this.chatMessage?.('⏸ Pause requested — finishing the current agent turn, then stopping.', 'tdd-orchestrator');
+  }
+
+  /**
+   * Immediate interrupt: dispose the active implementer session to abort its
+   * in-flight prompt, roll back the task branch, reset the task to `pending`
+   * with attempts=0 + feedback cleared, then exit the workflow. The repo ends
+   * up looking like the current task never ran.
+   */
+  requestStop(): void {
+    if (this.stopRequested) return;
+    this.stopRequested = true;
+    getLogger().info('[EXECUTOR] Stop requested — aborting active session and rolling back');
+    this.chatMessage?.('🛑 Stop requested — aborting active agent and rolling back the current task.', 'tdd-orchestrator');
+    // Force-dispose the live session so the in-flight prompt rejects quickly
+    // rather than waiting up to MAX_IMPLEMENTER_DURATION_MS for the timeout.
+    if (this.activeImplementerSession) {
+      try { this.activeImplementerHandle?.dispose(); } catch { /* best-effort */ }
+      try { this.activeImplementerSession.dispose(); } catch { /* best-effort */ }
+      // Don't null here — the catch block in processQueue does the cleanup
+      // accounting so the registry + post-error state line up.
+    }
+  }
+
+  /** Returns true if an interrupt is pending. */
+  isInterrupted(): boolean {
+    return this.pauseRequested || this.stopRequested;
   }
 
   /**
@@ -424,6 +486,16 @@ export class WorkflowExecutor {
       logger.info(`Resume check: Found ${resetInterrupted} tasks already in progress.`);
     }
 
+    // Always pick up paused tasks — they were suspended by a deliberate user
+    // action and represent WIP the user wants to continue. Unlike failed
+    // tasks, they are picked up regardless of mode.
+    const resumedPaused = this.state.resumePausedTasks();
+    if (resumedPaused > 0) {
+      // Paused tasks always run in resume mode (keep branch, preserve feedback).
+      this.resumeMode = true;
+      logger.info(`Resume check: Found ${resumedPaused} paused task(s) — continuing in resume mode`);
+    }
+
     if (mode === 'retry') {
       this.resumeMode = false;
       const resetFailed = this.state.resetFailedTasks();
@@ -432,9 +504,9 @@ export class WorkflowExecutor {
       this.resumeMode = true;
       const resumed = this.state.resumeFailedTasks();
       logger.info(`Resume mode: reset ${resumed} failed tasks (feedback preserved, branch kept)`);
-    } else {
-      this.resumeMode = false;
     }
+    // If mode === 'skip' and we already set resumeMode=true for paused tasks,
+    // keep that. Otherwise leave resumeMode=false (the constructor default).
 
     await this.processQueue();
   }
@@ -476,6 +548,11 @@ export class WorkflowExecutor {
   private async processQueue(): Promise<void> {
     const logger = getLogger();
     let consecutiveFailures = 0;
+
+    // Reset interrupt state at the start of each run. A previous run's flags
+    // could otherwise linger and immediately halt the new workflow.
+    this.pauseRequested = false;
+    this.stopRequested = false;
 
     // If a previous workflow left the repo on a tdd-workflow/* branch, switch to the
     // correct base before we do anything. If a feature branch was created for this
@@ -525,6 +602,14 @@ export class WorkflowExecutor {
     while (true) {
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         logger.error(`Circuit breaker: ${consecutiveFailures} consecutive task failures.`);
+        break;
+      }
+
+      // Outer-loop poll: if an interrupt landed between tasks, exit before
+      // starting the next one. (Interrupts mid-task are handled inside the
+      // inner loops below.)
+      if (this.stopRequested || this.pauseRequested) {
+        logger.info(`[EXECUTOR] Interrupt pending between tasks — exiting workflow`);
         break;
       }
 
@@ -656,6 +741,9 @@ export class WorkflowExecutor {
                 },
               });
               implementerHandle = this.subscribeToSession(implementerSession, `Implementer ${task.id}`, 'tdd-implementer');
+              // Expose for stop() to force-dispose from outside the task loop.
+              this.activeImplementerSession = implementerSession;
+              this.activeImplementerHandle = implementerHandle;
             }
             const handle = implementerHandle!;
 
@@ -709,6 +797,14 @@ export class WorkflowExecutor {
                 `Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes (across ${nudge + 1} prompt(s))`,
               );
 
+              // Interrupt check after each prompt returns: pause + stop both
+              // bail out of the nudge loop. Stop additionally throws (caught
+              // by the outer try/catch which handles session disposal + rollback).
+              if (this.stopRequested) {
+                throw new Error('__STOP_REQUESTED__');
+              }
+              if (this.pauseRequested) break;
+
               if (/^DONE:/im.test(handle.getTurnText())) break;
 
               if (nudge < MAX_NUDGES) {
@@ -719,6 +815,12 @@ export class WorkflowExecutor {
                 logger.warn(`[${task.id}] Implementer never signalled DONE after ${MAX_NUDGES} nudges — proceeding to quality gates anyway`);
               }
             }
+
+            // Interrupt check at the end of the implementer phase: if a pause
+            // landed during the current turn, stop here before spending budget
+            // on quality gates + reviewer.
+            if (this.stopRequested) throw new Error('__STOP_REQUESTED__');
+            if (this.pauseRequested) break;
 
             // Collect any questions the implementer wrote (outside the timeout — user
             // interaction time doesn't count against the agent's session budget).
@@ -870,6 +972,13 @@ export class WorkflowExecutor {
             });
           }
 
+          // Interrupt check before we spend reviewer budget. Stop → throw so
+          // the outer catch rolls the branch back; pause → break out cleanly
+          // (the passing commit is preserved and we'll resume into the
+          // reviewer next time).
+          if (this.stopRequested) throw new Error('__STOP_REQUESTED__');
+          if (this.pauseRequested) break;
+
           // Phase 4: Reviewing — runs for every task before merge
           {
             this.state.updateSubtask(task.id, { phase: 'reviewing' });
@@ -1007,8 +1116,13 @@ export class WorkflowExecutor {
           // NOTE: Phase 5 (Merge) is outside the attempt loops — see below.
 
         } catch (err) {
-          logger.error(`Attempt ${attempt} error: ${err}`);
-          feedback = `Runtime error: ${err}`;
+          const isStopSignal = err instanceof Error && err.message === '__STOP_REQUESTED__';
+          if (isStopSignal) {
+            logger.info(`[EXECUTOR] Stop signal caught — disposing session and rolling back ${task.id}`);
+          } else {
+            logger.error(`Attempt ${attempt} error: ${err}`);
+            feedback = `Runtime error: ${err}`;
+          }
           // Dispose the implementer session on error — the branch will be rolled back
           // so the session's in-flight context is no longer valid.
           if (implementerSession) {
@@ -1016,15 +1130,23 @@ export class WorkflowExecutor {
             try { implementerSession.dispose(); } catch { }
             implementerHandle = null;
             implementerSession = null;
+            this.activeImplementerSession = null;
+            this.activeImplementerHandle = null;
             logger.info('[EXECUTOR] Implementer session disposed after error.');
             await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
           }
           try { await this.sandbox.rollback(originalBranch); } catch { }
+          // If stop was requested, break out of the attempt loop — the outer
+          // task-level handler (after the pass loop) resets the task to pending
+          // and exits the workflow.
+          if (isStopSignal) break;
         }
           } // end inner attempt for-loop
 
           // Between pass 0 and pass 1: run the arbiter to decide what happens next.
-          if (pass === 0 && !approved) {
+          // Skip when a pause/stop interrupt is pending — the user has told us to
+          // halt the workflow, not spend more budget calling another agent.
+          if (pass === 0 && !approved && !this.stopRequested && !this.pauseRequested) {
             const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed);
             if (arbiterDecision.decision === 'approve') {
               if (lastQualityGatesPassed) {
@@ -1061,6 +1183,8 @@ export class WorkflowExecutor {
           try { implementerSession.dispose(); } catch { }
           implementerHandle = null;
           implementerSession = null;
+          this.activeImplementerSession = null;
+          this.activeImplementerHandle = null;
           logger.info('[EXECUTOR] Implementer session disposed after task completion.');
           await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
         }
@@ -1088,6 +1212,43 @@ export class WorkflowExecutor {
           this.events.emit('taskCompleted', { id: task.id, task: completedTask });
         }
         approved = true; // ensure correct path below for resuming tasks
+      }
+
+      // User interrupt handling takes priority over approved/failed bookkeeping.
+      // Both stop and pause exit the workflow; the difference is how the current
+      // task is marked and whether the branch survives.
+      if (this.stopRequested) {
+        // The catch block already disposed the session and rolled back; reset
+        // the task so the repo looks as if this run never happened.
+        this.state.updateSubtask(task.id, {
+          status: 'pending',
+          attempts: 0,
+          phase: undefined,
+          feedback: undefined,
+        });
+        this.chatMessage?.(
+          `🛑 **Stopped.** Task \`${task.id}\` was rolled back to \`${originalBranch}\`. ` +
+          `Run \`/tdd ${this.state.getState().original_request.split('\n')[0]!.substring(0, 60).trim()}\` ` +
+          `to start fresh, or \`/tdd <epic> resume\` to continue from the next pending task.`,
+          'tdd-orchestrator'
+        );
+        this.events.emit('taskStopped', { id: task.id });
+        this.postChecklistUpdate();
+        break;
+      }
+      if (this.pauseRequested) {
+        // Pause: preserve WIP. Keep the task branch intact, preserve attempts +
+        // feedback, and mark the task `paused`. Resumable via `/tdd N resume`.
+        this.state.updateSubtask(task.id, { status: 'paused', phase: undefined });
+        const epicRef = this.state.getState().original_request.split('\n')[0]!.substring(0, 60).trim();
+        this.chatMessage?.(
+          `⏸ **Paused.** Task \`${task.id}\` is at attempt ${task.attempts || 1} on branch \`${branchName}\` — WIP preserved. ` +
+          `Run \`/tdd ${epicRef} resume\` (or \`/tdd:resume\`) to continue where you left off.`,
+          'tdd-orchestrator'
+        );
+        this.events.emit('taskPaused', { id: task.id, branch: branchName });
+        this.postChecklistUpdate();
+        break;
       }
 
       if (approved) {

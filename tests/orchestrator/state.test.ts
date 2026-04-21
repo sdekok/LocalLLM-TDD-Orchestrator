@@ -213,4 +213,85 @@ describe('StateManager', () => {
     const backupFiles = files.filter(f => f.startsWith('state.json.corrupt.'));
     expect(backupFiles.length).toBeGreaterThan(0);
   });
+
+  // ─── paused status + resumePausedTasks ────────────────────────────────
+
+  describe('paused tasks', () => {
+    it('accepts "paused" as a valid task status via updateSubtask', () => {
+      tmpDir = createTmpDir();
+      const sm = new StateManager(tmpDir);
+      sm.initWorkflow('epic');
+      sm.setSubtasks([{ id: 'WI-1', description: 'Task' }]);
+      sm.updateSubtask('WI-1', { status: 'paused', attempts: 3, feedback: 'mid-implementation' });
+      expect(sm.getSubtask('WI-1')?.status).toBe('paused');
+    });
+
+    it('hasPausedTasks returns true only when at least one task is paused', () => {
+      tmpDir = createTmpDir();
+      const sm = new StateManager(tmpDir);
+      sm.initWorkflow('epic');
+      sm.setSubtasks([
+        { id: 'WI-1', description: 'a' },
+        { id: 'WI-2', description: 'b' },
+      ]);
+      expect(sm.hasPausedTasks()).toBe(false);
+      sm.updateSubtask('WI-2', { status: 'paused' });
+      expect(sm.hasPausedTasks()).toBe(true);
+    });
+
+    it('resumePausedTasks resets paused tasks to pending while preserving attempts + feedback', () => {
+      tmpDir = createTmpDir();
+      const sm = new StateManager(tmpDir);
+      sm.initWorkflow('epic');
+      sm.setSubtasks([{ id: 'WI-1', description: 'Task' }]);
+      sm.updateSubtask('WI-1', { status: 'paused', attempts: 4, feedback: 'reviewer said X' });
+
+      const resumed = sm.resumePausedTasks();
+
+      expect(resumed).toBe(1);
+      const task = sm.getSubtask('WI-1')!;
+      expect(task.status).toBe('pending');
+      expect(task.attempts).toBe(4);               // preserved
+      expect(task.feedback).toBe('reviewer said X'); // preserved
+    });
+
+    it('resumePausedTasks does not touch failed or completed tasks', () => {
+      tmpDir = createTmpDir();
+      const sm = new StateManager(tmpDir);
+      sm.initWorkflow('epic');
+      sm.setSubtasks([
+        { id: 'WI-1', description: 'a' },
+        { id: 'WI-2', description: 'b' },
+        { id: 'WI-3', description: 'c' },
+      ]);
+      sm.updateSubtask('WI-1', { status: 'paused' });
+      sm.updateSubtask('WI-2', { status: 'failed' });
+      sm.updateSubtask('WI-3', { status: 'completed' });
+
+      sm.resumePausedTasks();
+
+      expect(sm.getSubtask('WI-1')?.status).toBe('pending');
+      expect(sm.getSubtask('WI-2')?.status).toBe('failed');
+      expect(sm.getSubtask('WI-3')?.status).toBe('completed');
+    });
+
+    it('getSummary reports paused count separately from pending/failed', () => {
+      tmpDir = createTmpDir();
+      const sm = new StateManager(tmpDir);
+      sm.initWorkflow('epic');
+      sm.setSubtasks([
+        { id: 'WI-1', description: 'a' },
+        { id: 'WI-2', description: 'b' },
+        { id: 'WI-3', description: 'c' },
+      ]);
+      sm.updateSubtask('WI-1', { status: 'paused' });
+      sm.updateSubtask('WI-2', { status: 'failed' });
+      // WI-3 left as pending
+      const s = sm.getSummary();
+      expect(s.paused).toBe(1);
+      expect(s.failed).toBe(1);
+      expect(s.pending).toBe(1);
+      expect(s.total).toBe(3);
+    });
+  });
 });

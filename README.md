@@ -70,8 +70,13 @@ Inside any project, use the slash commands:
 - **Setup**: `/setup` — configure model routing interactively
 - **Plan**: `/plan "Build a secure login system"` — decomposes into Epics/WorkItems
 - **Implement**: `/tdd 1` — loads Epic 1 from `WorkItems/` and executes
-- **Resume**: `/tdd 1 retry` — retry failed tasks and continue; `/tdd 1 continue` — skip failed and continue
+- **Resume from failure**: `/tdd 1 retry` — retry failed tasks from scratch; `/tdd 1 resume` — retry with reviewer feedback preserved; `/tdd 1 continue` — skip failed and continue
+- **Pause/Stop/Resume** _(mid-workflow)_:
+  - `/tdd:pause` — finish the current agent turn, then halt. WIP branch + feedback + attempts are preserved.
+  - `/tdd:stop` — abort the running agent immediately, roll back the current task, reset it to pending. Repo looks like the task never ran.
+  - `/tdd:resume` — pick up from a paused workflow.
 - **Cleanup**: `/tdd:project-cleanup` — scan all quality gates, then run a TDD workflow to fix every pre-existing failure
+- **Run tests**: `/tdd:test` — run the project's test suite and report failures
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
 - **Analyze**: `/analyze` — architectural blueprinting
 
@@ -170,6 +175,23 @@ Timeouts are enforced independently per agent via `Promise.race`. When a task ex
 - **Escalate** — posts the situation to Pi chat and waits for you to reply with `approve`, `continue 1–3`, or `stop`
 
 When a task ultimately fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+
+## Pausing and Stopping a Workflow
+
+The orchestrator runs in the background once `/tdd` is invoked, but you can interrupt it from chat at any time:
+
+| Action | What it does | Current task ends up as | Branch | Feedback / attempts |
+|---|---|---|---|---|
+| `/tdd:pause` | Finishes the current agent turn, then halts the workflow. | `paused` | preserved | preserved |
+| `/tdd:stop` | Aborts the running agent immediately, rolls back the task branch to base. | `pending` (reset) | rolled back | cleared |
+| `/tdd:resume` | Resumes a paused workflow — picks up the paused task with its WIP branch + feedback intact. | `pending` → runs to completion | reused | preserved |
+
+**When to use which:**
+
+- **Pause** when you need to step away, reboot, or context-switch, and want to continue later right where the agent was. The task's progress and reviewer feedback are kept.
+- **Stop** when you realise the current task is going nowhere and you want a clean slate — e.g. the planner mis-scoped the work, or you want to hand-edit and re-plan. Other tasks in the epic are untouched.
+
+`/tdd:resume` picks up any `paused` tasks automatically. You can also use the existing `/tdd N resume` / `/tdd N retry` / `/tdd N continue` subcommands — they work alongside pause/stop.
 
 ## Project Cleanup
 

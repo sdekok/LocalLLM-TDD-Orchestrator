@@ -55,7 +55,7 @@ Configures model routing for all agent roles.
 
 If both a global and project config exist they are **merged** — the project config wins on any conflict, so you only need to declare what differs from your global defaults.
 
-### `/tdd <request | id> [retry | continue]`
+### `/tdd <request | id> [retry | resume | continue | task <id>]`
 
 Starts or resumes a TDD workflow.
 
@@ -66,26 +66,52 @@ Starts or resumes a TDD workflow.
 
 The system parses **Acceptance Criteria**, **Security requirements**, and **Test suggestions** from the epic file and injects them into the implementer's system prompt. Before implementation begins, each work item is refined into granular technical steps by a planning pass, and the breakdown is posted to chat.
 
-**Failure & resume:**
+**Failure & resume subcommands:**
 
-When any task exhausts all 3 attempts, the workflow **stops immediately** and posts a chat message:
+When any task exhausts its attempts (5 by default), the workflow **stops immediately** and posts a chat message with the branch name, state file location, and next-step commands. The failed branch is preserved exactly as the agent left it — nothing is cleaned up — so you can inspect, fix manually, or hand it to another agent.
 
-```
-❌ WI-1 failed after 3 attempts: Set up the Nx library scaffold
-
-Feedback: quality gates failed — tsc errors in project.json ...
-
-Inspect: branch `tdd-workflow/WI-1` · State: `.tdd-workflow/state.json` · Logs: `.tdd-workflow/logs/`
-
-Next step: `/tdd 1 retry` to retry failed tasks, or `/tdd 1 continue` to skip and proceed.
-```
-
-The failed branch is preserved exactly as the agent left it — nothing is cleaned up — so you can inspect, fix manually, or hand it to another agent.
-
-- `/tdd 1 retry` — resets all failed tasks to pending and resumes from the beginning of the queue
-- `/tdd 1 continue` — leaves failed tasks as-is and resumes from the next pending task
+- `/tdd 1 resume` — retry failed tasks with reviewer feedback **preserved** _(recommended)_
+- `/tdd 1 retry` — retry failed tasks from a clean slate (feedback cleared)
+- `/tdd 1 continue` — leave failed tasks as-is and resume from the next pending task
+- `/tdd 1 task WI-36` — run a single task (retry mode, feedback cleared)
+- `/tdd 1 task WI-36 resume` — run a single task (resume mode, feedback preserved)
 
 > **Note**: `/tdd 1` (no subcommand) always starts fresh, resetting state for that epic.
+
+### `/tdd:pause`, `/tdd:stop`, `/tdd:resume`
+
+Interrupt a running TDD workflow from chat — no need to kill Pi.
+
+**`/tdd:pause`** — graceful stop, designed to be resumed.
+
+- Lets the current agent turn finish naturally (typically seconds-to-minutes, not the full timeout).
+- Marks the currently-running task as `paused`. Other tasks stay `pending`.
+- **Preserves everything**: the WIP branch, the attempt counter, and any reviewer feedback already accumulated.
+- Use when you need to step away, restart, or context-switch and want to continue exactly where the agent was.
+
+**`/tdd:stop`** — immediate abort, repo returns to clean state.
+
+- Force-disposes the active agent session (no waiting for the model to finish its turn).
+- Rolls the repo back to the base branch.
+- Resets the current task to `pending` with attempts=0 and feedback cleared — the repo looks like the task never ran.
+- Other tasks in the epic are untouched.
+- Use when the current task is going nowhere and you want a clean slate — e.g. the planner mis-scoped the work, or you want to re-plan by hand.
+
+**`/tdd:resume`** — pick up a paused workflow.
+
+- Scans state for `paused` tasks and resumes them in resume mode (branch reused, feedback preserved, attempt counter preserved).
+- If there are no paused tasks, the command is a no-op with a friendly notice. Use `/tdd N resume` instead for failed tasks.
+
+**Pause vs stop — quick reference:**
+
+| | `/tdd:pause` | `/tdd:stop` |
+|---|---|---|
+| Current agent turn | finishes naturally | aborted immediately |
+| Current task status | `paused` | `pending` (reset) |
+| Task branch | preserved | rolled back |
+| Attempt counter | preserved | reset to 0 |
+| Reviewer feedback | preserved | cleared |
+| How to continue | `/tdd:resume` | `/tdd N` (fresh) or `/tdd N resume` (next pending) |
 
 ### `/plan <request>`
 
@@ -191,10 +217,12 @@ Add `tddConfig` to your `package.json` to enforce blocking coverage gates:
 ## Safety & Controls
 
 - **Git Sandboxing**: Every subtask runs in its own branch (`tdd-workflow/WI-N`). No code is merged unless all deterministic gates pass.
-- **Stop on failure**: Any task that exhausts all 3 attempts stops the workflow immediately. You must explicitly resume with `/tdd <n> retry` or `/tdd <n> continue`. The WIP branch is preserved for inspection.
+- **Stop on failure**: Any task that exhausts all its attempts stops the workflow immediately. You must explicitly resume with `/tdd <n> retry`, `/tdd <n> resume`, or `/tdd <n> continue`. The WIP branch is preserved for inspection.
+- **User interrupt**: `/tdd:pause` and `/tdd:stop` let you halt an active workflow from chat without killing Pi. Pause preserves the WIP for later; stop rolls the current task back.
 - **No destructive cleanup**: Rollback only switches back to the original branch. The sandbox branch is never deleted or cleaned automatically — you decide what to do with it.
 - **Circuit Breaker**: If 3 consecutive subtasks fail completely (retries exhausted), the entire workflow stops.
 - **Loop Detection**: If an agent produces nearly identical changes (>90% similarity) across attempts, the system bails early and flags the task for manual intervention.
+- **Shutdown cleanup**: When Pi exits (Ctrl-C, SIGTERM, unhandled error), any live sub-agent sessions are disposed before the process terminates — prevents llama.cpp slots from being left occupied.
 
 ## Troubleshooting
 
@@ -210,5 +238,8 @@ Add `tddConfig` to your `package.json` to enforce blocking coverage gates:
 | Workflow failed, unclear why | Search `.tdd-workflow/logs/` for the workflow ID shown at startup |
 | Task failed, want to retry | Run `/tdd <epic> retry` — resets failed tasks and resumes |
 | Task failed, want to skip it | Run `/tdd <epic> continue` — skips failed tasks and proceeds |
+| Need to step away mid-workflow | Run `/tdd:pause`, then `/tdd:resume` later — WIP branch and feedback are kept |
+| Current task is going nowhere | Run `/tdd:stop` — rolls the task back to base so you can re-plan or edit by hand |
+| `/tdd:resume` says "no paused tasks" | Your task failed rather than being paused — use `/tdd <epic> resume` instead |
 | Wrong epic files after /plan | Re-run `/plan` — each epic now gets a fresh session, preventing cross-contamination from prior epics' JSON |
 | Quality gates crash (lens-bridge) | Run `npm run build` in the plugin directory to ensure `dist/interfaces/pi/lens-bridge.js` is present |

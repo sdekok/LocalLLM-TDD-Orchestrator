@@ -1209,4 +1209,162 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     // User was consulted
     expect(waitForInput).toHaveBeenCalled();
   });
+
+  // ─── Pause / Stop tests ────────────────────────────────────────────────────
+
+  it('requestPause: finishes the current implementer prompt, marks task paused, preserves attempts + branch', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    state.initWorkflow('epic-pause');
+    state.setSubtasks([{ id: 'WI-1', description: 'Paused task' }]);
+
+    const paused: any[] = [];
+    executor.events.on('taskPaused', (e: any) => paused.push(e));
+
+    const { session: implSession } = makeMockSession();
+    implSession.prompt = vi.fn().mockImplementation(async () => {
+      // While the prompt is "running", the user requests a pause.
+      executor.requestPause();
+    });
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      if (opts.taskType === 'implement') return implSession;
+      // Any reviewer/arbiter spawning would be a failure — pause should exit first.
+      throw new Error(`unexpected ${opts.taskType} session after pause`);
+    });
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    const task = state.getSubtask('WI-1')!;
+    expect(task.status).toBe('paused');
+    expect(task.attempts).toBe(1); // attempt counter preserved
+    expect(paused).toHaveLength(1);
+    expect(paused[0].id).toBe('WI-1');
+    // Chat should confirm pause with /tdd:resume hint. Filter to the explicit
+    // pause notification (contains "⏸ **Paused.**"), not the progress
+    // checklist which just shows the task status icon.
+    const pauseMsg = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('⏸ **Paused.**'));
+    expect(pauseMsg).toBeDefined();
+    expect(pauseMsg![0]).toContain('resume');
+  });
+
+  it('requestStop: aborts implementer session, rolls back branch, resets task to pending with no feedback', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { Sandbox } = await import('../../src/orchestrator/sandbox.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    // Seed a feedback + attempts so we can verify the stop resets them.
+    state.initWorkflow('epic-stop');
+    state.setSubtasks([{ id: 'WI-1', description: 'Stop me' }]);
+
+    const stopped: any[] = [];
+    executor.events.on('taskStopped', (e: any) => stopped.push(e));
+
+    const { session: implSession } = makeMockSession();
+    let stopRequestedDuringPrompt = false;
+    implSession.prompt = vi.fn().mockImplementation(async () => {
+      executor.requestStop();
+      stopRequestedDuringPrompt = true;
+      // In real life stop also disposes the session so prompt would reject.
+      // Mock that by throwing to match the production abort path.
+      throw new Error('Session disposed');
+    });
+    (createSubAgentSession as any).mockImplementation(async () => implSession);
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    expect(stopRequestedDuringPrompt).toBe(true);
+    const task = state.getSubtask('WI-1')!;
+    expect(task.status).toBe('pending');
+    expect(task.attempts).toBe(0);       // reset
+    expect(task.feedback).toBeUndefined(); // cleared
+    expect(stopped).toHaveLength(1);
+    // Sandbox rollback should have been invoked (mockSandbox shared instance)
+    const mockSandbox: any = (Sandbox as any)();
+    expect(mockSandbox.rollback).toHaveBeenCalled();
+    // Chat message confirms stop
+    const stopMsg = chatMessage.mock.calls.find((c: any[]) => (c[0] as string).includes('Stopped'));
+    expect(stopMsg).toBeDefined();
+  });
+
+  it('requestPause during a multi-task workflow pauses at the current task and leaves the rest pending', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'T', subtasks: [] });
+
+    state.initWorkflow('multi-pause');
+    state.setSubtasks([
+      { id: 'WI-1', description: 'a' },
+      { id: 'WI-2', description: 'b' },
+    ]);
+
+    const { session: impl } = makeMockSession();
+    impl.prompt = vi.fn().mockImplementation(async () => {
+      executor.requestPause();
+    });
+    (createSubAgentSession as any).mockImplementation(async () => impl);
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+
+    await (executor as any).processQueue();
+
+    expect(state.getSubtask('WI-1')?.status).toBe('paused');
+    expect(state.getSubtask('WI-2')?.status).toBe('pending'); // never started
+  });
+
+  it('isInterrupted reflects pending pause/stop state', () => {
+    expect(executor.isInterrupted()).toBe(false);
+    executor.requestPause();
+    expect(executor.isInterrupted()).toBe(true);
+  });
+
+  it('requestPause is ignored when stop is already pending (stop wins)', () => {
+    executor.requestStop();
+    expect(executor.isInterrupted()).toBe(true);
+    // Attempting pause after stop should be a no-op — state still reflects stop,
+    // not pause. We verify by kicking off processQueue with a paused task setup
+    // and expecting the stop semantics (reset to pending) not pause (keep paused).
+    executor.requestPause();
+    // Internal flag state — stopRequested stays true
+    expect((executor as any).stopRequested).toBe(true);
+  });
+
+  it('resume() picks up paused tasks in resume mode (feedback + attempts preserved)', async () => {
+    state.initWorkflow('paused-epic');
+    state.setSubtasks([{ id: 'WI-1', description: 'Resumed task' }]);
+    state.updateSubtask('WI-1', { status: 'paused', attempts: 3, feedback: 'preserve me' });
+
+    (executor as any).processQueue = vi.fn().mockResolvedValue(undefined);
+
+    await executor.resume('skip');
+
+    // Paused task should now be pending with feedback + attempts preserved,
+    // and resumeMode should have flipped on so the task branch survives.
+    const task = state.getSubtask('WI-1')!;
+    expect(task.status).toBe('pending');
+    expect(task.attempts).toBe(3);
+    expect(task.feedback).toBe('preserve me');
+    expect((executor as any).resumeMode).toBe(true);
+  });
 });

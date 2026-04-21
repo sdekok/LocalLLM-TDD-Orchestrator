@@ -3,7 +3,7 @@ import * as path from 'path';
 import { randomBytes } from 'crypto';
 import { getLogger } from '../utils/logger.js';
 
-export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed';
+export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused';
 
 export type TaskPhase = 'refining' | 'implementing' | 'quality_gates' | 'reviewing' | 'merging';
 
@@ -207,11 +207,34 @@ export class StateManager {
     return count;
   }
 
+  /**
+   * Reset `paused` tasks to `pending` so processQueue picks them up again.
+   * Feedback and attempt counter are preserved — the task picks up where it
+   * left off (unlike `stop`, which resets attempts and clears feedback).
+   */
+  resumePausedTasks(): number {
+    let count = 0;
+    for (const task of this.state.subtasks) {
+      if (task.status === 'paused') {
+        task.status = 'pending';
+        // attempts + feedback intentionally preserved — pause is designed to resume
+        count++;
+      }
+    }
+    if (count > 0) this.saveState();
+    return count;
+  }
+
+  /** Returns true if any task is currently in the `paused` state. */
+  hasPausedTasks(): boolean {
+    return this.state.subtasks.some(t => t.status === 'paused');
+  }
+
   hasWorkflow(): boolean {
     return this.state.subtasks.length > 0;
   }
 
-  getSummary(): { total: number; pending: number; completed: number; failed: number; inProgress: number } {
+  getSummary(): { total: number; pending: number; completed: number; failed: number; inProgress: number; paused: number } {
     const subtasks = this.state.subtasks;
     return {
       total: subtasks.length,
@@ -219,6 +242,7 @@ export class StateManager {
       completed: subtasks.filter((t) => t.status === 'completed').length,
       failed: subtasks.filter((t) => t.status === 'failed').length,
       inProgress: subtasks.filter((t) => t.status === 'in_progress').length,
+      paused: subtasks.filter((t) => t.status === 'paused').length,
     };
   }
 }
