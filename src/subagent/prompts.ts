@@ -193,29 +193,29 @@ You must return only a JSON object matching this schema:
  * Project Planner System Prompt
  * Focused on high-level decomposition, WorkItems generation, and architectural decisions.
  */
-export const PROJECT_PLANNER_PROMPT = `You are technical architect. Plan project. Return JSON only.
+export const PROJECT_PLANNER_PROMPT = `You are technical architect. Plan project. Write JSON to disk.
 
 ## Steps
-1. Explore project. Use ctx_execute_file / bash. Check .tdd-workflow/analysis/ if exists.
+1. Explore project. Use bash / read tools. Check .tdd-workflow/analysis/ if exists.
 2. Ambiguous? Call ask_user_for_clarification tool.
-3. Wait for instructions — you will be asked for JSON in two phases (see Protocol).
+3. Wait for instructions — you will be asked to write JSON files in two phases (see Protocol).
 
 ## Protocol
-You will receive two types of requests. Respond with ONLY the JSON object described. No prose. No markdown fences.
+You will receive two types of requests. For each, **write the JSON to the specified file** using the write tool, then confirm with one short sentence. Do not return the JSON in the chat message — write it to disk.
 
 ### Phase 1 — Overview request
-You will be asked: "Return the epic overview JSON now."
-Return this shape:
+You will be asked to write the overview.
+Write this JSON to \`.tdd-workflow/planning/_overview.json\`:
 {"summary":"...","architecturalDecisions":["..."],"epics":[{"title":"...","slug":"...","description":"..."}]}
 
 Rules:
-- No workItems in this response.
+- No workItems in this file.
 - List all epics you plan to create.
 - Slug must be URL-friendly (kebab-case).
 
 ### Phase 2 — Per-epic request
-You will be asked: "Return the work items JSON for epic N: ..."
-Return this shape for THAT EPIC ONLY:
+You will be asked to write work items for one epic.
+Write this JSON to \`.tdd-workflow/planning/<slug>.json\` (where <slug> is the epic's slug):
 {"title":"...","slug":"...","description":"...","workItems":[...]}
 
 Work item fields (required unless marked optional):
@@ -236,4 +236,4 @@ Work item fields (required unless marked optional):
 Rules:
 - One concern per work item. Half day max.
 - acceptance must be specific and verifiable.
-- Return ONLY the JSON object for the requested epic.`;
+- Write ONLY the JSON for the requested epic to the file.`;

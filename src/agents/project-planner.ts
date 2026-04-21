@@ -4,7 +4,7 @@ import { ModelRouter } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { type ProjectPlan, type EpicOverview, type Epic } from './project-plan-schema.js';
 import { generatePlanMarkdown, formatWorkItemMarkdown } from './components/markdown-generator.js';
-import { extractPlanFromResponse, extractEpicOverview, extractSingleEpic } from './components/response-extractor.js';
+import { extractPlanFromResponse, extractEpicOverview, extractSingleEpic, TruncatedJsonError } from './components/response-extractor.js';
 export { generatePlanMarkdown };
 export { extractPlanFromResponse } from './components/response-extractor.js';
 import * as fs from 'fs';
@@ -99,6 +99,9 @@ export async function planProject(
   try {
     // ── Shared helpers ────────────────────────────────────────────────────────
 
+    const planningDir = path.join(cwd, '.tdd-workflow', 'planning');
+    fs.mkdirSync(planningDir, { recursive: true });
+
     const extractText = (msg: any): string => {
       if (typeof msg.content === 'string') return msg.content;
       if (!Array.isArray(msg.content)) return '';
@@ -145,9 +148,13 @@ export async function planProject(
       return null;
     };
 
-    /** Send a prompt, scan for T, retry once with schema hint if missing. */
-    const promptAndFind = async <T>(
+    /**
+     * Send a prompt, read JSON from `filePath` first (agent wrote it with write tool),
+     * fall back to message scanning, retry once with schema hint if still missing.
+     */
+    const promptAndReadFile = async <T>(
       promptText: string,
+      filePath: string,
       extractor: (text: string) => T,
       schemaHint: string,
       dumpLabel: string,
@@ -157,14 +164,33 @@ export async function planProject(
       logger.info(`[PLANNER] ${dumpLabel} completed in ${Date.now() - start}ms`);
       dumpSessionMessages(dumpLabel);
 
+      // Primary: read from disk (agent wrote the file)
+      if (fs.existsSync(filePath)) {
+        try {
+          return extractor(fs.readFileSync(filePath, 'utf-8'));
+        } catch (err) {
+          logger.warn(`[PLANNER] File ${filePath} schema validation failed: ${(err as Error).message} — falling back to message scan`);
+        }
+      } else {
+        logger.info(`[PLANNER] ${filePath} not written — falling back to message scan`);
+      }
+
+      // Fallback: scan assistant messages
       let result = findInMessages(session.messages, extractor);
       if (!result) {
-        logger.info(`[PLANNER] No JSON found after ${dumpLabel} — retrying.`);
+        logger.info(`[PLANNER] No JSON found after ${dumpLabel} — asking agent to write file.`);
         await session.prompt(
-          `Your response did not contain valid JSON. ` +
-          `Reply with ONLY a JSON object matching this shape:\n${schemaHint}`
+          `You did not write the JSON file. Write it now to \`${filePath}\` using the write tool. ` +
+          `The JSON must match this shape:\n${schemaHint}`
         );
         dumpSessionMessages(`${dumpLabel}-retry`);
+        if (fs.existsSync(filePath)) {
+          try {
+            return extractor(fs.readFileSync(filePath, 'utf-8'));
+          } catch (err) {
+            logger.warn(`[PLANNER] Retry file ${filePath} schema validation failed: ${(err as Error).message}`);
+          }
+        }
         result = findInMessages(session.messages, extractor);
         if (!result) {
           throw new Error(`No valid JSON found after retry for: ${dumpLabel}`);
@@ -176,9 +202,11 @@ export async function planProject(
     // ── Phase 1: Epic overview ────────────────────────────────────────────────
 
     const OVERVIEW_HINT = `{"summary":"...","architecturalDecisions":["..."],"epics":[{"title":"...","slug":"...","description":"..."}]}`;
+    const overviewFile = path.join(planningDir, '_overview.json');
 
-    const overview: EpicOverview = await promptAndFind(
-      `${request}\n\nReturn the epic overview JSON now. No work items yet — just the epic list.`,
+    const overview: EpicOverview = await promptAndReadFile(
+      `${request}\n\nWrite the epic overview JSON to \`.tdd-workflow/planning/_overview.json\` now. No work items yet — just the epic list.`,
+      overviewFile,
       extractEpicOverview,
       OVERVIEW_HINT,
       'phase1-overview',
@@ -261,13 +289,23 @@ export async function planProject(
         return msg.content.filter((c: any) => c.type === 'text').map((c: any) => c.text as string).join('\n').trim();
       };
 
-      const findInEpicMessages = <T>(msgs: any[], extractor: (text: string) => T): T | null => {
+      const epicFile = path.join(planningDir, `${epicStub.slug}.json`);
+
+      // Scan messages for a valid Epic — surfaces TruncatedJsonError, logs last failure.
+      const findEpicInMessages = (msgs: any[]): Epic | null => {
         const assistantMsgs = [...msgs].filter(m => m.role === 'assistant').reverse();
+        let lastErr: unknown = null;
         for (const msg of assistantMsgs) {
           const text = epicExtractText(msg);
           if (!text) continue;
-          try { return extractor(text); } catch { /* not this message */ }
+          try {
+            return extractSingleEpic(text);
+          } catch (err) {
+            if (err instanceof TruncatedJsonError) throw err;
+            lastErr = err;
+          }
         }
+        if (lastErr) logger.info(`[PLANNER] extractSingleEpic last error: ${(lastErr as Error).message}`);
         return null;
       };
 
@@ -275,20 +313,54 @@ export async function planProject(
       try {
         const prompt =
           `${overviewContext}\n\n` +
-          `Now return the work items JSON for epic ${i + 1}: "${epicStub.title}" (slug: "${epicStub.slug}").\n` +
-          `THIS EPIC ONLY. Return ALL work item fields. No prose, no code fences — pure JSON object.`;
+          `Write the work items JSON for epic ${i + 1}: "${epicStub.title}" (slug: "${epicStub.slug}") ` +
+          `to \`.tdd-workflow/planning/${epicStub.slug}.json\` using the write tool. ` +
+          `THIS EPIC ONLY. Include ALL work item fields.`;
 
         await epicSession.prompt(prompt);
         dumpSessionMessages(`phase2-epic-${epicStub.slug}`);
 
-        let result = findInEpicMessages(epicSession.messages, extractSingleEpic);
+        // Primary: read from disk
+        let result: Epic | null = null;
+        if (fs.existsSync(epicFile)) {
+          try {
+            result = extractSingleEpic(fs.readFileSync(epicFile, 'utf-8'));
+          } catch (err) {
+            logger.warn(`[PLANNER] Epic file ${epicFile} schema validation failed: ${(err as Error).message} — falling back to message scan`);
+          }
+        } else {
+          logger.info(`[PLANNER] ${epicFile} not written — falling back to message scan`);
+        }
+
+        // Fallback: scan messages
         if (!result) {
-          logger.info(`[PLANNER] No JSON found for epic ${epicStub.slug} — retrying.`);
+          try {
+            result = findEpicInMessages(epicSession.messages);
+          } catch (truncErr) {
+            if (truncErr instanceof TruncatedJsonError) {
+              logger.info(`[PLANNER] Truncated JSON for epic ${epicStub.slug} — asking agent to write file.`);
+            }
+          }
+        }
+
+        if (!result) {
+          logger.info(`[PLANNER] No JSON found for epic ${epicStub.slug} — asking agent to write file.`);
           await epicSession.prompt(
-            `Your response did not contain valid JSON. Reply with ONLY a JSON object matching this shape:\n${EPIC_HINT}`
+            `You did not write the JSON file. Write the work items for epic "${epicStub.title}" ` +
+            `to \`.tdd-workflow/planning/${epicStub.slug}.json\` now using the write tool. ` +
+            `JSON shape:\n${EPIC_HINT}`
           );
           dumpSessionMessages(`phase2-epic-${epicStub.slug}-retry`);
-          result = findInEpicMessages(epicSession.messages, extractSingleEpic);
+          if (fs.existsSync(epicFile)) {
+            try {
+              result = extractSingleEpic(fs.readFileSync(epicFile, 'utf-8'));
+            } catch (err) {
+              logger.warn(`[PLANNER] Retry epic file schema validation failed: ${(err as Error).message}`);
+            }
+          }
+          if (!result) {
+            try { result = findEpicInMessages(epicSession.messages); } catch { /* ignore */ }
+          }
           if (!result) throw new Error(`No valid JSON found for epic: ${epicStub.slug}`);
         }
         epic = result;
