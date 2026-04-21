@@ -90,9 +90,14 @@ export class Sandbox {
         }
       }
 
-      // Default: delete and recreate from current HEAD so the implementer always
+      // Default: delete and recreate from baseBranch so the implementer always
       // starts from the latest merged code (prevents stale-base merge conflicts).
-      logger.info(`Branch ${safeBranch} already exists — recreating from current HEAD`);
+      // Must checkout baseBranch first — `git branch -D` fails if we are currently
+      // on the branch being deleted (e.g. after a reviewer rejection with no rollback).
+      if (options?.baseBranch) {
+        await this.safeCheckout(sanitizeBranchName(options.baseBranch));
+      }
+      logger.info(`Branch ${safeBranch} already exists — recreating from ${options?.baseBranch ?? 'current HEAD'}`);
       try {
         await execFileAsync('git', ['branch', '-D', safeBranch], { cwd: this.projectDir, ...EXEC_OPTS });
       } catch { /* branch may have been deleted already */ }
@@ -166,6 +171,19 @@ export class Sandbox {
     fs.writeFileSync(msgFile, fullMessage, 'utf-8');
     try {
       await execFileAsync('git', ['add', '-A'], { cwd: this.projectDir, ...EXEC_OPTS });
+
+      // Check whether there is actually anything to commit before running git commit.
+      // This is more reliable than parsing git commit's error output, which can vary
+      // across git versions and may be prefixed with tool output (e.g. NX separators)
+      // that breaks simple string-includes checks.
+      const { stdout: porcelain } = await execFileAsync(
+        'git', ['status', '--porcelain'], { cwd: this.projectDir, ...EXEC_OPTS }
+      );
+      if (!porcelain.trim()) {
+        getLogger().info('[Sandbox] Skipping metadata commit — working tree already clean (implementer committed directly).');
+        return;
+      }
+
       await execFileAsync('git', ['commit', '-F', msgFile], { cwd: this.projectDir, ...EXEC_OPTS });
     } finally {
       if (fs.existsSync(msgFile)) fs.unlinkSync(msgFile);
@@ -228,13 +246,25 @@ export class Sandbox {
    * A previous workflow that failed mid-flight may have left the repo on a task branch.
    * Treating that branch as the "original" would cause the next workflow's merges to
    * target the wrong branch. Returns the resolved base branch name.
+   *
+   * If featureBranch is provided and the repo is on a task branch, the feature branch is
+   * used as the target instead of looking up the repo's default base branch. This ensures
+   * that on resume, task branches still merge into the feature branch rather than main.
    */
-  async ensureOnBaseBranch(): Promise<string> {
+  async ensureOnBaseBranch(featureBranch?: string): Promise<string> {
     const logger = getLogger();
     const current = await this.getCurrentBranch();
     if (!current.startsWith('tdd-workflow/')) return current;
 
     logger.warn(`[Sandbox] Repo is on task branch "${current}" — locating base branch before starting workflow`);
+
+    // If a feature branch was created for this workflow, return to it rather than
+    // the repo default — task branches must still merge into the feature branch.
+    if (featureBranch) {
+      await this.safeCheckout(featureBranch);
+      logger.info(`[Sandbox] Switched from task branch "${current}" to feature branch "${featureBranch}"`);
+      return featureBranch;
+    }
 
     // Prefer the remote's default branch; fall back through common names.
     let baseBranch = 'main';

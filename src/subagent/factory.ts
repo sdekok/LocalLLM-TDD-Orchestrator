@@ -96,6 +96,8 @@ export interface SubAgentOptions {
     security?: string;
     tests?: string[];
     devNotes?: string;
+    testCommand?: string;
+    packageManager?: string;
   };
   tools?: 'coding' | 'review' | 'readonly' | 'none';
   // Optional: UI context for interactive tools (e.g., ask_user_for_clarification)
@@ -125,10 +127,12 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   // Populate task metadata placeholders from Epic/WorkItem context
   const meta = options.taskMetadata;
   const populatedPrompt = finalPrompt
-    .replace('{acceptance}', meta?.acceptance?.length ? meta.acceptance.map(a => `- ${a}`).join('\n') : 'None specified')
-    .replace('{security}', meta?.security || 'None specified')
-    .replace('{tests}', meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
-    .replace('{devNotes}', meta?.devNotes || 'None specified');
+    .replace(/{acceptance}/g, meta?.acceptance?.length ? meta.acceptance.map(a => `- ${a}`).join('\n') : 'None specified')
+    .replace(/{security}/g, meta?.security || 'None specified')
+    .replace(/{tests}/g, meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
+    .replace(/{devNotes}/g, meta?.devNotes || 'None specified')
+    .replace(/{testCommand}/g, meta?.testCommand || 'npm test')
+    .replace(/{packageManager}/g, meta?.packageManager || 'npm');
 
   const targetModelId = profile.modelId || profile.ggufFilename;
   logger.info(`Spawning sub-agent [${options.taskType}] with target model: ${targetModelId}`);

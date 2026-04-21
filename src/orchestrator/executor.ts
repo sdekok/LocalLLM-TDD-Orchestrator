@@ -1,22 +1,61 @@
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, formatGateFailures } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, formatGateFailures } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
 import { EpicLoader, EpicPlan } from './epic-loader.js';
-import { createSubAgentSession } from '../subagent/factory.js';
+import { createSubAgentSession, type SubAgentOptions } from '../subagent/factory.js';
+import type { AgentSession } from '@mariozechner/pi-coding-agent';
 import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT, ARBITER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
-import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
+import { execFileAsync, DEFAULT_MAX_BUFFER, sanitizeBranchName } from '../utils/exec.js';
+import { getTestCommand, detectPackageManager } from './test-runner.js';
+
+/**
+ * Derive a short, stable, git-safe slug from an original workflow request.
+ *
+ * - Numeric/epic-ref requests ("1", "01", "epic-3") → "ep01", "ep03" etc.
+ * - All other requests → 6-char hex hash of the request string.
+ *
+ * The slug is used as a namespace within the tdd-workflow/* branch hierarchy
+ * so branches from different epics/workflows never collide.
+ */
+function workflowSlug(originalRequest: string): string {
+  const trimmed = originalRequest.trim();
+  const epicRefMatch = trimmed.match(/^(?:epic[-\s]*)?(\d{1,3})$/i);
+  if (epicRefMatch) {
+    return `ep${epicRefMatch[1]!.padStart(2, '0')}`;
+  }
+  return createHash('sha1').update(trimmed).digest('hex').substring(0, 6);
+}
+
+/**
+ * Derive a feature branch name from a workflow's slug and refined title.
+ * e.g. "ep01" + "Design Tokens & Theme System" → "feature/ep01-design-tokens-theme-system"
+ */
+function buildFeatureBranchName(originalRequest: string, refinedRequest: string): string {
+  const slug = workflowSlug(originalRequest);
+  const titleSlug = (refinedRequest || originalRequest)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 40);
+  return `feature/${slug}-${titleSlug}`.replace(/-+/g, '-').replace(/-$/, '');
+}
 
 export interface ExecutorOptions {
   searchClient?: SearchClient | null;
-  /** Optional callback to post messages into the Pi chat history. */
-  chatMessage?: (content: string) => void;
+  /**
+   * Optional callback to post messages into the Pi chat history.
+   * `type` is a custom message type (e.g. 'tdd-orchestrator', 'tdd-implementer') that
+   * the UI can use to render different agent sources with distinct headings.
+   */
+  chatMessage?: (content: string, type?: string) => void;
   /**
    * Optional callback to ask the user a question and await their reply.
    * Used when an agent writes questions to .tdd-workflow/questions.md.
@@ -28,7 +67,7 @@ export interface ExecutorOptions {
 }
 
 const MAX_ATTEMPTS = 5;
-const MAX_ARBITER_EXTRA_ROUNDS = 3;            // Max extra rounds the arbiter may grant
+const MAX_ARBITER_EXTRA_ROUNDS = 10;           // Max extra rounds the arbiter may grant
 const MAX_IMPLEMENTER_DURATION_MS = 60 * 60 * 1000;  // 60 minutes for the implementer
 const MAX_REVIEWER_DURATION_MS    = 60 * 60 * 1000;  // 60 minutes for the reviewer
 const MAX_ARBITER_DURATION_MS     = 20 * 60 * 1000;  // 20 minutes for the arbiter
@@ -78,10 +117,12 @@ export class WorkflowExecutor {
   private modelRouter: ModelRouter;
   private sandbox: Sandbox;
   private searchClient: SearchClient | null;
-  private chatMessage: ((content: string) => void) | null;
+  private chatMessage: ((content: string, type?: string) => void) | null;
   private waitForInput: ((prompt: string) => Promise<string | null>) | null;
   /** Set by resume() so processQueue knows to keep existing task branches. */
   private resumeMode = false;
+  /** When set, processQueue only runs the task with this ID. */
+  private singleTaskId: string | null = null;
   public events = new EventEmitter();
 
   constructor(
@@ -100,8 +141,9 @@ export class WorkflowExecutor {
   /**
    * Subscribe to a sub-agent session and stream thinking blocks, text output,
    * and tool calls into Pi chat. Mirrors the pattern in project-planner.ts.
+   * `messageType` is passed to chatMessage so the UI can route to the right heading.
    */
-  private subscribeToSession(session: any, label: string): void {
+  private subscribeToSession(session: any, label: string, messageType: string): void {
     if (!this.chatMessage) return;
     const chatMessage = this.chatMessage;
     const CHUNK_SIZE = 800;
@@ -112,20 +154,20 @@ export class WorkflowExecutor {
         const ae = event.assistantMessageEvent;
         if (ae.type === 'thinking_start') {
           thinkingBuffer = '';
-          chatMessage(`**[${label}]** 💭 _Thinking…_`);
+          chatMessage(`**[${label}]** 💭 _Thinking…_`, messageType);
         } else if (ae.type === 'thinking_delta' && ae.delta) {
           thinkingBuffer += ae.delta;
           while (thinkingBuffer.length >= CHUNK_SIZE) {
-            chatMessage(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`);
+            chatMessage(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`, messageType);
             thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
           }
         } else if (ae.type === 'thinking_end') {
           if (thinkingBuffer.trim()) {
-            chatMessage(`**[${label}]** 💭 ${thinkingBuffer}`);
+            chatMessage(`**[${label}]** 💭 ${thinkingBuffer}`, messageType);
             thinkingBuffer = '';
           }
         } else if (ae.type === 'text_end' && ae.content?.trim()) {
-          chatMessage(`**[${label}]** ${ae.content}`);
+          chatMessage(`**[${label}]** ${ae.content}`, messageType);
         }
       } else if (event.type === 'tool_execution_start') {
         const toolName: string = event.toolName;
@@ -157,7 +199,7 @@ export class WorkflowExecutor {
           if (firstArg) msg += `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}`;
         }
 
-        chatMessage(msg);
+        chatMessage(msg, messageType);
       }
     });
   }
@@ -284,6 +326,38 @@ export class WorkflowExecutor {
       );
     }
 
+    // Prompt the user to optionally create a feature branch for this workflow.
+    // All task branches will merge into the feature branch rather than the current base.
+    if (this.waitForInput) {
+      const stateSnap = this.state.getState();
+      const suggestedBranch = buildFeatureBranchName(stateSnap.original_request, stateSnap.refined_request);
+      const answer = await this.waitForInput(
+        `Create a feature branch for this epic?\n\n` +
+        `Suggested: \`${suggestedBranch}\`\n\n` +
+        `Type **y** to accept, a **custom branch name** to override, or **n** to work on the current branch:`
+      );
+
+      if (answer && answer.trim().toLowerCase() !== 'n' && answer.trim().toLowerCase() !== 'no') {
+        const trimmed = answer.trim();
+        const chosenBranch = (trimmed.toLowerCase() === 'y' || trimmed.toLowerCase() === 'yes')
+          ? suggestedBranch
+          : trimmed;
+
+        try {
+          sanitizeBranchName(chosenBranch); // validate before creating
+          await this.sandbox.createBranch(chosenBranch);
+          this.state.setFeatureBranch(chosenBranch);
+          this.chatMessage?.(`🌿 Feature branch created: \`${chosenBranch}\`. Task branches will merge into it.`);
+          getLogger().info(`Feature branch created: ${chosenBranch}`);
+        } catch (err) {
+          this.chatMessage?.(`⚠️ Could not create feature branch "${chosenBranch}": ${(err as Error).message}. Using current branch.`);
+          getLogger().warn(`Feature branch creation failed: ${err}`);
+        }
+      } else {
+        this.chatMessage?.(`ℹ️ Using current branch. Task branches will merge directly into it.`);
+      }
+    }
+
     await this.processQueue();
   }
 
@@ -314,34 +388,65 @@ export class WorkflowExecutor {
     await this.processQueue();
   }
 
+  /**
+   * Run (or retry) a single task by ID without touching any other tasks.
+   * The task must already exist in the workflow state (i.e. the epic must have
+   * been started at least once so its subtasks were planned and saved).
+   * If the task is 'failed' or 'completed', it is reset to 'pending' first.
+   */
+  async runTask(taskId: string, mode: 'retry' | 'resume' = 'retry'): Promise<void> {
+    const logger = getLogger();
+    if (!this.state.hasWorkflow()) {
+      throw new Error('No workflow state found. Start the epic first to generate its task list.');
+    }
+    const task = this.state.getSubtask(taskId);
+    if (!task) {
+      const ids = this.state.getState().subtasks.map(t => t.id).join(', ');
+      throw new Error(`Task "${taskId}" not found. Available tasks: ${ids}`);
+    }
+    if (task.status !== 'pending') {
+      if (mode === 'resume') {
+        this.resumeMode = true;
+        this.state.updateSubtask(taskId, { status: 'pending', attempts: 0, phase: undefined });
+      } else {
+        this.resumeMode = false;
+        this.state.updateSubtask(taskId, { status: 'pending', attempts: 0, phase: undefined, feedback: undefined });
+      }
+      logger.info(`runTask: reset task "${taskId}" to pending (mode=${mode})`);
+    }
+    this.singleTaskId = taskId;
+    try {
+      await this.processQueue();
+    } finally {
+      this.singleTaskId = null;
+    }
+  }
+
   private async processQueue(): Promise<void> {
     const logger = getLogger();
     let consecutiveFailures = 0;
 
     // If a previous workflow left the repo on a tdd-workflow/* branch, switch to the
-    // base branch before we do anything — otherwise every task's "original branch"
-    // would be a stale task branch and merges would target the wrong base.
+    // correct base before we do anything. If a feature branch was created for this
+    // workflow, switch to that; otherwise find the repo's default base branch.
+    const featureBranch = this.state.getState().featureBranch;
     try {
-      await this.sandbox.ensureOnBaseBranch();
+      await this.sandbox.ensureOnBaseBranch(featureBranch);
     } catch (err) {
       logger.warn(`[processQueue] Could not ensure base branch: ${err}`);
     }
 
-    // Capture the git HEAD before any agents run.
-    // Used by the final workflow reviewer to diff the full cumulative changes.
+    // Capture the git HEAD before any agents run — used by the final workflow review
+    // to build a cumulative diff across all tasks.
     let workflowStartSha = '';
     try {
       const { stdout } = await execFileAsync('git', ['rev-parse', 'HEAD'], {
         cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
       });
       workflowStartSha = stdout.trim();
-    } catch { /* non-fatal — final review will use a best-effort diff */ }
+    } catch { /* non-fatal */ }
 
-    // For multi-task workflows, skip per-subtask review and run a single final review
-    // after all subtasks complete. This prevents the reviewer from seeing a codebase
-    // in a partially-fixed state and rejecting valid incremental work.
     const totalSubtasks = this.state.getState().subtasks.length;
-    const deferReview = totalSubtasks > 1;
 
     // Capture which blocking gates are already failing before any agent runs.
     // Post-implementer, only NEW failures (not in this baseline) are counted.
@@ -368,7 +473,9 @@ export class WorkflowExecutor {
         break;
       }
 
-      const task = this.state.getNextPendingTask();
+      const task = this.singleTaskId
+        ? (this.state.getSubtask(this.singleTaskId)?.status === 'pending' ? this.state.getSubtask(this.singleTaskId) : undefined)
+        : this.state.getNextPendingTask();
       if (!task) break;
 
       logger.info(`\n--- Task ${task.id}: ${task.description.substring(0, 80)} ---`);
@@ -381,10 +488,16 @@ export class WorkflowExecutor {
       }
 
       const originalBranch = await this.sandbox.getCurrentBranch();
-      const branchName = `tdd-workflow/${task.id.substring(0, 12)}`;
+      const slug = workflowSlug(this.state.getState().original_request);
+      const branchName = `tdd-workflow/${slug}/${task.id.substring(0, 12)}`;
       let approved = false;
       // Seed with any feedback preserved from a prior run (resume mode).
       let feedback = task.feedback || '';
+
+      // Capture lens state before any implementation work starts, so the reviewer
+      // can compare against it to identify issues introduced by this task specifically.
+      let lensBaseline = '';
+      try { lensBaseline = await runLensAnalysis(this.state.projectDir); } catch { /* non-fatal */ }
 
       let lastAttemptDiff = '';
       let currentDiff = '';
@@ -392,6 +505,10 @@ export class WorkflowExecutor {
       let lastAttemptBlockedByPreexisting = false;
       let lastQualityGatesPassed = false; // tracks whether the latest committed state passed QA
       const startAttempt = task.attempts || 1;
+      // Implementer session is kept alive across reviewer-rejection retries so the agent
+      // can continue patching its own work in a multi-turn conversation.
+      // It is nulled out (and disposed) only when a runtime error forces a rollback.
+      let implementerSession: AgentSession | null = null;
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
@@ -426,14 +543,17 @@ export class WorkflowExecutor {
 
           // Phase 2: Implementing
           if (!task.phase || task.phase === 'refining' || task.phase === 'implementing') {
-            // In resume mode, keep the existing branch on the first attempt so the
-            // implementer can patch its previous work. On subsequent attempts within
-            // the same run, recreate fresh. All other modes always recreate.
-            const keepExisting = this.resumeMode && attempt === 1;
-            await this.sandbox.createBranch(branchName, { keepExisting, baseBranch: originalBranch });
+            // Only touch the branch when we are not already on the task branch.
+            // After a reviewer rejection we stay on the task branch so the implementer
+            // can continue patching its own work rather than restarting from scratch.
+            const currentBranch = await this.sandbox.getCurrentBranch();
+            if (currentBranch !== branchName) {
+              const keepExisting = this.resumeMode && attempt === 1;
+              await this.sandbox.createBranch(branchName, { keepExisting, baseBranch: originalBranch });
+            }
 
-            // Clear stale implementation notes from any previous attempt so the reviewer
-            // always reads notes that match the current diff, not a prior attempt's reasoning.
+            // Clear stale implementation notes so the reviewer always reads notes
+            // that match the current diff, not a prior attempt's reasoning.
             try {
               const notesPath = path.join(this.state.projectDir, '.tdd-workflow', 'implementation-notes.md');
               if (fs.existsSync(notesPath)) fs.unlinkSync(notesPath);
@@ -444,55 +564,90 @@ export class WorkflowExecutor {
               attempt,
               phase: 'implementing',
               message: feedback
-                ? `Addressing feedback from previous attempt (Build -> Test -> Fix)...`
+                ? `Addressing reviewer feedback (patching existing implementation)...`
                 : `Agent is building implementation (Read -> Test -> Code)...`
             });
 
-            if (attempt > 1) {
+            // Create the implementer session on the first attempt.
+            // On reviewer-rejection retries the same session is reused (multi-turn) so
+            // the agent has full context of its prior work and just applies the fixes.
+            let implementerLastText = '';
+            if (!implementerSession) {
+              implementerSession = await createSubAgentSession({
+                taskType: 'implement',
+                systemPrompt: IMPLEMENTER_PROMPT,
+                cwd: this.state.projectDir,
+                modelRouter: this.modelRouter,
+                taskMetadata: {
+                  acceptance: task.acceptance,
+                  security: task.security,
+                  tests: task.tests,
+                  devNotes: task.devNotes,
+                  testCommand: getTestCommand(this.state.projectDir),
+                  packageManager: detectPackageManager(this.state.projectDir),
+                },
+              });
+              this.subscribeToSession(implementerSession, `Implementer ${task.id}`, 'tdd-implementer');
+              // Capture the implementer's final message text so we can check for DONE:
+              implementerSession.subscribe((event: any) => {
+                if (event.type === 'message_update') {
+                  const ae = event.assistantMessageEvent;
+                  if (ae?.type === 'text_end' && ae.content?.trim()) implementerLastText += ae.content;
+                } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !implementerLastText) {
+                  implementerLastText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
+                }
+              });
+            }
+
+            // Build the prompt for this turn.
+            let implementerPrompt: string;
+            if (implementerSession && feedback && attempt > 1) {
+              // Retry turn: send reviewer/gate feedback as a follow-up message.
+              // The branch still has the previous implementation so the agent only
+              // needs to apply the requested changes.
               this.chatMessage?.(
-                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — agent is starting with the above feedback injected into its system prompt`
+                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — continuing implementer session with reviewer feedback`
               );
+              implementerPrompt =
+                `The reviewer rejected your implementation. Your previous code is still on this branch — ` +
+                `do not start from scratch. Read the feedback below, apply only the necessary changes, ` +
+                `run the tests to confirm everything passes, and commit.\n\n## Reviewer Feedback\n${feedback}`;
+            } else {
+              // First turn: full task description + metadata.
+              implementerPrompt = technicalDescription;
+              if (task.acceptance && task.acceptance.length > 0) {
+                implementerPrompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
+              }
+              if (task.security) {
+                implementerPrompt += `\n\n### Security Requirements\n${task.security}`;
+              }
+              if (task.tests && task.tests.length > 0) {
+                implementerPrompt += `\n\n### Required Tests\n- ${task.tests.join('\n- ')}`;
+              }
+              if (task.devNotes) {
+                implementerPrompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
+              }
             }
 
-            const implementerSession = await createSubAgentSession({
-              taskType: 'implement',
-              systemPrompt: IMPLEMENTER_PROMPT,
-              cwd: this.state.projectDir,
-              modelRouter: this.modelRouter,
-              feedback: feedback || undefined,
-              taskMetadata: {
-                acceptance: task.acceptance,
-                security: task.security,
-                tests: task.tests,
-                devNotes: task.devNotes,
-              },
-            });
-            this.subscribeToSession(implementerSession, `Implementer ${task.id}`);
-
-            // Enrich the prompt
-            let implementerPrompt = technicalDescription;
-            if (task.acceptance && task.acceptance.length > 0) {
-              implementerPrompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
-            }
-            if (task.security) {
-              implementerPrompt += `\n\n### Security Requirements\n${task.security}`;
-            }
-            if (task.tests && task.tests.length > 0) {
-              implementerPrompt += `\n\n### Required Tests\n- ${task.tests.join('\n- ')}`;
-            }
-            if (task.devNotes) {
-              implementerPrompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
-            }
-
-            try {
+            // Run the implementer, then nudge it to keep going if it didn't signal DONE.
+            // Cap nudges to avoid infinite loops on a truly stuck agent.
+            const MAX_NUDGES = 5;
+            for (let nudge = 0; nudge <= MAX_NUDGES; nudge++) {
+              implementerLastText = '';
               const implementerTimeout = new Promise<never>((_, reject) =>
                 setTimeout(() => reject(new Error(`Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes`)), MAX_IMPLEMENTER_DURATION_MS)
               );
               await Promise.race([implementerSession.prompt(implementerPrompt), implementerTimeout]);
-            } finally {
-              implementerSession.dispose();
-              logger.info('[EXECUTOR] Implementer disposed. Cooldown for slot recovery...');
-              await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+
+              if (/^DONE:/im.test(implementerLastText)) break;
+
+              if (nudge < MAX_NUDGES) {
+                logger.info(`[${task.id}] Implementer did not signal DONE — nudging (${nudge + 1}/${MAX_NUDGES})`);
+                this.chatMessage?.(`⏩ **[${task.id}]** Implementer hasn't finished — nudging to continue (${nudge + 1}/${MAX_NUDGES})`, 'tdd-implementer');
+                implementerPrompt = 'You have not signalled DONE yet. Continue implementing — write the remaining files, run the tests, commit, then end your message with `DONE: <summary>`.';
+              } else {
+                logger.warn(`[${task.id}] Implementer never signalled DONE after ${MAX_NUDGES} nudges — proceeding to quality gates anyway`);
+              }
             }
 
             // Collect any questions the implementer wrote (outside the timeout — user
@@ -626,14 +781,8 @@ export class WorkflowExecutor {
             });
           }
 
-          // Phase 4: Reviewing
-          // For multi-task workflows (deferReview=true), skip per-subtask review.
-          // A single final review runs after all subtasks complete (see runFinalWorkflowReview).
-          if (deferReview) {
-            // task.phase cannot be 'merging' here (we're inside the !merging guard)
-            approved = true;
-            this.state.updateSubtask(task.id, { phase: 'merging' });
-          } else {
+          // Phase 4: Reviewing — runs for every task before merge
+          {
             this.state.updateSubtask(task.id, { phase: 'reviewing' });
             const subtask = task!;
             this.events.emit('taskProgress', {
@@ -650,7 +799,7 @@ export class WorkflowExecutor {
               modelRouter: this.modelRouter,
               tools: 'review'
             });
-            this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`);
+            this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`, 'tdd-reviewer');
 
             let reviewText = '';
             try {
@@ -687,7 +836,18 @@ export class WorkflowExecutor {
               const diffSummary = changedFiles.length > 0
                 ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
                 : '';
-              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${diffSummary}`), reviewerTimeout]);
+
+              // Capture lens state after implementation and include before/after for the reviewer.
+              // The reviewer uses this to judge whether new structural/type issues were introduced.
+              let lensSection = '';
+              try {
+                const lensAfter = await runLensAnalysis(this.state.projectDir);
+                const beforeText = lensBaseline || 'No issues';
+                const afterText = lensAfter || 'No issues';
+                lensSection = `\n\n## Lens Analysis (Structural & Type Checks)\n**Before this task:**\n${beforeText}\n\n**After this task:**\n${afterText}`;
+              } catch { /* non-fatal — omit lens section */ }
+
+              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${lensSection}${diffSummary}`), reviewerTimeout]);
 
               // If the reviewer analysed but didn't produce the required verdict format,
               // send a follow-up asking it to emit only the structured lines.
@@ -769,6 +929,14 @@ export class WorkflowExecutor {
         } catch (err) {
           logger.error(`Attempt ${attempt} error: ${err}`);
           feedback = `Runtime error: ${err}`;
+          // Dispose the implementer session on error — the branch will be rolled back
+          // so the session's in-flight context is no longer valid.
+          if (implementerSession) {
+            try { implementerSession.dispose(); } catch { }
+            implementerSession = null;
+            logger.info('[EXECUTOR] Implementer session disposed after error.');
+            await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+          }
           try { await this.sandbox.rollback(originalBranch); } catch { }
         }
           } // end inner attempt for-loop
@@ -781,7 +949,7 @@ export class WorkflowExecutor {
                 approved = true; // fall through to Phase 5 merge
               } else {
                 // Can't approve if QA never passed — treat as escalation
-                this.chatMessage?.(`⚖️ **[${task.id}]** Arbiter wanted to approve but quality gates never passed — escalating to you.`);
+                this.chatMessage?.(`⚖️ **[${task.id}]** Arbiter wanted to approve but quality gates never passed — escalating to you.`, 'tdd-arbiter');
                 const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback,
                   `${arbiterDecision.rationale} (QA never passed — approval blocked)`);
                 if (userDecision.action === 'approve' && lastQualityGatesPassed) {
@@ -804,6 +972,14 @@ export class WorkflowExecutor {
             }
           }
         } // end outer pass for-loop
+
+        // Dispose the implementer session now that all attempts for this task are done.
+        if (implementerSession) {
+          try { implementerSession.dispose(); } catch { }
+          implementerSession = null;
+          logger.info('[EXECUTOR] Implementer session disposed after task completion.');
+          await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+        }
       } // end if (task.phase !== 'merging')
 
       // Phase 5: Merge — runs once approved (by reviewer, arbiter, or user) OR when resuming from 'merging' phase.
@@ -869,20 +1045,18 @@ export class WorkflowExecutor {
       }
     }
 
-    // Final review for multi-task workflows: one reviewer sees the complete cumulative diff
-    // rather than each subtask being reviewed in a partially-fixed state.
-    if (deferReview) {
-      const allCompleted = this.state.getState().subtasks.every(t => t.status === 'completed');
-      if (allCompleted) {
-        await this.runFinalWorkflowReview(workflowStartSha);
-      }
+    // Final workflow review: runs after all tasks complete, sees the full cumulative diff.
+    // Per-task reviewers approved each story individually; this is an additional holistic
+    // check across all changes. A rejection here is advisory — all changes are already merged.
+    const allCompleted = this.state.getState().subtasks.every(t => t.status === 'completed');
+    if (allCompleted && totalSubtasks > 1) {
+      await this.runFinalWorkflowReview(workflowStartSha);
     }
   }
 
   /**
-   * Run a single reviewer over the full cumulative diff produced by a multi-task workflow.
-   * Called after all subtasks complete instead of per-subtask review, so the reviewer
-   * sees a coherent finished state rather than a partially-fixed codebase.
+   * Run a single reviewer over the full cumulative diff after all tasks have been individually
+   * reviewed and merged. Sees the coherent finished state across all tasks.
    * A rejection here is advisory — all quality gates have already passed and changes are
    * merged. The feedback is posted to chat for the user to act on.
    */
@@ -899,7 +1073,7 @@ export class WorkflowExecutor {
     qualityGatesPassed: boolean,
   ): Promise<{ decision: 'approve' | 'continue' | 'escalate'; rounds: number; rationale: string }> {
     const logger = getLogger();
-    this.chatMessage?.(`⚖️ **[${task.id}]** All ${MAX_ATTEMPTS} attempts exhausted — calling neutral arbiter…`);
+    this.chatMessage?.(`⚖️ **[${task.id}]** All ${MAX_ATTEMPTS} attempts exhausted — calling neutral arbiter…`, 'tdd-arbiter');
 
     const diffSummary = changedFiles.length > 0
       ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${diff.length > 6000 ? diff.substring(0, 6000) + '\n… (truncated)' : diff}\n\`\`\``
@@ -918,7 +1092,7 @@ export class WorkflowExecutor {
       modelRouter: this.modelRouter,
       tools: 'none',
     });
-    this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`);
+    this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`, 'tdd-arbiter');
 
     let arbiterText = '';
     try {
@@ -951,7 +1125,7 @@ export class WorkflowExecutor {
     const rationale = rationaleMatch?.[1]?.trim() ?? 'Arbiter provided no rationale.';
 
     logger.info(`Arbiter decision: ${decision} (rounds=${rounds}) — ${rationale}`);
-    this.chatMessage?.(`⚖️ **[${task.id}] Arbiter:** ${decision.toUpperCase()} — ${rationale}`);
+    this.chatMessage?.(`⚖️ **[${task.id}] Arbiter:** ${decision.toUpperCase()} — ${rationale}`, 'tdd-arbiter');
 
     return { decision, rounds, rationale };
   }
@@ -1005,7 +1179,7 @@ export class WorkflowExecutor {
     const logger = getLogger();
     const subtasks = this.state.getState().subtasks;
 
-    this.chatMessage?.(`🔍 **Final Review** — reviewing all ${subtasks.length} task(s) together…`);
+    this.chatMessage?.(`🔍 **Final Review** — reviewing all ${subtasks.length} task(s) together…`, 'tdd-reviewer');
     this.events.emit('taskProgress', { id: 'final-review', phase: 'reviewing', message: 'Running final workflow review…' });
 
     // Build cumulative diff from the start of the workflow to current HEAD
@@ -1045,7 +1219,7 @@ export class WorkflowExecutor {
       modelRouter: this.modelRouter,
       tools: 'review',
     });
-    this.subscribeToSession(reviewerSession, 'Final Review');
+    this.subscribeToSession(reviewerSession, 'Final Review', 'tdd-reviewer');
 
     let reviewText = '';
     try {
@@ -1106,14 +1280,15 @@ export class WorkflowExecutor {
 
     if (isApproved) {
       logger.info('Final workflow review: approved');
-      this.chatMessage?.(`✅ **Final Review Approved** — ${subtasks.length} task(s) completed and reviewed.\n\n${reviewerFeedback}`);
+      this.chatMessage?.(`✅ **Final Review Approved** — ${subtasks.length} task(s) completed and reviewed.\n\n${reviewerFeedback}`, 'tdd-reviewer');
       this.events.emit('workflowCompleted', { subtasks, reviewerFeedback });
     } else {
       logger.warn(`Final workflow review: rejected — ${reviewerFeedback.substring(0, 200)}`);
       // Advisory only — all quality gates passed and changes are merged
       this.chatMessage?.(
         `⚠️ **Final Review: concerns raised** — all quality gates passed but the reviewer has feedback:\n\n${reviewerFeedback}\n\n` +
-        `All changes have been merged. Use \`/tdd\` with the specific feedback to address reviewer concerns.`
+        `All changes have been merged. Use \`/tdd\` with the specific feedback to address reviewer concerns.`,
+        'tdd-reviewer'
       );
       this.events.emit('workflowReviewWarning', { subtasks, reviewerFeedback });
     }

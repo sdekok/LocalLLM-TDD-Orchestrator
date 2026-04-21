@@ -26,6 +26,8 @@ export interface Subtask {
 export interface WorkflowState {
   original_request: string;
   refined_request: string;
+  /** Feature branch created at workflow start (if user requested one). All task branches merge into this. */
+  featureBranch?: string;
   subtasks: Subtask[];
 }
 
@@ -104,6 +106,11 @@ export class StateManager {
 
   initWorkflow(request: string): void {
     this.state = { original_request: request, refined_request: '', subtasks: [] };
+    this.saveState();
+  }
+
+  setFeatureBranch(name: string | undefined): void {
+    this.state.featureBranch = name;
     this.saveState();
   }
 

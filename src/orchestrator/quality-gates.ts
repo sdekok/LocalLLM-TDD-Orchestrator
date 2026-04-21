@@ -27,14 +27,7 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
   let testMetrics: TestMetrics | undefined;
   let coverageMetrics: CoverageMetrics | undefined;
 
-  // Gate 0: Lens Analysis (BLOCKING - New structural and deep type checks)
-  const lensReport = await runLensGate(projectDir);
-  gates.push(lensReport);
-  if (!lensReport.passed) {
-    logger.warn('Lens analysis found blocking structural or type issues.');
-  }
-
-  // Gate 1: TypeScript compilation (BLOCKING - legacy fallback)
+  // Gate 1: TypeScript compilation (BLOCKING)
   // If Lens passed, we still run full TSC for final safety until Lens is fully proven
   const tsconfigPath = path.join(projectDir, 'tsconfig.json');
   if (fs.existsSync(tsconfigPath)) {
@@ -178,6 +171,17 @@ export function getLensFailPolicy(): LensFailPolicy {
   const raw = process.env['LENS_FAIL_POLICY'];
   if (raw === 'fail-open') return 'fail-open';
   return 'fail-closed'; // secure default
+}
+
+/**
+ * Run lens analysis and return a human-readable issues string.
+ * Empty string means no issues found.
+ * Used by the executor to pass before/after context to the reviewer.
+ */
+export async function runLensAnalysis(projectDir: string): Promise<string> {
+  const result = await runLensGate(projectDir);
+  if (result.passed) return '';
+  return result.output;
 }
 
 /**

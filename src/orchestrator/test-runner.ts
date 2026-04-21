@@ -34,6 +34,17 @@ export interface TestRunner {
 }
 
 /**
+ * Detect which package manager is in use for a project directory.
+ * Returns the executable name: 'pnpm', 'yarn', 'bun', or 'npm'.
+ */
+export function detectPackageManager(projectDir: string): string {
+  if (fs.existsSync(path.join(projectDir, 'pnpm-lock.yaml'))) return 'pnpm';
+  if (fs.existsSync(path.join(projectDir, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(projectDir, 'bun.lockb'))) return 'bun';
+  return 'npm';
+}
+
+/**
  * Base class for common test runner logic.
  */
 export abstract class BaseTestRunner implements TestRunner {
@@ -47,10 +58,10 @@ export abstract class BaseTestRunner implements TestRunner {
       const { stdout, stderr } = await execAsync(command, { cwd, timeout: timeoutMs });
       return { stdout, stderr, passed: true };
     } catch (err: any) {
-      return { 
-        stdout: err.stdout || '', 
-        stderr: err.stderr || err.message || '', 
-        passed: false 
+      return {
+        stdout: err.stdout || '',
+        stderr: err.stderr || err.message || '',
+        passed: false
       };
     }
   }
@@ -85,12 +96,17 @@ export abstract class BaseTestRunner implements TestRunner {
 
 /**
  * Vitest Implementation
+ *
+ * Prefers `<pm> run test` / `<pm> run test:coverage` from package.json scripts
+ * so that project-level vitest configs (environment, globals, plugins) are picked
+ * up correctly. Falls back to `npx vitest run` when no test script is defined.
  */
 export class VitestRunner extends BaseTestRunner {
   name = 'vitest';
 
   async runTests(projectDir: string, timeoutMs: number): Promise<TestResult> {
-    const { stdout, stderr, passed } = await this.execWithTimeout('npx vitest run', projectDir, timeoutMs);
+    const command = this.resolveTestCommand(projectDir);
+    const { stdout, stderr, passed } = await this.execWithTimeout(command, projectDir, timeoutMs);
     const output = stdout + '\n' + stderr;
     return {
       passed,
@@ -103,11 +119,8 @@ export class VitestRunner extends BaseTestRunner {
     // @vitest/coverage-v8 writes coverage-summary.json to the coverage/ directory
     // automatically — no extra reporter flag needed (json-summary is not a built-in
     // in vitest v4 and causes a startup crash if specified).
-    const { stdout, stderr, passed } = await this.execWithTimeout(
-      'npx vitest run --coverage',
-      projectDir,
-      timeoutMs
-    );
+    const command = this.resolveCoverageCommand(projectDir);
+    const { stdout, stderr, passed } = await this.execWithTimeout(command, projectDir, timeoutMs);
     const output = stdout + '\n' + stderr;
     return {
       passed,
@@ -117,10 +130,45 @@ export class VitestRunner extends BaseTestRunner {
     };
   }
 
+  /**
+   * Resolve the test command to run.
+   * Uses `<pm> run test` if package.json defines a `test` script,
+   * otherwise falls back to `npx vitest run`.
+   */
+  private resolveTestCommand(projectDir: string): string {
+    const scripts = this.readScripts(projectDir);
+    if (scripts?.test) {
+      return `${detectPackageManager(projectDir)} run test`;
+    }
+    return 'npx vitest run';
+  }
+
+  /**
+   * Resolve the coverage command to run.
+   * Prefers `test:coverage` script, then `coverage` script,
+   * then falls back to `npx vitest run --coverage`.
+   */
+  private resolveCoverageCommand(projectDir: string): string {
+    const scripts = this.readScripts(projectDir);
+    const pm = detectPackageManager(projectDir);
+    if (scripts?.['test:coverage']) return `${pm} run test:coverage`;
+    if (scripts?.coverage) return `${pm} run coverage`;
+    return 'npx vitest run --coverage';
+  }
+
+  private readScripts(projectDir: string): Record<string, string> | undefined {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+      return pkg.scripts;
+    } catch {
+      return undefined;
+    }
+  }
+
   private parseTestMetrics(output: string): TestMetrics | undefined {
     const testsLineMatch = output.match(/^\s*Tests\s+(.+\(\d+\))\s*$/m);
     if (!testsLineMatch) return undefined;
-    
+
     const line = testsLineMatch[1]!;
     const totalMatch = line.match(/\((\d+)\)/);
     const total = totalMatch ? parseInt(totalMatch[1]!, 10) : 0;
@@ -155,6 +203,19 @@ export class VitestRunner extends BaseTestRunner {
 }
 
 /**
+ * Resolve the test command the project uses — mirrors VitestRunner.resolveTestCommand
+ * so the implementer agent can run the exact same command as `tdd:test`.
+ */
+export function getTestCommand(projectDir: string): string {
+  const pm = detectPackageManager(projectDir);
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    if (pkg.scripts?.test) return `${pm} run test`;
+  } catch { /* ignore */ }
+  return `${pm} test`;
+}
+
+/**
  * Factory to detect and create the appropriate runner
  */
 export function getTestRunner(projectDir: string): TestRunner | null {
@@ -167,7 +228,7 @@ export function getTestRunner(projectDir: string): TestRunner | null {
 
     if (allDeps.vitest) return new VitestRunner();
     // More runners can be added here (JestRunner, etc)
-    
+
     return null;
   } catch {
     return null;

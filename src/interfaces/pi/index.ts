@@ -18,6 +18,7 @@ import {
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { runQualityGates } from '../../orchestrator/quality-gates.js';
+import { getTestRunner } from '../../orchestrator/test-runner.js';
 import { planProject } from '../../agents/project-planner.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
@@ -71,18 +72,23 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('tdd', {
-    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> resume | /tdd <epic> continue',
+    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> resume | /tdd <epic> continue | /tdd <epic> task <id> [retry|resume]',
     handler: async (args: string, ctx) => {
       if (!args) {
-        args = await ctx.ui.input('Enter TDD Epic number or description (append "retry", "resume", or "continue" to resume):') || '';
+        args = await ctx.ui.input('Enter TDD Epic number or description (append "retry", "resume", "continue", or "task <id>"):') || '';
         if (!args) return;
       }
 
-      // Parse subcommand: "/tdd 1 retry" | "/tdd 1 resume" | "/tdd 1 continue" | "/tdd 1"
+      // Parse subcommand variants:
+      //   /tdd 1                       — start new
+      //   /tdd 1 retry|resume|continue — resume whole epic
+      //   /tdd 1 task WI-36            — run single task (retry mode, clears feedback)
+      //   /tdd 1 task WI-36 resume     — run single task (resume mode, preserves feedback)
       const parts = args.trim().split(/\s+/);
       const epicRef = parts[0] ?? '';
       const subcommand = parts[1]?.toLowerCase();
       const isResume = subcommand === 'retry' || subcommand === 'resume' || subcommand === 'continue';
+      const isSingleTask = subcommand === 'task';
 
       // Lazy init orchestrator state
       if (!stateManager) {
@@ -100,7 +106,7 @@ export default function(pi: ExtensionAPI) {
 
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
-          chatMessage: (content) => postToChat(content, 'tdd-progress'),
+          chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
           waitForInput: async (prompt: string) => {
             postToChat(`💬 ${prompt}`, 'tdd-question');
             return await waitForChatInput();
@@ -145,7 +151,23 @@ export default function(pi: ExtensionAPI) {
         });
       };
 
-      if (isResume) {
+      if (isSingleTask) {
+        if (!stateManager.hasWorkflow()) {
+          ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
+          return;
+        }
+        const taskId = parts[2];
+        if (!taskId) {
+          ctx.ui.notify('Usage: /tdd <epic> task <task-id>  e.g. /tdd 6 task WI-36', 'warning');
+          return;
+        }
+        const taskMode = parts[3]?.toLowerCase() === 'resume' ? 'resume' : 'retry';
+        postToChat(
+          `🎯 Running single task **${taskId}** for epic **${epicRef}** (mode=${taskMode})…`,
+          'tdd-progress'
+        );
+        runAndReport(executor!.runTask(taskId, taskMode));
+      } else if (isResume) {
         if (!stateManager.hasWorkflow()) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
           return;
@@ -297,7 +319,7 @@ export default function(pi: ExtensionAPI) {
 
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
-          chatMessage: (content) => postToChat(content, 'tdd-progress'),
+          chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
           waitForInput: async (prompt: string) => {
             postToChat(`💬 ${prompt}`, 'tdd-question');
             return await waitForChatInput();
@@ -336,6 +358,43 @@ export default function(pi: ExtensionAPI) {
         ctx.ui.notify(`🔥 Cleanup engine error: ${err.message}`, 'error');
       });
     }
+  });
+
+  pi.registerCommand('tdd:test', {
+    description: 'Run the test suite and report failing tests',
+    handler: async (_args: string, ctx) => {
+      const runner = getTestRunner(ctx.cwd);
+      if (!runner) {
+        ctx.ui.notify('No test runner detected in this project.', 'warning');
+        return;
+      }
+
+      ctx.ui.notify(`Running ${runner.name} tests…`, 'info');
+      ctx.ui.setStatus('tdd-test', `🧪 Running ${runner.name}…`);
+
+      try {
+        const result = await runner.runTests(ctx.cwd, 600_000);
+        ctx.ui.setStatus('tdd-test', undefined);
+
+        const m = result.metrics;
+        const summary = m
+          ? `${m.passed}/${m.total} passed` +
+            (m.failed > 0 ? ` · **${m.failed} failed**` : '') +
+            (m.skipped > 0 ? ` · ${m.skipped} skipped` : '')
+          : result.passed ? 'All tests passed' : 'Tests failed';
+
+        const icon = result.passed ? '✅' : '❌';
+        const outputBlock = result.output
+          ? `\n\n\`\`\`\n${result.output.length > 4000 ? result.output.slice(-4000) + '\n…(truncated — showing last 4000 chars)' : result.output}\n\`\`\``
+          : '';
+
+        postToChat(`${icon} **Test Results** — ${summary}${outputBlock}`, 'tdd-progress');
+        ctx.ui.notify(`${icon} Tests: ${summary}`, result.passed ? 'info' : 'warning');
+      } catch (err) {
+        ctx.ui.setStatus('tdd-test', undefined);
+        ctx.ui.notify(`Test run failed: ${(err as Error).message}`, 'error');
+      }
+    },
   });
 
   pi.registerCommand('analyze', {

@@ -840,9 +840,9 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(state.getSubtask('WI-1')?.status).toBe('completed');
   });
 
-  it('deferred review: per-task reviewer is skipped for multi-task workflows', async () => {
-    // With 2+ subtasks, no per-task reviewer should be created.
-    // The createSubAgentSession call count should equal the number of implementer sessions only.
+  it('per-task review: each story gets its own reviewer before merging', async () => {
+    // Every WI task should run: implementer → reviewer → merge.
+    // A final workflow review also runs after all tasks complete.
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;
 
@@ -862,33 +862,33 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     const sessionCreations: string[] = [];
     const { session: impl1 } = makeMockSession();
     const { session: impl2 } = makeMockSession();
-    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
-    let callCount = 0;
+    let reviewerCount = 0;
     (createSubAgentSession as any).mockImplementation(async (opts: any) => {
-      callCount++;
       if (opts.taskType === 'implement') {
         sessionCreations.push('implementer');
-        return callCount === 1 ? impl1 : impl2;
+        return reviewerCount === 0 ? impl1 : impl2;
       }
-      // taskType === 'review' → final reviewer
+      // taskType === 'review'
       sessionCreations.push('reviewer');
-      finalReviewer.prompt = vi.fn().mockImplementation(async () => {
-        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: All good' } });
+      reviewerCount++;
+      const { session: rev, fire: fireRev } = makeMockSession();
+      rev.prompt = vi.fn().mockImplementation(async () => {
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: All good' } });
       });
-      return finalReviewer;
+      return rev;
     });
 
     (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
 
     await (executor as any).processQueue();
 
-    // Two implementer sessions, then one final reviewer — no per-task reviewers
-    expect(sessionCreations).toEqual(['implementer', 'implementer', 'reviewer']);
+    // Two tasks → two implementers + two per-task reviewers + one final reviewer
+    expect(sessionCreations).toEqual(['implementer', 'reviewer', 'implementer', 'reviewer', 'reviewer']);
     expect(state.getSubtask('WI-1')?.status).toBe('completed');
     expect(state.getSubtask('WI-2')?.status).toBe('completed');
   });
 
-  it('deferred review: final reviewer receives cumulative diff and approved message is posted to chat', async () => {
+  it('final review: runs after all tasks complete and receives cumulative diff', async () => {
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;
 
@@ -902,9 +902,7 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     // Per-task diffs use 'HEAD'; final-review diffs use the captured SHA 'abc123'.
     (execFileAsync as any).mockImplementation(async (_cmd: string, args: string[]) => {
       if (args[0] === 'rev-parse') return { stdout: 'abc123', stderr: '' };
-      // git diff abc123 (cumulative, no --name-only)
       if (args[0] === 'diff' && args.includes('abc123') && !args.includes('--name-only')) return { stdout: '+cumulative change', stderr: '' };
-      // git diff --name-only abc123 (cumulative, with --name-only)
       if (args[0] === 'diff' && args.includes('abc123') && args.includes('--name-only')) return { stdout: 'src/foo.ts', stderr: '' };
       return { stdout: '', stderr: '' };
     });
@@ -917,17 +915,21 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
 
     const { session: impl1 } = makeMockSession();
     const { session: impl2 } = makeMockSession();
-    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
     let finalReviewerPromptArg = '';
-    let callCount = 0;
+    let implCount = 0;
+    let reviewCount = 0;
     (createSubAgentSession as any).mockImplementation(async (opts: any) => {
-      callCount++;
-      if (opts.taskType === 'implement') return callCount === 1 ? impl1 : impl2;
-      finalReviewer.prompt = vi.fn().mockImplementation(async (prompt: string) => {
-        finalReviewerPromptArg = prompt;
-        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: Looks great overall' } });
+      if (opts.taskType === 'implement') {
+        return implCount++ === 0 ? impl1 : impl2;
+      }
+      // Per-task reviewers approve; track only the last (final) reviewer's prompt
+      const { session: rev, fire: fireRev } = makeMockSession();
+      const isLastReview = reviewCount++ === 2; // 0 and 1 are per-task; 2 is final
+      rev.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        if (isLastReview) finalReviewerPromptArg = prompt;
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true\nFEEDBACK: Looks great overall' } });
       });
-      return finalReviewer;
+      return rev;
     });
 
     (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
@@ -944,7 +946,7 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(approvedMsg).toBeDefined();
   });
 
-  it('deferred review: advisory warning posted when final reviewer rejects (changes already merged)', async () => {
+  it('final review: advisory warning posted when final reviewer rejects (changes already merged)', async () => {
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;
 
@@ -963,22 +965,27 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
 
     const { session: impl1 } = makeMockSession();
     const { session: impl2 } = makeMockSession();
-    const { session: finalReviewer, fire: fireFinalReviewer } = makeMockSession();
-    let callCount = 0;
+    let implCount = 0;
+    let reviewCount = 0;
     (createSubAgentSession as any).mockImplementation(async (opts: any) => {
-      callCount++;
-      if (opts.taskType === 'implement') return callCount === 1 ? impl1 : impl2;
-      finalReviewer.prompt = vi.fn().mockImplementation(async () => {
-        fireFinalReviewer({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: false\nFEEDBACK: Missing error handling in foo.ts' } });
+      if (opts.taskType === 'implement') return implCount++ === 0 ? impl1 : impl2;
+      // Per-task reviewers approve; final reviewer rejects (advisory)
+      const isLastReview = reviewCount++ === 2;
+      const { session: rev, fire: fireRev } = makeMockSession();
+      rev.prompt = vi.fn().mockImplementation(async () => {
+        const verdict = isLastReview
+          ? 'APPROVED: false\nFEEDBACK: Missing error handling in foo.ts'
+          : 'APPROVED: true\nFEEDBACK: All good';
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: verdict } });
       });
-      return finalReviewer;
+      return rev;
     });
 
     (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
 
     await (executor as any).processQueue();
 
-    // Both tasks should still be completed (quality gates passed)
+    // Both tasks should still be completed (per-task reviewers approved, final is advisory only)
     expect(state.getSubtask('WI-1')?.status).toBe('completed');
     expect(state.getSubtask('WI-2')?.status).toBe('completed');
 
