@@ -128,10 +128,13 @@ The easiest way to create or update either file is via `/setup` in Pi. You can a
     "project-plan": "my-thinking-model",
     "implement":    "my-fast-model",
     "review":       "my-thinking-model",
+    "arbitrate":    "my-thinking-model",
     "research":     "my-fast-model"
   }
 }
 ```
+
+**Routing keys** are all optional except the ones you actually use. Any role that isn't explicitly routed falls back to the `plan` model. `/setup` configures `plan`, `project-plan`, `implement`, `review`, and `research` — you can add `arbitrate` manually if you want the deadlock-breaking arbiter on a different model than the planner.
 
 **`enableThinking`** tells the orchestrator to activate Pi's reasoning mode (`setThinkingLevel('medium')`) and strip thinking blocks from multi-turn message history to keep quality high. Reasoning-token injection is handled at the llama.cpp / chat-template level — no plugin-side prompt mutations are needed.
 
@@ -208,28 +211,34 @@ The orchestrator includes a native code analyzer that supports:
 
 ## Commit Messages
 
-Every merge commit includes quality gate results, test counts, and reviewer feedback:
+Each per-attempt implementer commit includes quality gate results and test/coverage metrics:
 
 ```
-TDD: Create JWT token generation
+TDD [Attempt 1]: Create JWT token generation
 
 ---
-Quality Gates: ✅ lens, ✅ typescript, ✅ tests, ⚠️ lint
+Attempt: 1
+
+Quality Gates:
+  ✅ typescript (blocking)
+  ✅ tests (blocking)
+  ✅ coverage (blocking)
+  ⚠️ lint
+
 Tests: 47/47 passed
 Coverage: 87.3% lines, 72.1% branches, 91.0% functions
-Reviewer Score: 17/20
-Reviewer: Good test coverage, clean error handling.
-Files: src/auth/jwt.ts, tests/auth/jwt.test.ts
 ```
 
 ## Development
 
 ```bash
-npm run test         # Run unit tests (vitest)
-npm run build        # Compile TypeScript
-npm run build:csharp # Build the Roslyn C# analyzer (requires .NET 10 SDK)
-npm run build:all    # Full build
-npm run dev          # Watch mode
+npm run test          # Run unit tests (vitest)
+npm run test:watch    # Run tests in watch mode
+npm run test:coverage # Run tests with coverage
+npm run build         # Compile TypeScript + bundle
+npm run build:csharp  # Build the Roslyn C# analyzer (requires .NET 10 SDK)
+npm run build:all     # Full build (csharp + typescript)
+npm run deploylocal   # Symlink into ~/.pi/extensions for live development
 ```
 
 ## Project Config (`tddConfig` in `package.json`)
@@ -243,16 +252,25 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
     "functions": 80,
     "branches": 70
   },
-  "fileSafetyAllowlist": ["scripts/", "config/", "fixtures/", "e2e/"]
+  "fileSafetyAllowlist": ["fixtures/", "custom-dir/"]
 }
 ```
 
 | Key | Default | Description |
 |---|---|---|
-| `coverageThresholds.lines` | `80` | Minimum line coverage % |
-| `coverageThresholds.functions` | `80` | Minimum function coverage % |
-| `coverageThresholds.branches` | `70` | Minimum branch coverage % |
-| `fileSafetyAllowlist` | `[]` | Extra path prefixes (e.g. `"scripts/"`) the file-safety gate should not flag. Built-in safe prefixes include `src/`, `tests/`, `libs/`, `apps/`, `packages/`, `docs/`, `coverage/`, `.pi-lens/`, `.tdd-workflow/`, and common root files (`.gitignore`, lock files, `tsconfig*.json`). |
+| `coverageThresholds` | _(unset)_ | **Opt-in.** When present, the coverage gate becomes blocking and enforces these minimums. Omit this key entirely to skip the coverage gate (useful for projects without tests yet). Supported thresholds: `lines`, `functions`, `branches`, `statements`. |
+| `fileSafetyAllowlist` | `[]` | Extra path prefixes the file-safety gate should not flag. See built-in prefixes below. |
+
+**Built-in file-safety prefixes** (always allowed — no config needed):
+`src/`, `tests/`, `test/`, `__tests__/`, `e2e/`, `lib/`, `libs/`, `apps/`, `packages/`, `docs/`, `scripts/`, `config/`, `public/`, `static/`, `assets/`, `styles/`, `schemas/`, `migrations/`, `prisma/`, `coverage/`, `.github/`, `.vscode/`, `.pi-lens/`, `.tdd-workflow/`
+
+**Built-in file-safety patterns** (matched at repo root):
+- Package manifests / lockfiles (`package.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lockb`, `pnpm-workspace.yaml`)
+- TS / lint / formatter configs (`tsconfig*.json`, `.eslintrc*`, `eslint.config.*`, `vitest.config.*`, `jest.config.*`, `prettier.config.*`, `.prettierrc*`)
+- Root dotfiles (`.gitignore`, `.gitattributes`, `.editorconfig`, `.nvmrc`, `.dockerignore`, `.env.example`, etc.)
+- Framework / monorepo / bundler configs (`turbo.json`, `nx.json`, `project.json`, `vite.config.*`, `next.config.*`, `tailwind.config.*`, etc.)
+- Docker (`Dockerfile*`, `docker-compose*.yml`, `.docker/`)
+- Root docs (`README*`, `CHANGELOG*`, `LICENSE*`, `CONTRIBUTING*`, and any `*.md`/`*.mdx` at the root)
 
 ## Environment Variables
 

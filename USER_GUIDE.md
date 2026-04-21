@@ -6,9 +6,9 @@ The TDD Agentic Workflow orchestrator is a native **Pi Extension** that automate
 
 1. **Plans** — Breaks your request into testable subtasks, researching best practices via web search.
 2. **Implements** — Spawns a headless Pi sub-agent that writes tests and code natively using `read`, `edit`, and `bash` tools.
-3. **Validates** — Runs deterministic quality gates (TypeScript compilation, test suite, linting) on the sub-agent's work.
+3. **Validates** — Runs deterministic quality gates on the sub-agent's work: Lens (structural + type), TypeScript compile, test suite, coverage (opt-in), lint, file-safety.
 4. **Reviews** — Spawns a reviewer sub-agent to score the implementation on test coverage and code quality.
-5. **Merges or Retries** — If gates pass, code is merged. If not, the implementer gets feedback and tries again (up to 3 attempts).
+5. **Merges or Retries** — If gates + review pass, code is merged. If not, the implementer gets feedback and tries again (up to 5 attempts per task; a neutral arbiter then decides approve/continue/escalate).
 
 ## Installation
 
@@ -113,6 +113,21 @@ Interrupt a running TDD workflow from chat — no need to kill Pi.
 | Reviewer feedback | preserved | cleared |
 | How to continue | `/tdd:resume` | `/tdd N` (fresh) or `/tdd N resume` (next pending) |
 
+### `/tdd:project-cleanup`
+
+Audits every quality gate across the whole project **before any agent runs**, summarises the failing gates in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
+
+- The implementer is instructed to only fix failures in files it is already modifying, so cleanup stays scoped and doesn't cause unrelated drift.
+- Useful after onboarding a stale codebase, after a large refactor landed externally, or before starting a new feature on top of a currently-red tree.
+
+### `/tdd:test`
+
+Runs the project's test suite using the same runner + command the TDD executor uses internally (so results match what the gates will see). Posts the summary and last 4k of output to chat.
+
+- Auto-detects Vitest from `package.json#devDependencies`.
+- Uses `<pkgManager> run test` when a `test` script is defined, else falls back to `npx vitest run`.
+- Useful as a quick sanity check before kicking off `/tdd` on a task, or to inspect what failures the gates will report.
+
 ### `/plan <request>`
 
 Decomposes a project or feature into Epics and WorkItems.
@@ -149,6 +164,8 @@ Routing is driven by `models.config.json`. The orchestrator checks two locations
 | `<project>/models.config.json` | Project-specific overrides |
 
 Use `/setup` to create or update either file interactively. You can also edit the JSON directly.
+
+**Routing roles**: the full set of roles is `plan`, `project-plan`, `implement`, `review`, `arbitrate`, `research`, plus optional `design`, `design_review`, `analyze`, `document`. `/setup` configures the five commonly-used ones (plan, project-plan, implement, review, research). Anything unrouted falls back to the `plan` model — so the arbiter uses the plan model by default unless you add `"arbitrate": "some-model"` to the routing yourself.
 
 ### `enableThinking`
 
@@ -194,13 +211,13 @@ The orchestrator does **not** ask an AI if the code is good enough. It runs dete
 | **Lens Analysis** | Blocking | Structural bugs (ast-grep) + deep type errors (LSP) |
 | **TypeScript** | Blocking | `npx tsc --noEmit` — any type errors fail the gate |
 | **Tests** | Blocking | Auto-detects test framework and runs the suite |
-| **Coverage** | Blocking | Enforces thresholds defined in `package.json` |
+| **Coverage** | Blocking _(opt-in)_ | Only runs when `tddConfig.coverageThresholds` is set in `package.json` — otherwise skipped entirely |
 | **Lint** | Non-blocking | ESLint warnings are logged but don't block |
 | **File Safety** | Blocking | Ensures files were only written to expected directories |
 
-### Coverage Thresholds
+### Coverage Thresholds (opt-in)
 
-Add `tddConfig` to your `package.json` to enforce blocking coverage gates:
+The coverage gate is **disabled by default**. Add `tddConfig.coverageThresholds` to your `package.json` to turn it on as a blocking gate:
 
 ```json
 {
@@ -208,11 +225,14 @@ Add `tddConfig` to your `package.json` to enforce blocking coverage gates:
     "coverageThresholds": {
       "lines": 85,
       "functions": 80,
-      "branches": 75
+      "branches": 75,
+      "statements": 80
     }
   }
 }
 ```
+
+Only the thresholds you specify are enforced. A project without this key has no coverage-based failure mode — useful when you're starting out and haven't written tests yet.
 
 ## Safety & Controls
 
