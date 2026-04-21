@@ -40,16 +40,38 @@ export default function(pi: ExtensionAPI) {
   // --------------------------------------------------------------------------
   // Chat input bridge — lets planning / interactive flows receive user replies
   // directly from Pi's chat input area rather than via modal dialogs.
+  //
+  // Single-slot by design: at most one flow can be waiting for the user at any
+  // given time (the executor serialises its agent phases, and /plan and /tdd
+  // own the chat turn while active). If a second waiter tries to register
+  // while one is already pending, we cancel the stale waiter (returns null to
+  // its caller) so it can clean up, and log a warning — this is almost always
+  // a leaked state bug rather than intentional concurrency.
   // --------------------------------------------------------------------------
   let chatInputResolve: ((value: string | null) => void) | null = null;
 
-  /** Wait for the user to type something in Pi chat. Returns null if cancelled. */
+  /**
+   * Wait for the user to type something in Pi chat. Returns null if cancelled.
+   * If another waiter is already pending it is cancelled first (they receive null).
+   */
   const waitForChatInput = (): Promise<string | null> =>
-    new Promise((resolve) => { chatInputResolve = resolve; });
+    new Promise((resolve) => {
+      if (chatInputResolve) {
+        getLogger().warn('[PI] waitForChatInput called while another waiter is pending — cancelling the previous one');
+        const stale = chatInputResolve;
+        chatInputResolve = null;
+        try { stale(null); } catch { /* previous caller already gone */ }
+      }
+      chatInputResolve = resolve;
+    });
 
-  /** Cancel a pending waitForChatInput (e.g. on error). */
+  /** Cancel a pending waitForChatInput (e.g. on error). Safe to call unconditionally. */
   const cancelChatInput = () => {
-    if (chatInputResolve) { chatInputResolve(null); chatInputResolve = null; }
+    if (chatInputResolve) {
+      const resolve = chatInputResolve;
+      chatInputResolve = null;
+      try { resolve(null); } catch { /* caller already gone */ }
+    }
   };
 
   /** Helper: post a message to Pi chat history without triggering a turn. */
@@ -147,6 +169,7 @@ export default function(pi: ExtensionAPI) {
           }
         }).catch((err: any) => {
           ctx.ui.setStatus('tdd', undefined);
+          cancelChatInput();
           ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
         });
       };
@@ -355,6 +378,7 @@ export default function(pi: ExtensionAPI) {
         }
       }).catch((err: any) => {
         ctx.ui.setStatus('tdd-cleanup', undefined);
+        cancelChatInput();
         ctx.ui.notify(`🔥 Cleanup engine error: ${err.message}`, 'error');
       });
     }

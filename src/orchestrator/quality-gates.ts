@@ -21,6 +21,159 @@ export interface QualityReport {
   coverageMetrics?: CoverageMetrics;
 }
 
+/**
+ * Extract a normalised set of "error signatures" from a gate's output. Used to
+ * compare baseline (pre-implementer) gate failures against post-implementer
+ * failures so we can distinguish pre-existing errors from ones the implementer
+ * introduced — instead of masking every failure of a gate that was already red.
+ *
+ * The extractor is gate-aware but conservative: if a gate's output format is
+ * unrecognised, it falls back to a generic line-based fingerprint.
+ */
+export function extractErrorSignatures(gateName: string, output: string): Set<string> {
+  if (!output) return new Set();
+  const lines = output.split('\n').map(l => l.trimEnd());
+
+  // Per-gate signature extraction. Signatures intentionally OMIT line/column
+  // numbers where possible so that purely structural edits (adding imports,
+  // re-indenting) don't cause existing errors to look "new".
+  switch (gateName) {
+    case 'typescript': {
+      // Lines like "src/foo.ts(12,34): error TS2345: Argument of type ..."
+      const out = new Set<string>();
+      for (const l of lines) {
+        const m = l.match(/^(.+\.[cm]?[jt]sx?)\((\d+),(\d+)\): (error|warning) (TS\d+): (.+)$/);
+        if (m) {
+          // File + error code + message.
+          out.add(`${m[1]}:${m[5]}:${m[6]}`);
+        }
+      }
+      return out;
+    }
+    case 'tests': {
+      // Fingerprint per test CASE, not per file. Otherwise a new failing test
+      // in a file that was already red would collapse onto the existing file
+      // signature and be masked as pre-existing.
+      //
+      // Vitest stylish output includes:
+      //   " ❯ tests/foo.test.ts > describeBlock > it does X"     (tree line)
+      //   "  × it does X  4ms"                                    (assertion marker line)
+      //   " FAIL  tests/foo.test.ts > describeBlock > it does X"  (per-case FAIL)
+      //   "AssertionError: expected 'x' to equal 'y'"             (stack frame — skipped)
+      //
+      // We match the FAIL + × / ✖ / ✗ / ❯ forms and normalise any trailing
+      // duration (" 4ms") so an identical test that just runs faster/slower
+      // isn't seen as new.
+      const out = new Set<string>();
+      const stripDuration = (s: string) => s.replace(/\s+\d+(?:\.\d+)?\s*m?s\s*$/, '').trim();
+      for (const l of lines) {
+        const fail = l.match(/^\s*(?:FAIL|×|✖|✗|❯)\s+(.+)$/);
+        if (fail) {
+          const sig = stripDuration(fail[1]!);
+          // Only keep entries that actually name a test (contain ">" for
+          // suite>case separator, or a spec-file extension). This filters out
+          // summary lines like "❯ Failed Tests 3".
+          if (sig.includes(' > ') || /\.(test|spec)\.[cm]?[jt]sx?\b/.test(sig)) {
+            out.add(sig);
+          }
+        }
+      }
+      return out;
+    }
+    case 'lint': {
+      // ESLint compact / stylish: "path/to/file:line:col  error  message  rule"
+      const out = new Set<string>();
+      for (const l of lines) {
+        const m = l.match(/^\s*(.+?):(\d+):(\d+)\s+(error|warning)\s+(.+?)(?:\s{2,}(\S+))?$/);
+        if (m && m[4] === 'error') {
+          // File + message + rule (no line/col).
+          out.add(`${m[1]}:${m[5]!.trim()}${m[6] ? `:${m[6]}` : ''}`);
+        }
+      }
+      return out;
+    }
+    case 'lens': {
+      // Lens output mixes "[LSP] file: N error(s)" / "[Structural] file: ..."
+      // headers with indented lines like "  L42: message". Fingerprint by
+      // (file, message) so a shifted line number doesn't fake a new issue.
+      const out = new Set<string>();
+      let currentFile = '';
+      for (const l of lines) {
+        const header = l.match(/^\[(LSP|Structural)\]\s+(.+?)(?::\s+\d+ error\(s\))?$/);
+        if (header) {
+          currentFile = header[2]!.replace(/:$/, '').trim();
+          continue;
+        }
+        const body = l.match(/^\s+(?:L\d+:\s*)?(.+)$/);
+        if (body && currentFile && body[1]!.trim()) {
+          // Drop "L42:" prefix if any, then key on file + normalised message.
+          const msg = body[1]!.trim();
+          out.add(`${currentFile}:${msg}`);
+        }
+      }
+      // Fallback: if nothing matched the structured format, treat every
+      // non-empty line as a separate signature (defensive for custom Lens builds).
+      if (out.size === 0) {
+        for (const l of lines) if (l.trim()) out.add(l.trim());
+      }
+      return out;
+    }
+    case 'coverage':
+      // Coverage doesn't have line-level signatures; callers handle it by
+      // comparing pass/fail directly. Return empty so any coverage failure
+      // looks like a regression unless the caller short-circuits.
+      return new Set();
+    case 'file-safety': {
+      // file-safety lists unexpected files under a header line. Extract the
+      // file paths so a baseline with one unexpected file doesn't silently
+      // mask a new unexpected file introduced by the implementer.
+      const out = new Set<string>();
+      let inList = false;
+      for (const l of lines) {
+        if (/Unexpected files/i.test(l)) {
+          inList = true;
+          continue;
+        }
+        if (inList) {
+          const trimmed = l.trim();
+          if (!trimmed) continue;
+          // Stop if we hit another header-like line (empty block ended).
+          if (/^[A-Z][a-z].*:$/.test(trimmed)) break;
+          out.add(trimmed);
+        }
+      }
+      return out;
+    }
+    default: {
+      // Unknown gate — fingerprint every non-empty line that mentions "error".
+      const out = new Set<string>();
+      for (const l of lines) {
+        if (/error|fail/i.test(l) && l.trim()) out.add(l.trim());
+      }
+      return out;
+    }
+  }
+}
+
+/**
+ * Compare a gate's current failing output against its baseline output.
+ * Returns the set of error signatures that are NEW (present now, absent in
+ * baseline). Callers treat a non-empty set as a genuine regression.
+ */
+export function diffGateFailures(
+  gateName: string,
+  baselineOutput: string,
+  currentOutput: string,
+): { newErrors: string[]; baselineCount: number; currentCount: number } {
+  const baseline = extractErrorSignatures(gateName, baselineOutput);
+  const current = extractErrorSignatures(gateName, currentOutput);
+  const newErrors: string[] = [];
+  for (const sig of current) {
+    if (!baseline.has(sig)) newErrors.push(sig);
+  }
+  return { newErrors, baselineCount: baseline.size, currentCount: current.size };
+}
+
 export async function runQualityGates(projectDir: string): Promise<QualityReport> {
   const logger = getLogger();
   const gates: GateResult[] = [];
@@ -66,9 +219,14 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
 
     testMetrics = result.metrics;
 
-    // Gate 2b: Coverage Threshold (BLOCKING)
-    if (coverageMetrics) {
-      const thresholds = pkg.tddConfig?.coverageThresholds || { lines: 80, functions: 80, branches: 70 };
+    // Gate 2b: Coverage Threshold (BLOCKING, but only when project opts in)
+    // The coverage gate only runs when the project explicitly sets
+    // `tddConfig.coverageThresholds` in package.json. Projects that don't ask
+    // for coverage enforcement should not be blocked by a default threshold —
+    // they may not even have tests yet, and failing on "0% < 80%" would make
+    // every task fail before the implementer gets a chance.
+    if (coverageMetrics && pkg.tddConfig?.coverageThresholds) {
+      const thresholds = pkg.tddConfig.coverageThresholds;
       const coveragePass = checkCoverageThresholds(coverageMetrics, thresholds);
 
       gates.push({
@@ -110,6 +268,14 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
  * Run a quality gate command.
  * Accepts a command as [program, ...args] to avoid shell injection —
  * execFile does not spawn a shell so arguments are passed directly.
+ *
+ * Timeout handling is explicit: when execFile fires the timeout, Node sends
+ * SIGTERM to the child and returns the partial output that was captured so
+ * far. We detect that case (killed=true or signal='SIGTERM') and prepend a
+ * clear marker to the output — otherwise downstream code (the baseline
+ * signature diff, the reviewer prompt) sees truncated tsc/vitest output
+ * and treats it as a normal failure, producing misleading "0 tests found"
+ * style feedback.
  */
 async function runGate(
   name: string,
@@ -129,9 +295,15 @@ async function runGate(
     logger.info(`Gate '${name}' PASSED`);
     return { gate: name, passed: true, output: (stdout + '\n' + stderr).trim(), blocking };
   } catch (err: unknown) {
-    const e = err as { stdout?: string; stderr?: string; message?: string };
-    const output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim();
-    logger.info(`Gate '${name}' FAILED: ${output.substring(0, 200)}`);
+    const e = err as { stdout?: string; stderr?: string; message?: string; killed?: boolean; signal?: string; code?: number };
+    const timedOut = e.killed === true || e.signal === 'SIGTERM';
+    let output = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n').trim();
+    if (timedOut) {
+      output = `[TIMEOUT after ${timeoutMs / 1000}s — output below is partial and may be truncated mid-line]\n${output}`;
+      logger.warn(`Gate '${name}' TIMED OUT after ${timeoutMs / 1000}s`);
+    } else {
+      logger.info(`Gate '${name}' FAILED: ${output.substring(0, 200)}`);
+    }
     return { gate: name, passed: false, output, blocking };
   }
 }
@@ -297,20 +469,44 @@ const BUILTIN_SAFE_PREFIXES = [
   'tests/',
   'test/',
   '__tests__/',
+  'e2e/',
   'lib/',
   'libs/',
   'apps/',
   'packages/',
   'docs/',
+  'scripts/',
+  'config/',
+  'public/',
+  'static/',
+  'assets/',
+  'styles/',
+  'schemas/',
+  'migrations/',
+  'prisma/',
   'coverage/',
+  '.github/',
+  '.vscode/',
   '.pi-lens/',
   '.tdd-workflow/',
 ];
 
 const BUILTIN_SAFE_PATTERNS = [
-  /^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb)/,
-  /^(tsconfig[^/]*\.json|\.eslintrc[^/]*|vitest\.config|jest\.config|prettier\.config)/,
-  /^\.(gitignore|npmignore|prettierignore|eslintignore|editorconfig|nvmrc|node-version)$/,
+  // Package manifests / lockfiles
+  /^(package\.json|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb|pnpm-workspace\.yaml)/,
+  // TS / lint / formatter configs
+  /^(tsconfig[^/]*\.json|\.eslintrc[^/]*|eslint\.config\.[cm]?[jt]s|vitest\.config|vitest\.workspace|jest\.config|prettier\.config|\.prettierrc[^/]*)/,
+  // Common root dotfiles
+  /^\.(gitignore|gitattributes|npmignore|npmrc|prettierignore|eslintignore|editorconfig|nvmrc|node-version|dockerignore|env\.example)$/,
+  // Framework / monorepo / bundler configs at repo root
+  /^(turbo\.json|nx\.json|project\.json|lerna\.json|rush\.json|workspace\.json)$/,
+  /^(vite\.config|rollup\.config|webpack\.config|esbuild\.config|tsup\.config|babel\.config|\.babelrc)/,
+  /^(tailwind\.config|postcss\.config|next\.config|nuxt\.config|svelte\.config|astro\.config|remix\.config|gatsby-config)/,
+  // Docker
+  /^(Dockerfile[^/]*|docker-compose[^/]*\.ya?ml|\.docker\/)/,
+  // Repo-level docs (allow any *.md at the root, and common root text files)
+  /^[^/]+\.(md|mdx|txt|rst)$/i,
+  /^(README|CHANGELOG|LICENSE|CONTRIBUTING|CODE_OF_CONDUCT|SECURITY|AUTHORS|NOTICE)(\.[^/]+)?$/i,
 ];
 
 export function loadFileSafetyAllowlist(projectDir: string): string[] {

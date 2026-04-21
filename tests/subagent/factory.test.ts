@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createSubAgentSession } from '../../src/subagent/factory.js';
+import { createSubAgentSession, _activeSessionCount } from '../../src/subagent/factory.js';
 import { ModelRouter } from '../../src/llm/model-router.js';
 import { IMPLEMENTER_PROMPT } from '../../src/subagent/prompts.js';
 
@@ -90,5 +90,55 @@ describe('SubAgent Factory', () => {
     });
 
     expect(session.setThinkingLevel).toHaveBeenCalledWith('medium');
+  });
+
+  // ─── session registry / shutdown-handler integration ─────────────────────
+
+  describe('session registry', () => {
+    it('registers created sessions so they can be cleaned up on shutdown', async () => {
+      const before = _activeSessionCount();
+      const session = await createSubAgentSession({
+        taskType: 'implement',
+        systemPrompt: 'PROMPT',
+        cwd: '/tmp',
+        modelRouter,
+      });
+
+      expect(_activeSessionCount()).toBe(before + 1);
+
+      // Calling dispose removes the session from the registry
+      session.dispose();
+      expect(_activeSessionCount()).toBe(before);
+    });
+
+    it('unregisters a session exactly once even if dispose is called twice', async () => {
+      const before = _activeSessionCount();
+      const session = await createSubAgentSession({
+        taskType: 'implement',
+        systemPrompt: 'PROMPT',
+        cwd: '/tmp',
+        modelRouter,
+      });
+      expect(_activeSessionCount()).toBe(before + 1);
+
+      session.dispose();
+      session.dispose();
+      expect(_activeSessionCount()).toBe(before);
+    });
+
+    it('tracks multiple concurrent sessions', async () => {
+      const before = _activeSessionCount();
+      const s1 = await createSubAgentSession({ taskType: 'implement', systemPrompt: 'P', cwd: '/tmp', modelRouter });
+      const s2 = await createSubAgentSession({ taskType: 'implement', systemPrompt: 'P', cwd: '/tmp', modelRouter });
+      const s3 = await createSubAgentSession({ taskType: 'implement', systemPrompt: 'P', cwd: '/tmp', modelRouter });
+
+      expect(_activeSessionCount()).toBe(before + 3);
+
+      s1.dispose();
+      expect(_activeSessionCount()).toBe(before + 2);
+      s2.dispose();
+      s3.dispose();
+      expect(_activeSessionCount()).toBe(before);
+    });
   });
 });

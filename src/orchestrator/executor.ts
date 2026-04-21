@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, formatGateFailures } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, diffGateFailures } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -80,6 +80,25 @@ const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '
  * Detect if two strings are suspiciously similar (agent is looping).
  * Uses a simple character-level comparison — fast and good enough for code output.
  */
+/**
+ * Race a promise against a timeout, but always clear the timer when either side
+ * settles so we don't leak a Node.js timer for up to an hour.
+ * Plain `Promise.race([p, setTimeoutReject(ms)])` leaves the timer armed, which
+ * matters for long timeouts (the process can't exit cleanly and the captured
+ * closure stays in memory).
+ */
+export async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 export function outputSimilarity(a: string, b: string): number {
   if (!a || !b) return 0;
   if (a === b) return 1;
@@ -139,37 +158,63 @@ export class WorkflowExecutor {
   }
 
   /**
-   * Subscribe to a sub-agent session and stream thinking blocks, text output,
-   * and tool calls into Pi chat. Mirrors the pattern in project-planner.ts.
-   * `messageType` is passed to chatMessage so the UI can route to the right heading.
+   * Subscribe to a sub-agent session ONCE and return a handle that:
+   *  - streams thinking / text / tool calls to Pi chat (`chatMessage`)
+   *  - accumulates the agent's visible `text_end` output so callers can
+   *    inspect the last turn's reply (e.g. for `DONE:` / `APPROVED:` checks)
+   *  - exposes `resetTurnText()` so the caller can clear the accumulator
+   *    between `prompt()` calls on the same session
+   *  - exposes `dispose()` to stop processing further events without
+   *    relying on the SDK exposing an explicit unsubscribe handle
+   *
+   * IMPORTANT: call this once per session. Previously the codebase subscribed
+   * twice — once here, once inline for text capture — which duplicated
+   * chat output on every retry and made the text accumulator race.
    */
-  private subscribeToSession(session: any, label: string, messageType: string): void {
-    if (!this.chatMessage) return;
+  private subscribeToSession(
+    session: any,
+    label: string,
+    messageType: string,
+  ): { getTurnText(): string; resetTurnText(): void; dispose(): void } {
     const chatMessage = this.chatMessage;
     const CHUNK_SIZE = 800;
     let thinkingBuffer = '';
+    let turnText = '';
+    let disposed = false;
 
     session.subscribe((event: any) => {
+      if (disposed) return;
+
       if (event.type === 'message_update') {
         const ae = event.assistantMessageEvent;
-        if (ae.type === 'thinking_start') {
+        if (ae?.type === 'thinking_start') {
           thinkingBuffer = '';
-          chatMessage(`**[${label}]** 💭 _Thinking…_`, messageType);
-        } else if (ae.type === 'thinking_delta' && ae.delta) {
+          chatMessage?.(`**[${label}]** 💭 _Thinking…_`, messageType);
+        } else if (ae?.type === 'thinking_delta' && ae.delta) {
           thinkingBuffer += ae.delta;
           while (thinkingBuffer.length >= CHUNK_SIZE) {
-            chatMessage(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`, messageType);
+            chatMessage?.(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`, messageType);
             thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
           }
-        } else if (ae.type === 'thinking_end') {
+        } else if (ae?.type === 'thinking_end') {
           if (thinkingBuffer.trim()) {
-            chatMessage(`**[${label}]** 💭 ${thinkingBuffer}`, messageType);
+            chatMessage?.(`**[${label}]** 💭 ${thinkingBuffer}`, messageType);
             thinkingBuffer = '';
           }
-        } else if (ae.type === 'text_end' && ae.content?.trim()) {
-          chatMessage(`**[${label}]** ${ae.content}`, messageType);
+        } else if (ae?.type === 'text_end' && ae.content?.trim()) {
+          // Accumulate for the caller (e.g. DONE:/APPROVED: detection).
+          turnText += ae.content;
+          chatMessage?.(`**[${label}]** ${ae.content}`, messageType);
         }
+      } else if (event.type === 'message_end'
+                 && event.message?.role === 'assistant'
+                 && !turnText) {
+        // Fallback for non-streaming / non-reasoning sessions that never
+        // emit text_end but do publish the final content array.
+        const text = event.message.content?.find((c: any) => c.type === 'text')?.text;
+        if (text) turnText += text;
       } else if (event.type === 'tool_execution_start') {
+        if (!chatMessage) return;
         const toolName: string = event.toolName;
         const args = (event.args && typeof event.args === 'object') ? event.args as Record<string, unknown> : {};
         let msg = `**[${label}]** 🔧 \`${toolName}\``;
@@ -202,6 +247,12 @@ export class WorkflowExecutor {
         chatMessage(msg, messageType);
       }
     });
+
+    return {
+      getTurnText: () => turnText,
+      resetTurnText: () => { turnText = ''; },
+      dispose: () => { disposed = true; },
+    };
   }
 
   /** Post a full task checklist with live status icons so users can track progress. */
@@ -448,19 +499,23 @@ export class WorkflowExecutor {
 
     const totalSubtasks = this.state.getState().subtasks.length;
 
-    // Capture which blocking gates are already failing before any agent runs.
-    // Post-implementer, only NEW failures (not in this baseline) are counted.
-    let baselineFailingGates = new Set<string>();
+    // Capture each blocking gate's full output at baseline so we can compare
+    // against it per-attempt. We don't just mask "was this gate failing?" —
+    // we extract an error-signature set from each failing gate and only treat
+    // errors that appear in the current run but NOT in the baseline as genuine
+    // regressions. Otherwise a baseline of "3 tsc errors" would silently mask
+    // an implementer that adds 7 more tsc errors.
+    const baselineGateOutputs = new Map<string, string>();
     try {
       const baseline = await runQualityGates(this.state.projectDir);
-      if (!baseline.allBlockingPassed) {
-        baselineFailingGates = new Set(
-          baseline.gates.filter(g => g.blocking && !g.passed).map(g => g.gate)
-        );
-        logger.info(`Baseline blocking gate failures: ${[...baselineFailingGates].join(', ')}`);
+      const failing = baseline.gates.filter(g => g.blocking && !g.passed);
+      for (const g of failing) baselineGateOutputs.set(g.gate, g.output);
+      if (failing.length > 0) {
+        const list = failing.map(g => g.gate).join(', ');
+        logger.info(`Baseline blocking gate failures: ${list}`);
         this.chatMessage?.(
-          `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${[...baselineFailingGates].join(', ')}**. ` +
-          `These will not block task completion.`
+          `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${list}**. ` +
+          `Only NEW errors introduced by the implementer will block tasks — existing ones are ignored.`
         );
       }
     } catch (err) {
@@ -493,6 +548,13 @@ export class WorkflowExecutor {
       let approved = false;
       // Seed with any feedback preserved from a prior run (resume mode).
       let feedback = task.feedback || '';
+      // In resume mode, preserve the existing task branch for the ENTIRE task
+      // lifetime — not just attempt 1. If a runtime error rolls us back to the
+      // base branch mid-task, the next attempt must still find the WIP where
+      // the previous attempt left it. The README contract is "failed branch is
+      // preserved exactly as the agent left it" — that applies across every
+      // subsequent attempt, not only the first one.
+      const preserveExistingBranch = this.resumeMode;
 
       // Capture lens state before any implementation work starts, so the reviewer
       // can compare against it to identify issues introduced by this task specifically.
@@ -509,6 +571,11 @@ export class WorkflowExecutor {
       // can continue patching its own work in a multi-turn conversation.
       // It is nulled out (and disposed) only when a runtime error forces a rollback.
       let implementerSession: AgentSession | null = null;
+      // The stream handle is paired with the session lifetime — one subscription for the
+      // whole lifetime of the session, with a per-turn text accumulator that we reset
+      // before each prompt() call. This avoids the multi-subscribe bug where text
+      // accumulated across turns and duplicated chat output.
+      let implementerHandle: { getTurnText(): string; resetTurnText(): void; dispose(): void } | null = null;
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
@@ -548,8 +615,10 @@ export class WorkflowExecutor {
             // can continue patching its own work rather than restarting from scratch.
             const currentBranch = await this.sandbox.getCurrentBranch();
             if (currentBranch !== branchName) {
-              const keepExisting = this.resumeMode && attempt === 1;
-              await this.sandbox.createBranch(branchName, { keepExisting, baseBranch: originalBranch });
+              await this.sandbox.createBranch(branchName, {
+                keepExisting: preserveExistingBranch,
+                baseBranch: originalBranch,
+              });
             }
 
             // Clear stale implementation notes so the reviewer always reads notes
@@ -571,7 +640,6 @@ export class WorkflowExecutor {
             // Create the implementer session on the first attempt.
             // On reviewer-rejection retries the same session is reused (multi-turn) so
             // the agent has full context of its prior work and just applies the fixes.
-            let implementerLastText = '';
             if (!implementerSession) {
               implementerSession = await createSubAgentSession({
                 taskType: 'implement',
@@ -587,17 +655,9 @@ export class WorkflowExecutor {
                   packageManager: detectPackageManager(this.state.projectDir),
                 },
               });
-              this.subscribeToSession(implementerSession, `Implementer ${task.id}`, 'tdd-implementer');
-              // Capture the implementer's final message text so we can check for DONE:
-              implementerSession.subscribe((event: any) => {
-                if (event.type === 'message_update') {
-                  const ae = event.assistantMessageEvent;
-                  if (ae?.type === 'text_end' && ae.content?.trim()) implementerLastText += ae.content;
-                } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !implementerLastText) {
-                  implementerLastText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
-                }
-              });
+              implementerHandle = this.subscribeToSession(implementerSession, `Implementer ${task.id}`, 'tdd-implementer');
             }
+            const handle = implementerHandle!;
 
             // Build the prompt for this turn.
             let implementerPrompt: string;
@@ -631,15 +691,25 @@ export class WorkflowExecutor {
 
             // Run the implementer, then nudge it to keep going if it didn't signal DONE.
             // Cap nudges to avoid infinite loops on a truly stuck agent.
+            // The total time budget for this attempt (initial prompt + all nudges) is
+            // MAX_IMPLEMENTER_DURATION_MS as a single deadline — NOT a per-prompt timeout
+            // re-armed on each nudge. Otherwise MAX_NUDGES × per-prompt timeouts could
+            // compound into a 6-hour attempt.
             const MAX_NUDGES = 5;
+            const attemptDeadline = Date.now() + MAX_IMPLEMENTER_DURATION_MS;
             for (let nudge = 0; nudge <= MAX_NUDGES; nudge++) {
-              implementerLastText = '';
-              const implementerTimeout = new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error(`Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes`)), MAX_IMPLEMENTER_DURATION_MS)
+              handle.resetTurnText();
+              const remaining = attemptDeadline - Date.now();
+              if (remaining <= 0) {
+                throw new Error(`Implementer attempt exceeded deadline (${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes)`);
+              }
+              await withTimeout(
+                implementerSession.prompt(implementerPrompt),
+                remaining,
+                `Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes (across ${nudge + 1} prompt(s))`,
               );
-              await Promise.race([implementerSession.prompt(implementerPrompt), implementerTimeout]);
 
-              if (/^DONE:/im.test(implementerLastText)) break;
+              if (/^DONE:/im.test(handle.getTurnText())) break;
 
               if (nudge < MAX_NUDGES) {
                 logger.info(`[${task.id}] Implementer did not signal DONE — nudging (${nudge + 1}/${MAX_NUDGES})`);
@@ -716,30 +786,49 @@ export class WorkflowExecutor {
             }
 
             if (!qualityReport.allBlockingPassed) {
-              // Filter out gates that were already failing before any agent ran (baseline).
-              // Only new failures introduced by this agent's changes block the task.
-              const newBlockingFailures = qualityReport.gates.filter(
-                g => g.blocking && !g.passed && !baselineFailingGates.has(g.gate)
-              );
+              // For each failing blocking gate, compare against the baseline. If every
+              // error in the current output was already present at baseline, the gate
+              // is pre-existing and we ignore it. Otherwise build a feedback report
+              // containing only the NEW errors — not the full failure dump — so the
+              // implementer isn't distracted by legacy issues it wasn't asked to fix.
+              const regressionReports: string[] = [];
+              const regressionGates: typeof qualityReport.gates = [];
+              const preexistingGates: string[] = [];
 
-              if (newBlockingFailures.length === 0) {
+              for (const g of qualityReport.gates) {
+                if (!g.blocking || g.passed) continue;
+                const baseline = baselineGateOutputs.get(g.gate);
+                if (baseline === undefined) {
+                  // No baseline for this gate — it was green before, now red. Full regression.
+                  regressionGates.push(g);
+                  regressionReports.push(`[${g.gate.toUpperCase()} BLOCKING]\n${g.output}`);
+                  continue;
+                }
+                const { newErrors, baselineCount, currentCount } = diffGateFailures(g.gate, baseline, g.output);
+                if (newErrors.length === 0) {
+                  preexistingGates.push(`${g.gate}(${currentCount} pre-existing)`);
+                  continue;
+                }
+                regressionGates.push(g);
+                regressionReports.push(
+                  `[${g.gate.toUpperCase()} BLOCKING] ${newErrors.length} new error(s) introduced ` +
+                  `(baseline had ${baselineCount}, now ${currentCount}):\n` +
+                  newErrors.map(e => `  • ${e}`).join('\n')
+                );
+              }
+
+              if (regressionGates.length === 0) {
                 // Every blocking failure is pre-existing — treat as passed.
-                const preexisting = [...baselineFailingGates].join(', ');
-                logger.info(`All blocking gate failures are pre-existing (${preexisting}) — treating as passed for this task.`);
+                logger.info(`All blocking gate failures are pre-existing (${preexistingGates.join(', ')}) — treating as passed for this task.`);
                 this.chatMessage?.(
-                  `**[${task.id}]** ℹ️ All blocking failures (**${preexisting}**) are pre-existing — not caused by this task's changes. Proceeding.`
+                  `**[${task.id}]** ℹ️ All blocking failures are pre-existing (${preexistingGates.join(', ')}) — not caused by this task's changes. Proceeding.`
                 );
                 lastAttemptBlockedByPreexisting = true;
                 // Fall through to commit / reviewer as if gates passed.
               } else {
                 // There are genuine new failures. Build feedback from those only.
-                feedback = formatGateFailures({
-                  ...qualityReport,
-                  gates: newBlockingFailures,
-                  allBlockingPassed: false,
-                });
-
-                logger.info(`Quality gates failed (new failures):\n${feedback.substring(0, 300)}`);
+                feedback = regressionReports.join('\n\n');
+                logger.info(`Quality gates failed (new failures only):\n${feedback.substring(0, 300)}`);
 
                 // Emit detailed feedback for TUI
                 this.events.emit('taskProgress', {
@@ -799,27 +888,10 @@ export class WorkflowExecutor {
               modelRouter: this.modelRouter,
               tools: 'review'
             });
-            this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`, 'tdd-reviewer');
+            const reviewerHandle = this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`, 'tdd-reviewer');
 
             let reviewText = '';
             try {
-              // Capture review text from text_end stream events — more reliable than
-              // message_end content array, which may be empty on reasoning models that
-              // return thinking blocks instead of text blocks in the final message object.
-              reviewerSession.subscribe((event: any) => {
-                if (event.type === 'message_update') {
-                  const ae = event.assistantMessageEvent;
-                  if (ae?.type === 'text_end' && ae.content?.trim()) {
-                    reviewText += ae.content;
-                  }
-                } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !reviewText) {
-                  // Fallback for non-streaming / non-reasoning sessions
-                  reviewText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
-                }
-              });
-              const reviewerTimeout = new Promise<never>((_, reject) =>
-                setTimeout(() => reject(new Error(`Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`)), MAX_REVIEWER_DURATION_MS)
-              );
               // Read implementer notes if the agent wrote them
               let implementerNotes = '';
               try {
@@ -847,7 +919,12 @@ export class WorkflowExecutor {
                 lensSection = `\n\n## Lens Analysis (Structural & Type Checks)\n**Before this task:**\n${beforeText}\n\n**After this task:**\n${afterText}`;
               } catch { /* non-fatal — omit lens section */ }
 
-              await Promise.race([reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${lensSection}${diffSummary}`), reviewerTimeout]);
+              await withTimeout(
+                reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${lensSection}${diffSummary}`),
+                MAX_REVIEWER_DURATION_MS,
+                `Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
+              );
+              reviewText = reviewerHandle.getTurnText();
 
               // If the reviewer analysed but didn't produce the required verdict format,
               // send a follow-up asking it to emit only the structured lines.
@@ -856,9 +933,9 @@ export class WorkflowExecutor {
               if (!reviewText.includes('APPROVED:')) {
                 logger.warn(`[${task.id}] Reviewer missing structured verdict — sending format reminder`);
                 const savedReviewText = reviewText;
-                reviewText = ''; // reset accumulator so we only see the new response
+                reviewerHandle.resetTurnText();
                 try {
-                  await Promise.race([
+                  await withTimeout(
                     reviewerSession.prompt(
                       'STOP all tool calls. Do NOT read any more files.\n\n' +
                       'Your review is complete but is missing the required structured verdict. ' +
@@ -867,8 +944,10 @@ export class WorkflowExecutor {
                       'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
                       'FEEDBACK: <your feedback based on what you have already read>'
                     ),
-                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), FORMAT_RETRY_TIMEOUT_MS)),
-                  ]);
+                    FORMAT_RETRY_TIMEOUT_MS,
+                    'format-retry-timeout',
+                  );
+                  reviewText = reviewerHandle.getTurnText();
                 } catch {
                   reviewText = savedReviewText; // retry failed — restore original
                 }
@@ -877,6 +956,7 @@ export class WorkflowExecutor {
                 }
               }
             } finally {
+              reviewerHandle.dispose();
               reviewerSession.dispose();
               logger.info('[EXECUTOR] Reviewer disposed. Cooldown for slot recovery...');
               await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
@@ -932,7 +1012,9 @@ export class WorkflowExecutor {
           // Dispose the implementer session on error — the branch will be rolled back
           // so the session's in-flight context is no longer valid.
           if (implementerSession) {
+            try { implementerHandle?.dispose(); } catch { }
             try { implementerSession.dispose(); } catch { }
+            implementerHandle = null;
             implementerSession = null;
             logger.info('[EXECUTOR] Implementer session disposed after error.');
             await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
@@ -975,7 +1057,9 @@ export class WorkflowExecutor {
 
         // Dispose the implementer session now that all attempts for this task are done.
         if (implementerSession) {
+          try { implementerHandle?.dispose(); } catch { }
           try { implementerSession.dispose(); } catch { }
+          implementerHandle = null;
           implementerSession = null;
           logger.info('[EXECUTOR] Implementer session disposed after task completion.');
           await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
@@ -1092,26 +1176,21 @@ export class WorkflowExecutor {
       modelRouter: this.modelRouter,
       tools: 'none',
     });
-    this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`, 'tdd-arbiter');
+    const arbiterHandle = this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`, 'tdd-arbiter');
 
     let arbiterText = '';
     try {
-      arbiterSession.subscribe((event: any) => {
-        if (event.type === 'message_update') {
-          const ae = event.assistantMessageEvent;
-          if (ae?.type === 'text_end' && ae.content?.trim()) arbiterText += ae.content;
-        } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !arbiterText) {
-          arbiterText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
-        }
-      });
-      const arbiterTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Arbiter timed out after ${MAX_ARBITER_DURATION_MS / 60000} minutes`)), MAX_ARBITER_DURATION_MS)
+      await withTimeout(
+        arbiterSession.prompt(arbiterPrompt),
+        MAX_ARBITER_DURATION_MS,
+        `Arbiter timed out after ${MAX_ARBITER_DURATION_MS / 60000} minutes`,
       );
-      await Promise.race([arbiterSession.prompt(arbiterPrompt), arbiterTimeout]);
+      arbiterText = arbiterHandle.getTurnText();
     } catch (err) {
       logger.warn(`Arbiter session error: ${err} — defaulting to escalate`);
       return { decision: 'escalate', rounds: 0, rationale: `Arbiter failed: ${err}` };
     } finally {
+      arbiterHandle.dispose();
       arbiterSession.dispose();
       await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
     }
@@ -1219,36 +1298,27 @@ export class WorkflowExecutor {
       modelRouter: this.modelRouter,
       tools: 'review',
     });
-    this.subscribeToSession(reviewerSession, 'Final Review', 'tdd-reviewer');
+    const reviewerHandle = this.subscribeToSession(reviewerSession, 'Final Review', 'tdd-reviewer');
 
     let reviewText = '';
     try {
-      reviewerSession.subscribe((event: any) => {
-        if (event.type === 'message_update') {
-          const ae = event.assistantMessageEvent;
-          if (ae?.type === 'text_end' && ae.content?.trim()) reviewText += ae.content;
-        } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !reviewText) {
-          reviewText = event.message.content?.find((c: any) => c.type === 'text')?.text || '';
-        }
-      });
-      const reviewerTimeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Final reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`)), MAX_REVIEWER_DURATION_MS)
-      );
-      await Promise.race([
+      await withTimeout(
         reviewerSession.prompt(
           `Review the complete workflow.\n\n## Tasks Completed\n${subtaskSummary}${notesSummary}${diffSummary}`
         ),
-        reviewerTimeout,
-      ]);
+        MAX_REVIEWER_DURATION_MS,
+        `Final reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
+      );
+      reviewText = reviewerHandle.getTurnText();
 
       // Format reminder if structured verdict is missing
       const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
       if (!reviewText.includes('APPROVED:')) {
         logger.warn('[EXECUTOR] Final reviewer missing structured verdict — sending format reminder');
         const savedReviewText = reviewText;
-        reviewText = '';
+        reviewerHandle.resetTurnText();
         try {
-          await Promise.race([
+          await withTimeout(
             reviewerSession.prompt(
               'STOP all tool calls. Do NOT read any more files.\n\n' +
               'Your review is complete but is missing the required structured verdict. ' +
@@ -1257,14 +1327,17 @@ export class WorkflowExecutor {
               'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
               'FEEDBACK: <your feedback based on what you have already read>'
             ),
-            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('format-retry-timeout')), FORMAT_RETRY_TIMEOUT_MS)),
-          ]);
+            FORMAT_RETRY_TIMEOUT_MS,
+            'format-retry-timeout',
+          );
+          reviewText = reviewerHandle.getTurnText();
         } catch {
           reviewText = savedReviewText;
         }
         if (!reviewText.includes('APPROVED:')) reviewText = savedReviewText;
       }
     } finally {
+      reviewerHandle.dispose();
       reviewerSession.dispose();
       logger.info('[EXECUTOR] Final reviewer disposed. Cooldown for slot recovery...');
       await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));

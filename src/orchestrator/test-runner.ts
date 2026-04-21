@@ -52,16 +52,25 @@ export abstract class BaseTestRunner implements TestRunner {
   abstract runTests(projectDir: string, timeoutMs: number): Promise<TestResult>;
   abstract runCoverage(projectDir: string, timeoutMs: number): Promise<TestResult>;
 
-  protected async execWithTimeout(command: string, cwd: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; passed: boolean }> {
+  protected async execWithTimeout(command: string, cwd: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; passed: boolean; timedOut?: boolean }> {
     const logger = getLogger();
     try {
       const { stdout, stderr } = await execAsync(command, { cwd, timeout: timeoutMs });
       return { stdout, stderr, passed: true };
     } catch (err: any) {
+      // When `exec` hits the timeout it SIGTERMs the child and returns partial
+      // output. We flag it so upstream can annotate the gate output with a
+      // truncation warning instead of silently treating "0 tests found" as a
+      // genuine regression.
+      const timedOut = err.killed === true || err.signal === 'SIGTERM';
+      if (timedOut) {
+        logger.warn(`[TestRunner] Command timed out after ${timeoutMs / 1000}s: ${command}`);
+      }
       return {
         stdout: err.stdout || '',
         stderr: err.stderr || err.message || '',
-        passed: false
+        passed: false,
+        timedOut,
       };
     }
   }
@@ -106,8 +115,8 @@ export class VitestRunner extends BaseTestRunner {
 
   async runTests(projectDir: string, timeoutMs: number): Promise<TestResult> {
     const command = this.resolveTestCommand(projectDir);
-    const { stdout, stderr, passed } = await this.execWithTimeout(command, projectDir, timeoutMs);
-    const output = stdout + '\n' + stderr;
+    const { stdout, stderr, passed, timedOut } = await this.execWithTimeout(command, projectDir, timeoutMs);
+    const output = this.annotateIfTimedOut(stdout + '\n' + stderr, timedOut, timeoutMs);
     return {
       passed,
       output,
@@ -120,14 +129,19 @@ export class VitestRunner extends BaseTestRunner {
     // automatically — no extra reporter flag needed (json-summary is not a built-in
     // in vitest v4 and causes a startup crash if specified).
     const command = this.resolveCoverageCommand(projectDir);
-    const { stdout, stderr, passed } = await this.execWithTimeout(command, projectDir, timeoutMs);
-    const output = stdout + '\n' + stderr;
+    const { stdout, stderr, passed, timedOut } = await this.execWithTimeout(command, projectDir, timeoutMs);
+    const output = this.annotateIfTimedOut(stdout + '\n' + stderr, timedOut, timeoutMs);
     return {
       passed,
       output,
       metrics: this.parseTestMetrics(output),
       coverage: this.parseJSONCoverage(projectDir) || this.parseTextCoverage(output)
     };
+  }
+
+  protected annotateIfTimedOut(output: string, timedOut: boolean | undefined, timeoutMs: number): string {
+    if (!timedOut) return output;
+    return `[TIMEOUT after ${timeoutMs / 1000}s — output below is partial; counts and summary may be missing]\n${output}`;
   }
 
   /**

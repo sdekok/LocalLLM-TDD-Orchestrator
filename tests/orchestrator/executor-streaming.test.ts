@@ -127,16 +127,24 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
     fs.rmSync(projectDir, { recursive: true, force: true });
   });
 
-  // ── no-op when chatMessage is absent ──────────────────────────────────────
+  // ── no chat posting when chatMessage is absent, but accumulator still works ─
 
-  it('does nothing when chatMessage is null', () => {
+  it('does not post to chatMessage when chatMessage is null, but still accumulates text for getTurnText()', () => {
     const { session, fire } = makeMockSession();
     (executor as any).chatMessage = null;
-    (executor as any).subscribeToSession(session, 'Label');
+    const handle = (executor as any).subscribeToSession(session, 'Label');
+
+    // Subscribe must still happen — the helper owns the text accumulator,
+    // which reviewer/arbiter rely on to parse verdicts even when chat streaming is off.
+    expect(session.subscribe).toHaveBeenCalledOnce();
 
     fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    expect(session.subscribe).not.toHaveBeenCalled();
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'APPROVED: true' }));
+
+    // chatMessage must not have been invoked
     expect(chatMessage).not.toHaveBeenCalled();
+    // But the accumulator captured the text
+    expect(handle.getTurnText()).toBe('APPROVED: true');
   });
 
   // ── thinking_start ────────────────────────────────────────────────────────
@@ -343,6 +351,77 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
     fire({ type: 'compaction_start', reason: 'threshold' });
 
     expect(chatMessage).not.toHaveBeenCalled();
+  });
+
+  // ── handle API: getTurnText / resetTurnText / dispose ────────────────────
+
+  it('handle.getTurnText accumulates text_end content across multiple stream events', () => {
+    const { session, fire } = makeMockSession();
+    const handle = (executor as any).subscribeToSession(session, 'L');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'DONE: part one.' }));
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: ' And also part two.' }));
+
+    expect(handle.getTurnText()).toBe('DONE: part one. And also part two.');
+  });
+
+  it('handle.resetTurnText clears accumulated text for the next turn', () => {
+    const { session, fire } = makeMockSession();
+    const handle = (executor as any).subscribeToSession(session, 'L');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'turn one' }));
+    expect(handle.getTurnText()).toBe('turn one');
+
+    handle.resetTurnText();
+    expect(handle.getTurnText()).toBe('');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'turn two' }));
+    expect(handle.getTurnText()).toBe('turn two');
+  });
+
+  it('handle.dispose stops further events from mutating state or reaching chatMessage', () => {
+    const { session, fire } = makeMockSession();
+    const handle = (executor as any).subscribeToSession(session, 'L');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'before dispose' }));
+    handle.dispose();
+    chatMessage.mockClear();
+
+    // Post-dispose: any events must be no-ops
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'after dispose' }));
+    fire({ type: 'tool_execution_start', toolName: 'edit', args: { path: 'x' } });
+
+    expect(chatMessage).not.toHaveBeenCalled();
+    expect(handle.getTurnText()).toBe('before dispose');
+  });
+
+  it('handle falls back to message_end content when no text_end has fired yet', () => {
+    // Non-streaming SDK path: some sessions publish the final text only via
+    // message_end.message.content — the helper must pick it up as a fallback.
+    const { session, fire } = makeMockSession();
+    const handle = (executor as any).subscribeToSession(session, 'L');
+
+    fire({
+      type: 'message_end',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: 'APPROVED: true\nFEEDBACK: ok' }],
+      },
+    });
+
+    expect(handle.getTurnText()).toContain('APPROVED: true');
+  });
+
+  it('handle does NOT overwrite text_end accumulator from message_end (streaming path wins)', () => {
+    // Reasoning-model path: text_end streams the real content, message_end.message.content
+    // may be empty. Ensure text_end's accumulated value is preserved.
+    const { session, fire } = makeMockSession();
+    const handle = (executor as any).subscribeToSession(session, 'L');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'streamed verdict' }));
+    fire({ type: 'message_end', message: { role: 'assistant', content: [] } });
+
+    expect(handle.getTurnText()).toBe('streamed verdict');
   });
 });
 

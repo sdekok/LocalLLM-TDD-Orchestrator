@@ -25,6 +25,82 @@ import { getAskUserForClarificationParams, type AskUserForClarificationArgs } fr
 
 const PI_AGENT_DIR = path.join(os.homedir(), '.pi', 'agent');
 
+// ─── Live session registry ──────────────────────────────────────────────────
+//
+// Sub-agent sessions hold resources outside the Node process (llama.cpp slots,
+// MCP child processes, open file descriptors). If the orchestrator is killed
+// mid-workflow — Ctrl-C, SIGTERM from the IDE, unhandled rejection — those
+// resources can remain occupied, which is the root cause of "slot stuck" and
+// MCP warm-up flakiness the next time a session is created.
+//
+// We keep a module-level set of every session we hand out and register a
+// best-effort shutdown handler that disposes them all. The handler is attached
+// exactly once, regardless of how many sub-agent sessions get created.
+
+const ACTIVE_SESSIONS = new Set<AgentSession>();
+let shutdownHandlerInstalled = false;
+
+function installShutdownHandler(): void {
+  if (shutdownHandlerInstalled) return;
+  shutdownHandlerInstalled = true;
+
+  const disposeAll = (reason: string) => {
+    if (ACTIVE_SESSIONS.size === 0) return;
+    const logger = getLogger();
+    logger.warn(`[SUBAGENT FACTORY] Shutdown (${reason}) — disposing ${ACTIVE_SESSIONS.size} active session(s)`);
+    for (const session of ACTIVE_SESSIONS) {
+      try { session.dispose(); } catch { /* best-effort */ }
+    }
+    ACTIVE_SESSIONS.clear();
+  };
+
+  // Signals: let the default behaviour run AFTER we clean up. We attach with
+  // `once` so repeated Ctrl-C doesn't re-trigger disposal; the second signal
+  // will kill the process via Node's default handler.
+  process.once('SIGINT', () => { disposeAll('SIGINT'); process.exit(130); });
+  process.once('SIGTERM', () => { disposeAll('SIGTERM'); process.exit(143); });
+
+  // beforeExit fires when the event loop is empty — a natural termination path.
+  // exit() is last-ditch; dispose is synchronous but we do it anyway.
+  process.once('beforeExit', () => disposeAll('beforeExit'));
+  process.once('exit', () => disposeAll('exit'));
+
+  // Unhandled errors: dispose before Node's default crash, so the operator
+  // doesn't have to hunt for zombie llama.cpp slots after a bug.
+  process.once('uncaughtException', (err) => {
+    disposeAll('uncaughtException');
+    // Rethrow so Node's default handler still prints + exits.
+    throw err;
+  });
+  process.once('unhandledRejection', (reason) => {
+    disposeAll('unhandledRejection');
+    // Node's default is to warn-then-exit (since Node 15); we let that run.
+    getLogger().error(`[SUBAGENT FACTORY] unhandledRejection: ${reason}`);
+  });
+}
+
+/**
+ * Wrap a session so that calling `.dispose()` (from any call site) also
+ * unregisters it from the live set. Returns the same session object — the
+ * wrapping is applied in-place by replacing `dispose`.
+ */
+function trackSession(session: AgentSession): AgentSession {
+  installShutdownHandler();
+  ACTIVE_SESSIONS.add(session);
+
+  const originalDispose = session.dispose.bind(session);
+  (session as any).dispose = () => {
+    ACTIVE_SESSIONS.delete(session);
+    return originalDispose();
+  };
+  return session;
+}
+
+/** Test / diagnostic helper. Returns the number of sessions currently registered. */
+export function _activeSessionCount(): number {
+  return ACTIVE_SESSIONS.size;
+}
+
 /**
  * Resolve Pi extension package paths from ~/.pi/agent/settings.json so the
  * subagent session loads the same extensions as the main Pi session (including
@@ -121,12 +197,58 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   const feedbackContext = options.feedback
     ? `\n\nPREVIOUS ATTEMPT FAILED. Feedback for this attempt:\n${options.feedback}\n\nFix these issues.`
     : '';
-  
+
   const finalPrompt = options.systemPrompt.replace('{feedbackContext}', feedbackContext);
+
+  // Detect which optional Pi extensions the subagent will have access to,
+  // so the prompt doesn't promise tools the session can't actually call.
+  // We check the configured extension packages before session creation so
+  // the guidance is baked into the system prompt (which Pi caches at session
+  // init time and does not re-read later).
+  const extensionPaths = resolveAgentExtensionPaths(PI_AGENT_DIR);
+  const extHay = extensionPaths.join('|').toLowerCase();
+  const hasContextMode = extHay.includes('context-mode') || extHay.includes('pi-mcp-adapter');
+  const hasLens = extHay.includes('pi-lens');
+  const hasWebSearch = !!process.env['SEARXNG_URL'];
+
+  const toolsGuidance = hasContextMode
+    ? `## Context Mode (MANDATORY)
+
+Default to context-mode for ALL commands. Only use Bash for guaranteed-small-output operations.
+
+### Bash Whitelist (Safe to run directly)
+- **File mutations**: \`mkdir\`, \`mv\`, \`cp\`, \`rm\`, \`touch\`, \`chmod\`
+- **Git writes**: \`git add\`, \`git commit\` — these are the only git operations you are permitted to run
+- **Navigation**: \`cd\`, \`pwd\`, \`which\`
+- **Process control**: \`kill\`, \`pkill\`
+- **Package management**: \`{packageManager} install\`, \`{packageManager} publish\`, \`pip install\`
+- **Simple output**: \`echo\`, \`printf\`
+
+**Everything else → \`ctx_execute\` or \`ctx_execute_file\`.**
+
+### Critical Anti-Patterns to Avoid
+- **DO NOT** \`cat\` large files via Bash. Use \`ctx_execute_file\`.
+- **DO NOT** use \`head\` or \`tail\` via Bash to "save" context; you lose data. Use code in \`ctx_execute\` to process the full dataset and print a summary.`
+    : `## Command Execution
+
+This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_execute_file\`). Use \`bash\` to run commands directly. Keep command output small:
+
+- When a command might produce a lot of output, pipe through a summary (e.g. \`grep\`, \`awk\`, \`head\`) — but always prefer narrow, targeted commands over large greps.
+- For reading files, use \`read\` rather than \`cat\`.
+- For file mutations, use \`write\` or \`edit\` rather than shell redirects.
+- **Git writes** (\`git add\`, \`git commit\`) are allowed. **Do NOT** run \`git merge\`, \`git push\`, \`git checkout <other>\`, or \`git branch -d\`.`;
+
+  const runCommandGuidance = hasContextMode
+    ? `**Running commands**: Prefer \`ctx_execute('{testCommand}')\` for test runs and long-output commands. Use \`bash\` only for short, whitelisted operations.`
+    : `**Running commands**: Use the \`bash\` tool for command execution (including \`{testCommand}\`). There is no \`ctx_execute\` tool in this session.`;
+
+  logger.info(`[SUBAGENT FACTORY] Tool detection: contextMode=${hasContextMode}, lens=${hasLens}, webSearch=${hasWebSearch}`);
 
   // Populate task metadata placeholders from Epic/WorkItem context
   const meta = options.taskMetadata;
   const populatedPrompt = finalPrompt
+    .replace(/{toolsGuidance}/g, toolsGuidance)
+    .replace(/{runCommandGuidance}/g, runCommandGuidance)
     .replace(/{acceptance}/g, meta?.acceptance?.length ? meta.acceptance.map(a => `- ${a}`).join('\n') : 'None specified')
     .replace(/{security}/g, meta?.security || 'None specified')
     .replace(/{tests}/g, meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
@@ -186,9 +308,10 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
     customTools = [...(customTools || []), ...options.customTools];
   }
 
-  // Load the same extensions Pi itself uses (pi-lens, pi-mcp-adapter, etc.)
-  // so MCP servers like context-mode are available in the subagent session.
-  const extensionPaths = resolveAgentExtensionPaths(PI_AGENT_DIR);
+  // extensionPaths was resolved earlier (we needed it for tool-guidance detection)
+  // and is reused here to register the same extensions Pi itself uses (pi-lens,
+  // pi-mcp-adapter, etc.) so MCP servers like context-mode are available in
+  // the subagent session.
 
   // When thinking mode is active, register an extension that strips thinking
   // blocks from prior assistant messages. Keeping only the final visible answer
@@ -266,7 +389,10 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   logger.info(`[SUBAGENT FACTORY] Agent session created successfully`);
   logger.info(`[SUBAGENT FACTORY] Thinking level: ${thinkingLevel}`);
   logger.info(`[SUBAGENT FACTORY] Session setup complete`);
-  return session;
+
+  // Register the session for emergency shutdown cleanup. This wraps dispose()
+  // so every existing call site automatically unregisters on normal disposal.
+  return trackSession(session);
 }
 
 /**

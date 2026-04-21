@@ -92,10 +92,23 @@ export class StateManager {
       // Re-ensure the directory exists — it may have been removed after construction
       // (e.g. git clean, fresh project, or manual deletion).
       fs.mkdirSync(path.dirname(this.stateFile), { recursive: true });
-      fs.writeFileSync(tmpPath, data, 'utf-8');
+
+      // Durable write: write to a temp file, fsync it, THEN atomic rename.
+      // Without the explicit fsync, the rename is "atomic" only with respect to
+      // visibility — the file's *contents* may still be in the page cache, so a
+      // power cut or hard kernel panic after the rename can leave a zero-byte
+      // or half-written state.json. Since we track expensive long-running
+      // agent progress here, we pay the extra syscall to survive crashes.
+      const fd = fs.openSync(tmpPath, 'w');
+      try {
+        fs.writeSync(fd, data, 0, 'utf-8');
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
       fs.renameSync(tmpPath, this.stateFile);
     } catch (err) {
-      try { fs.unlinkSync(tmpPath); } catch {}
+      try { fs.unlinkSync(tmpPath); } catch { /* tmp may already be gone */ }
       throw err;
     }
   }

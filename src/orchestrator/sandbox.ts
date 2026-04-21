@@ -325,7 +325,12 @@ export class Sandbox {
     try {
       await execFileAsync('git', ['merge', safeSandbox, '--no-edit'], { cwd: this.projectDir, ...EXEC_OPTS });
     } catch (mergeErr) {
-      const mergeMsg = String(mergeErr);
+      // `execFile` errors report conflicts via the *stdout* of the failed process
+      // ("CONFLICT (add/add): ..."), NOT via err.message / toString(). Examine
+      // stdout/stderr + message together so we don't miss conflict detection and
+      // throw a generic "Command failed" error instead of entering recovery.
+      const e = mergeErr as { stdout?: string; stderr?: string; message?: string };
+      const mergeMsg = [e.stdout, e.stderr, e.message].filter(Boolean).join('\n');
       if (!mergeMsg.includes('CONFLICT') && !mergeMsg.includes('Automatic merge failed')) {
         throw mergeErr; // Not a merge conflict — propagate as-is
       }
