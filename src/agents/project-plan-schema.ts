@@ -1,26 +1,37 @@
 import { z } from 'zod';
 
+// Models sometimes write null or a non-array value for optional list fields.
+// This preprocessor coerces any non-array to undefined so optional() accepts it.
+const optionalStringArray = (description: string) =>
+  z.preprocess(
+    v => (Array.isArray(v) ? v : undefined),
+    z.array(z.string()).optional().describe(description)
+  );
+
 // ─── Work Item ────────────────────────────────────────────────────────────────
 
 export const WorkItemSchema = z.object({
   id: z.string().describe("A unique identifier (e.g., 'WI-1')."),
   title: z.string().describe("The title of the work item."),
   description: z.string().describe("One sentence: what this does and why."),
-  filesToCreate: z.array(z.string()).optional().describe("Files to create, each as 'path/to/file - reason'."),
-  filesToModify: z.array(z.string()).optional().describe("Files to modify, each as 'path/to/file - reason'."),
-  dependencies: z.object({
-    read: z.array(z.string()).optional().describe("Docs or files to read before starting."),
-    blocksOn: z.array(z.string()).optional().describe("Work item IDs this blocks on (e.g. 'WI-2')."),
-  }).optional().describe("Read dependencies and blocking work items."),
-  implementationSteps: z.array(z.string()).optional().describe("Ordered implementation steps."),
-  technicalConstraints: z.array(z.string()).optional().describe("Libraries, conventions, or patterns to follow."),
+  filesToCreate: optionalStringArray("Files to create, each as 'path/to/file - reason'."),
+  filesToModify: optionalStringArray("Files to modify, each as 'path/to/file - reason'."),
+  dependencies: z.preprocess(
+    v => (v && typeof v === 'object' && !Array.isArray(v) ? v : undefined),
+    z.object({
+      read: optionalStringArray("Docs or files to read before starting."),
+      blocksOn: optionalStringArray("Work item IDs this blocks on (e.g. 'WI-2')."),
+    }).optional().describe("Read dependencies and blocking work items.")
+  ),
+  implementationSteps: optionalStringArray("Ordered implementation steps."),
+  technicalConstraints: optionalStringArray("Libraries, conventions, or patterns to follow."),
   acceptance: z.array(z.string()).describe("Specific, verifiable acceptance criteria."),
   security: z.string().optional().describe("Specific security considerations for this work item."),
   tests: z.array(z.string()).describe("Test cases, prefixed with type: 'Unit: ...', 'Integration: ...', 'Visual: ...'."),
-  edgeCases: z.array(z.string()).optional().describe("Edge cases to handle (null/empty, loading, error, responsive)."),
-  relatedDocs: z.array(z.string()).optional().describe("Paths to related documentation files."),
+  edgeCases: optionalStringArray("Edge cases to handle (null/empty, loading, error, responsive)."),
+  relatedDocs: optionalStringArray("Paths to related documentation files."),
   devNotes: z.string().optional().describe("Implementation notes, technical gotchas, or library recommendations."),
-  filesAffected: z.array(z.string()).optional().describe("Legacy: list of files likely to be touched (use filesToCreate/filesToModify instead)."),
+  filesAffected: optionalStringArray("Legacy: list of files likely to be touched (use filesToCreate/filesToModify instead)."),
 });
 
 // ─── Epic ─────────────────────────────────────────────────────────────────────
