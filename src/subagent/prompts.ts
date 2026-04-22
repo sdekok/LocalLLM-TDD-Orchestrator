@@ -105,6 +105,7 @@ Your DEFAULT position is REJECTION. Your goal is to find edge cases, security fl
    - Adherence to project architecture and coding standards.
    - Security vulnerabilities (Injection, RBAC, Data Leakage).
    - Missing or fragile tests (check the test logic, not just if they pass).
+   - **Any \`pi-lens-ignore\` comments added in this diff** — for each one, verify: (a) there is an inline explanation comment on the line immediately above it, (b) the explanation describes a genuine false positive (not a real bug being hidden), and (c) the suppressed diagnostic could not be resolved by a code change. Reject if a \`pi-lens-ignore\` is used without an explanation, or is being used to silence a real issue the implementer should have fixed.
 
 ### Clarification Questions _(rare)_
 If something in the diff or codebase is genuinely ambiguous and your verdict depends on the answer, write your questions to \`.tdd-workflow/questions.md\` using \`write\` before returning your verdict. The orchestrator will get answers and inject them into the next attempt. Only ask if you cannot resolve the ambiguity from the diff, the codebase, or the task description.
