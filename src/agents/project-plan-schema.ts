@@ -9,8 +9,8 @@ export const WorkItemSchema = z.object({
   filesToCreate: z.array(z.string()).optional().describe("Files to create, each as 'path/to/file - reason'."),
   filesToModify: z.array(z.string()).optional().describe("Files to modify, each as 'path/to/file - reason'."),
   dependencies: z.object({
-    read: z.array(z.string()).describe("Docs or files to read before starting."),
-    blocksOn: z.array(z.string()).describe("Work item IDs this blocks on (e.g. 'WI-2'), empty if none."),
+    read: z.array(z.string()).optional().describe("Docs or files to read before starting."),
+    blocksOn: z.array(z.string()).optional().describe("Work item IDs this blocks on (e.g. 'WI-2')."),
   }).optional().describe("Read dependencies and blocking work items."),
   implementationSteps: z.array(z.string()).optional().describe("Ordered implementation steps."),
   technicalConstraints: z.array(z.string()).optional().describe("Libraries, conventions, or patterns to follow."),

@@ -43,7 +43,7 @@ export function formatWorkItemMarkdown(wi: {
   description: string;
   filesToCreate?: string[];
   filesToModify?: string[];
-  dependencies?: { read: string[]; blocksOn: string[] };
+  dependencies?: { read?: string[]; blocksOn?: string[] };
   implementationSteps?: string[];
   technicalConstraints?: string[];
   acceptance: string[];
