@@ -31,7 +31,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.65.0",
+    "@mariozechner/pi-coding-agent": "^0.68.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
     "@sinclair/typebox": "^0.34.28",

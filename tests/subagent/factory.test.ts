@@ -6,12 +6,12 @@ import { IMPLEMENTER_PROMPT } from '../../src/subagent/prompts.js';
 // Mock Pi SDK
 vi.mock('@mariozechner/pi-coding-agent', () => {
   const DefaultResourceLoader = vi.fn().mockImplementation(function(this: any, config) {
-    this.systemPromptOverride = config.systemPromptOverride;
+    this.systemPrompt = config.systemPrompt;
     this.reload = vi.fn().mockResolvedValue(undefined);
   });
 
   const createAgentSession = vi.fn().mockImplementation(async (options) => {
-    const systemPrompt = options.resourceLoader?.systemPromptOverride?.() || '';
+    const systemPrompt = options.resourceLoader?.systemPrompt ?? '';
     return {
       session: {
         agent: { state: { systemPrompt } },
@@ -31,12 +31,6 @@ vi.mock('@mariozechner/pi-coding-agent', () => {
       inMemory: vi.fn().mockReturnValue({}),
     },
     DefaultResourceLoader,
-    createCodingTools: vi.fn().mockReturnValue([]),
-    createReadOnlyTools: vi.fn().mockReturnValue([]),
-    createBashTool: vi.fn().mockReturnValue({}),
-    createGrepTool: vi.fn().mockReturnValue({}),
-    createFindTool: vi.fn().mockReturnValue({}),
-    createLsTool: vi.fn().mockReturnValue({}),
   };
 });
 

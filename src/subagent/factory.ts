@@ -1,12 +1,6 @@
 import {
   createAgentSession,
   SessionManager,
-  createCodingTools,
-  createReadOnlyTools,
-  createBashTool,
-  createGrepTool,
-  createFindTool,
-  createLsTool,
   DefaultResourceLoader,
   type AgentSession,
   type ToolDefinition,
@@ -263,18 +257,18 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   logger.info(`[SUBAGENT FACTORY] System prompt: ~${estimatedTokens} tokens (${populatedPrompt.length} chars)`);
   logger.info(`[SUBAGENT FACTORY] System prompt preview: ${populatedPrompt.substring(0, 200)}...`);
 
-  // Build the tools list
-  let baseTools: any[];
+  // Build the tool allowlist (string names — 0.68.0 API)
+  let toolNames: string[];
   if (options.tools === 'none') {
-    baseTools = [];
+    toolNames = [];
   } else if (options.tools === 'readonly') {
-    baseTools = createReadOnlyTools(options.cwd);
+    toolNames = ['read', 'grep', 'find', 'ls'];
   } else if (options.tools === 'review') {
-    // Reviewer: read-only tools + bash for running tests/inspecting, but no write/edit
-    baseTools = [...createReadOnlyTools(options.cwd), createBashTool(options.cwd)];
+    // Reviewer: read + search + bash for running tests, but no write/edit
+    toolNames = ['read', 'bash', 'grep', 'find', 'ls'];
   } else {
-    // Coding: full editing tools + search tools for code navigation
-    baseTools = [...createCodingTools(options.cwd), createGrepTool(options.cwd), createFindTool(options.cwd), createLsTool(options.cwd)];
+    // Coding: full editing tools + search tools
+    toolNames = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'];
   }
 
   logger.info(`[SUBAGENT FACTORY] Tools loaded: ${options.tools || 'coding'}`);
@@ -323,12 +317,12 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   }
 
   const loader = new DefaultResourceLoader({
+    cwd: options.cwd,
+    agentDir: PI_AGENT_DIR,
     additionalExtensionPaths: extensionPaths,
     extensionFactories,
-    systemPromptOverride: () => populatedPrompt,
-    appendSystemPromptOverride: () => [],
-    noExtensions: false,
-    noSkills: false,
+    systemPrompt: populatedPrompt,
+    appendSystemPrompt: [],
   });
   await loader.reload();
 
@@ -340,7 +334,7 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     cwd: options.cwd,
     sessionManager: SessionManager.inMemory(), // Ephemeral session
     resourceLoader: loader,
-    tools: baseTools,
+    tools: toolNames,
     customTools,
   });
 
