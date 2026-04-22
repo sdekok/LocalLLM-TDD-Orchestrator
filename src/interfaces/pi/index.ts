@@ -326,7 +326,9 @@ export default function(pi: ExtensionAPI) {
         `\n\n## Rules\n` +
         `- Fix ONLY what is explicitly listed above. Do not refactor unrelated code.\n` +
         `- Each subtask should be scoped to a single package or file group.\n` +
-        `- Commit fixes separately from any feature work.`;
+        `- Commit fixes separately from any feature work.\n` +
+        `- **pi-lens-ignore**: For issues that are genuinely unfixable (e.g. a third-party type mismatch, a generated file, or a pattern that is architecturally intentional), suppress with \`// pi-lens-ignore\` and add an inline comment on the line above explaining why. The goal is a clean \`/lens-booboo\` report — use suppression to silence real false positives, not to avoid real fixes.\n` +
+        `- After all fixes are committed, run \`/lens-booboo\` (if available) and confirm the report is clean before signalling DONE.`;
 
       // Lazy-init the same executor used by /tdd so event wiring is shared.
       if (!stateManager) {

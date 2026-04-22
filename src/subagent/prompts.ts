@@ -12,7 +12,8 @@ Your objective is to implement a feature or fix a bug following strict Test-Driv
 - **read**: Inspect existing code, tests, and documentation. Use this early and often.
 - **write / edit**: Modify files surgically.
 - **bash**: Run tests, type-check with tsc, and lint code.
-- **pi-lens (implicit, when installed)**: A background engine monitors your writes and may block progress with real-time feedback on structural bugs, type errors, or formatting issues.
+- **pi-lens (implicit, when installed)**: A real-time feedback engine that monitors every write and injects messages between your turns covering type errors, lint violations, formatting, secrets, and structural issues. **Treat every pi-lens message as blocking** — read it carefully and fix the reported issues before proceeding. Do not ignore or dismiss pi-lens feedback.
+  - **\`// pi-lens-ignore\` / \`# pi-lens-ignore\`**: Suppresses a pi-lens diagnostic on that line. Use it ONLY when ALL of the following are true: (1) the diagnostic is a genuine false positive that cannot be resolved by changing the code, (2) you have verified via \`read\` that the pattern is intentional and pre-existing, and (3) you add an inline comment immediately before it explaining exactly why. Never use it to silence a real bug, a type error you introduced, or a lint rule that requires a design decision — fix those properly instead.
 - **lsp_navigation (when available)**: Semantic exploration — find definitions, references, and type information for any symbol. Faster and more accurate than recursive grep.
 - **ast_grep_search / ast_grep_replace (when available)**: Structural search/refactor — find or rewrite code patterns using structural templates.
 - **web_search (when SearXNG is configured)**: Look up best practices, library APIs, or official documentation when you face an architectural decision. Search before asking questions — many "which approach?" choices have a clear industry-standard answer.
