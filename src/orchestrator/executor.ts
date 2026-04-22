@@ -67,7 +67,6 @@ export interface ExecutorOptions {
 }
 
 const MAX_ATTEMPTS = 5;
-const MAX_ARBITER_EXTRA_ROUNDS = 10;           // Max extra rounds the arbiter may grant
 const MAX_IMPLEMENTER_DURATION_MS = 60 * 60 * 1000;  // 60 minutes for the implementer
 const MAX_REVIEWER_DURATION_MS    = 60 * 60 * 1000;  // 60 minutes for the reviewer
 const MAX_ARBITER_DURATION_MS     = 20 * 60 * 1000;  // 20 minutes for the arbiter
@@ -75,6 +74,13 @@ const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole 
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
 const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
+
+/** One record per implement→review cycle, used by the arbiter for loop detection. */
+interface IterationRecord {
+  attempt: number;
+  implementerSummary: string;
+  reviewerFeedback: string;
+}
 
 /**
  * Detect if two strings are suspiciously similar (agent is looping).
@@ -664,6 +670,8 @@ export class WorkflowExecutor {
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
+        // Accumulates one entry per implement→review cycle for arbiter loop detection.
+        const iterationHistory: IterationRecord[] = [];
         // Two-pass outer loop: pass 0 = normal attempts, pass 1 = arbiter-granted extra rounds.
         let arbiterExtraRounds = 0;
         for (let pass = 0; pass <= 1 && !approved; pass++) {
@@ -694,6 +702,7 @@ export class WorkflowExecutor {
           }
 
           // Phase 2: Implementing
+          let implementerSummary = '';
           if (!task.phase || task.phase === 'refining' || task.phase === 'implementing') {
             // Only touch the branch when we are not already on the task branch.
             // After a reviewer rejection we stay on the task branch so the implementer
@@ -815,6 +824,9 @@ export class WorkflowExecutor {
                 logger.warn(`[${task.id}] Implementer never signalled DONE after ${MAX_NUDGES} nudges — proceeding to quality gates anyway`);
               }
             }
+
+            // Capture the implementer's DONE summary for arbiter loop detection.
+            implementerSummary = handle.getTurnText();
 
             // Interrupt check at the end of the implementer phase: if a pause
             // landed during the current turn, stop here before spending budget
@@ -949,6 +961,12 @@ export class WorkflowExecutor {
                   );
                 }
                 lastAttemptBlockedByPreexisting = false;
+
+                iterationHistory.push({
+                  attempt,
+                  implementerSummary: implementerSummary || '(no DONE message captured)',
+                  reviewerFeedback: `Quality gates failed: ${regressionReports.join(' | ').substring(0, 300)}`,
+                });
 
                 this.state.updateSubtask(task.id, { phase: undefined });
                 continue;
@@ -1089,6 +1107,12 @@ export class WorkflowExecutor {
                 ? `${reviewerFeedback}\n\n${reviewerAnswers}`
                 : reviewerFeedback;
 
+              iterationHistory.push({
+                attempt,
+                implementerSummary: implementerSummary || '(no DONE message captured)',
+                reviewerFeedback,
+              });
+
               // Emit detailed feedback for TUI
               this.events.emit('taskProgress', {
                 id: task.id,
@@ -1147,7 +1171,7 @@ export class WorkflowExecutor {
           // Skip when a pause/stop interrupt is pending — the user has told us to
           // halt the workflow, not spend more budget calling another agent.
           if (pass === 0 && !approved && !this.stopRequested && !this.pauseRequested) {
-            const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed);
+            const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed, iterationHistory);
             if (arbiterDecision.decision === 'approve') {
               if (lastQualityGatesPassed) {
                 approved = true; // fall through to Phase 5 merge
@@ -1316,6 +1340,7 @@ export class WorkflowExecutor {
     changedFiles: string[],
     feedback: string,
     qualityGatesPassed: boolean,
+    iterationHistory: IterationRecord[],
   ): Promise<{ decision: 'approve' | 'continue' | 'escalate'; rounds: number; rationale: string }> {
     const logger = getLogger();
     this.chatMessage?.(`⚖️ **[${task.id}]** All ${MAX_ATTEMPTS} attempts exhausted — calling neutral arbiter…`, 'tdd-arbiter');
@@ -1324,10 +1349,18 @@ export class WorkflowExecutor {
       ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${diff.length > 6000 ? diff.substring(0, 6000) + '\n… (truncated)' : diff}\n\`\`\``
       : '\n\n## Diff\n(no diff captured)';
 
+    const historySummary = iterationHistory.length > 0
+      ? `\n\n## Iteration History (${iterationHistory.length} attempt(s))\n` +
+        iterationHistory.map(r =>
+          `### Attempt ${r.attempt}\n**Implementer claimed:** ${r.implementerSummary.substring(0, 300)}\n**Reviewer feedback:** ${r.reviewerFeedback.substring(0, 300)}`
+        ).join('\n\n')
+      : '';
+
     const arbiterPrompt =
       `## Task\n${task.description}\n\n` +
       `## Quality Gates\n${qualityGatesPassed ? '✅ Passed' : '❌ Failed — code has blocking quality issues'}\n\n` +
       `## Reviewer\'s Final Feedback\n${feedback || '(no feedback recorded)'}` +
+      historySummary +
       diffSummary;
 
     const arbiterSession = await createSubAgentSession({
@@ -1361,7 +1394,7 @@ export class WorkflowExecutor {
     const rationaleMatch = arbiterText.match(/RATIONALE:\s*(.+)/i);
 
     const decision  = (decisionMatch?.[1]?.toLowerCase() ?? 'escalate') as 'approve' | 'continue' | 'escalate';
-    const rounds    = Math.min(parseInt(roundsMatch?.[1] ?? '1', 10), MAX_ARBITER_EXTRA_ROUNDS);
+    const rounds    = parseInt(roundsMatch?.[1] ?? '1', 10);
     const rationale = rationaleMatch?.[1]?.trim() ?? 'Arbiter provided no rationale.';
 
     logger.info(`Arbiter decision: ${decision} (rounds=${rounds}) — ${rationale}`);
@@ -1393,7 +1426,7 @@ export class WorkflowExecutor {
       `**Diff preview:**\n\`\`\`diff\n${diffPreview}\n\`\`\`\n\n` +
       `**Your options (reply with one):**\n` +
       `- \`approve\` — accept the current implementation as-is\n` +
-      `- \`continue 1\` / \`continue 2\` / \`continue 3\` — grant more rounds\n` +
+      `- \`continue N\` — grant N more rounds (e.g. \`continue 3\`)\n` +
       `- \`stop\` — mark as failed and move on`;
 
     this.chatMessage?.(msg);
@@ -1410,7 +1443,7 @@ export class WorkflowExecutor {
     if (lower === 'approve') return { action: 'approve', rounds: 0 };
     const continueMatch = lower.match(/^continue\s+(\d+)$/);
     if (continueMatch) {
-      return { action: 'continue', rounds: Math.min(parseInt(continueMatch[1]!, 10), MAX_ARBITER_EXTRA_ROUNDS) };
+      return { action: 'continue', rounds: parseInt(continueMatch[1]!, 10) };
     }
     return { action: 'stop', rounds: 0 };
   }
