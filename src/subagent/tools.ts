@@ -1,4 +1,4 @@
-import { Type } from '@sinclair/typebox';
+import { Type } from 'typebox';
 
 /**
  * TypeBox schema for the ask_user_for_clarification tool.

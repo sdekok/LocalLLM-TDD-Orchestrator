@@ -292,6 +292,7 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
         return {
           content: [{ type: 'text', text: response }],
           details: { question, answer: response },
+          terminate: true,
         };
       },
     };

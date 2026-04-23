@@ -31,10 +31,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "^0.68.0",
+    "@mariozechner/pi-coding-agent": "^0.69.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
-    "@sinclair/typebox": "^0.34.28",
+    "typebox": "^1.1.31",
     "jsdom": "^29.0.2",
     "json5": "^2.2.3",
     "openai": "^6.33.0",
