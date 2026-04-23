@@ -245,10 +245,14 @@ export class WorkflowExecutor {
     messageType: string,
   ): { getTurnText(): string; resetTurnText(): void; dispose(): void } {
     const chatMessage = this.chatMessage;
+    const logger = getLogger();
     const CHUNK_SIZE = 800;
     let thinkingBuffer = '';
     let turnText = '';
     let disposed = false;
+
+    /** Terminal signals that are worth surfacing in Pi chat. */
+    const isTerminalSignal = (text: string) => /DONE:|APPROVED:|DECISION:/i.test(text);
 
     session.subscribe((event: any) => {
       if (disposed) return;
@@ -257,22 +261,26 @@ export class WorkflowExecutor {
         const ae = event.assistantMessageEvent;
         if (ae?.type === 'thinking_start') {
           thinkingBuffer = '';
-          chatMessage?.(`**[${label}]** 💭 _Thinking…_`, messageType);
+          logger.stream(label, '💭 Thinking…');
         } else if (ae?.type === 'thinking_delta' && ae.delta) {
           thinkingBuffer += ae.delta;
           while (thinkingBuffer.length >= CHUNK_SIZE) {
-            chatMessage?.(`**[${label}]** 💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`, messageType);
+            logger.stream(label, `💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`);
             thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
           }
         } else if (ae?.type === 'thinking_end') {
           if (thinkingBuffer.trim()) {
-            chatMessage?.(`**[${label}]** 💭 ${thinkingBuffer}`, messageType);
+            logger.stream(label, `💭 ${thinkingBuffer}`);
             thinkingBuffer = '';
           }
         } else if (ae?.type === 'text_end' && ae.content?.trim()) {
           // Accumulate for the caller (e.g. DONE:/APPROVED: detection).
           turnText += ae.content;
-          chatMessage?.(`**[${label}]** ${ae.content}`, messageType);
+          logger.stream(label, ae.content);
+          // Only surface terminal signals in Pi chat — everything else stays in live.log.
+          if (chatMessage && isTerminalSignal(ae.content)) {
+            chatMessage(`**[${label}]** ${ae.content}`, messageType);
+          }
         }
       } else if (event.type === 'message_end'
                  && event.message?.role === 'assistant'
@@ -280,12 +288,17 @@ export class WorkflowExecutor {
         // Fallback for non-streaming / non-reasoning sessions that never
         // emit text_end but do publish the final content array.
         const text = event.message.content?.find((c: any) => c.type === 'text')?.text;
-        if (text) turnText += text;
+        if (text) {
+          turnText += text;
+          logger.stream(label, text);
+          if (chatMessage && isTerminalSignal(text)) {
+            chatMessage(`**[${label}]** ${text}`, messageType);
+          }
+        }
       } else if (event.type === 'tool_execution_start') {
-        if (!chatMessage) return;
         const toolName: string = event.toolName;
         const args = (event.args && typeof event.args === 'object') ? event.args as Record<string, unknown> : {};
-        let msg = `**[${label}]** 🔧 \`${toolName}\``;
+        let msg = `🔧 \`${toolName}\``;
 
         if (toolName === 'write') {
           const filePath = (args['path'] ?? args['file_path'] ?? '') as string;
@@ -293,7 +306,7 @@ export class WorkflowExecutor {
           msg += `: ${filePath}`;
           if (content) {
             const preview = content.length > 400 ? content.substring(0, 400) + '\n…' : content;
-            msg += `\n\`\`\`\n${preview}\n\`\`\``;
+            msg += `\n${preview}`;
           }
         } else if (toolName === 'edit') {
           const filePath = (args['path'] ?? args['file_path'] ?? '') as string;
@@ -304,15 +317,15 @@ export class WorkflowExecutor {
           for (const edit of edits.slice(0, 2)) {
             const oldPreview = edit.oldText.length > 120 ? edit.oldText.substring(0, 120) + '…' : edit.oldText;
             const newPreview = edit.newText.length > 120 ? edit.newText.substring(0, 120) + '…' : edit.newText;
-            msg += `\n\`\`\`diff\n- ${oldPreview.replace(/\n/g, '\n- ')}\n+ ${newPreview.replace(/\n/g, '\n+ ')}\n\`\`\``;
+            msg += `\n- ${oldPreview.replace(/\n/g, '\n- ')}\n+ ${newPreview.replace(/\n/g, '\n+ ')}`;
           }
-          if (edits.length > 2) msg += `\n_…and ${edits.length - 2} more edit(s)_`;
+          if (edits.length > 2) msg += `\n…and ${edits.length - 2} more edit(s)`;
         } else {
           const firstArg = Object.values(args).find(v => typeof v === 'string') as string | undefined;
           if (firstArg) msg += `: ${firstArg.length > 60 ? firstArg.substring(0, 60) + '…' : firstArg}`;
         }
 
-        chatMessage(msg, messageType);
+        logger.stream(label, msg);
       }
     });
 

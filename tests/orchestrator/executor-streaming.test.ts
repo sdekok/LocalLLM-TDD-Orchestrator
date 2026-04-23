@@ -147,130 +147,69 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
     expect(handle.getTurnText()).toBe('APPROVED: true');
   });
 
-  // ── thinking_start ────────────────────────────────────────────────────────
+  // ── thinking events → live.log only, never chatMessage ──────────────────
 
-  it('posts Thinking… immediately on thinking_start', () => {
+  it('does NOT post thinking_start to chatMessage (routes to live.log only)', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Impl WI-1');
 
     fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
 
-    expect(chatMessage).toHaveBeenCalledOnce();
-    expect(chatMessage.mock.calls[0][0]).toContain('Thinking…');
-    expect(chatMessage.mock.calls[0][0]).toContain('[Impl WI-1]');
-  });
-
-  // ── thinking_delta — buffering ────────────────────────────────────────────
-
-  it('buffers thinking_delta content and does not post until chunk threshold', () => {
-    const { session, fire } = makeMockSession();
-    (executor as any).subscribeToSession(session, 'Label');
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    chatMessage.mockClear(); // ignore the Thinking… notification
-
-    // Send something shorter than the 800-char chunk size
-    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'x'.repeat(400) }));
-
-    // Should NOT have posted a chunk yet
     expect(chatMessage).not.toHaveBeenCalled();
   });
 
-  it('posts a chunk when accumulated thinking_delta exceeds 800 chars', () => {
+  it('does NOT post thinking_delta chunks to chatMessage even when threshold exceeded', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Label');
 
     fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    chatMessage.mockClear();
-
-    // Two deltas that together exceed 800 chars
     fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'a'.repeat(500) }));
     fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'b'.repeat(400) }));
 
-    // Should have posted exactly one chunk
-    expect(chatMessage).toHaveBeenCalledOnce();
-    const posted = chatMessage.mock.calls[0][0] as string;
-    expect(posted).toContain('💭');
-    expect(posted.length).toBeLessThanOrEqual(
-      '**[Label]** 💭 '.length + 800 + 10 // some slack for prefix
-    );
-  });
-
-  it('posts multiple chunks for very long thinking content', () => {
-    const { session, fire } = makeMockSession();
-    (executor as any).subscribeToSession(session, 'Label');
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    chatMessage.mockClear();
-
-    // 2500 chars → should produce at least 3 chunks (800, 800, 900)
-    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'z'.repeat(2500) }));
-
-    expect(chatMessage.mock.calls.length).toBeGreaterThanOrEqual(3);
-  });
-
-  // ── thinking_end — flush remainder ───────────────────────────────────────
-
-  it('flushes remaining buffered thinking content on thinking_end', () => {
-    const { session, fire } = makeMockSession();
-    (executor as any).subscribeToSession(session, 'Label');
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    chatMessage.mockClear();
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'partial content' }));
-    expect(chatMessage).not.toHaveBeenCalled(); // still buffered
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'partial content' }));
-
-    expect(chatMessage).toHaveBeenCalledOnce();
-    expect(chatMessage.mock.calls[0][0]).toContain('partial content');
-  });
-
-  it('does not post on thinking_end when buffer is empty (chunk already flushed)', () => {
-    const { session, fire } = makeMockSession();
-    (executor as any).subscribeToSession(session, 'Label');
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
-    chatMessage.mockClear();
-
-    // Exactly 800 chars → flushes in the delta handler, buffer becomes empty
-    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'x'.repeat(800) }));
-    expect(chatMessage).toHaveBeenCalledOnce(); // chunk posted
-    chatMessage.mockClear();
-
-    fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'x'.repeat(800) }));
-
-    // Buffer was empty — thinking_end should post nothing
     expect(chatMessage).not.toHaveBeenCalled();
   });
 
-  it('resets the buffer on the next thinking_start so blocks do not bleed into each other', () => {
+  it('does NOT post thinking_end flush to chatMessage', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Label');
 
-    // Block 1: start, partial delta
+    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
+    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'partial content' }));
+    fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'partial content' }));
+
+    expect(chatMessage).not.toHaveBeenCalled();
+  });
+
+  it('does not post on thinking_end when buffer is empty', () => {
+    const { session, fire } = makeMockSession();
+    (executor as any).subscribeToSession(session, 'Label');
+
+    fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
+    fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'x'.repeat(800) }));
+    fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'x'.repeat(800) }));
+
+    expect(chatMessage).not.toHaveBeenCalled();
+  });
+
+  it('resets thinking buffer on next thinking_start so blocks do not bleed', () => {
+    // Verify buffer isolation even though output goes to logger, not chatMessage
+    const { session, fire } = makeMockSession();
+    (executor as any).subscribeToSession(session, 'Label');
+
     fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
     fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'block-one' }));
     fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'block-one' }));
-    chatMessage.mockClear();
-
-    // Block 2
     fire(makeMessageUpdateEvent({ type: 'thinking_start' }));
     fire(makeMessageUpdateEvent({ type: 'thinking_delta', delta: 'block-two' }));
     fire(makeMessageUpdateEvent({ type: 'thinking_end', content: 'block-two' }));
 
-    // Only block-two content should appear in the second round
-    const allCalls = chatMessage.mock.calls.map(c => c[0] as string);
-    const flushCall = allCalls.find(s => s.includes('block-two'));
-    expect(flushCall).toBeDefined();
-    const blockOneInSecondRound = allCalls.some(s => s.includes('block-one') && s.includes('block-two'));
-    expect(blockOneInSecondRound).toBe(false);
+    // No thinking output should reach chatMessage at all
+    expect(chatMessage).not.toHaveBeenCalled();
   });
 
   // ── text_end ──────────────────────────────────────────────────────────────
 
-  it('posts text_end content with label prefix', () => {
+  it('posts terminal-signal text_end (APPROVED:) to chatMessage with label prefix', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Reviewer WI-2');
 
@@ -280,6 +219,25 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
     const posted = chatMessage.mock.calls[0][0] as string;
     expect(posted).toContain('[Reviewer WI-2]');
     expect(posted).toContain('APPROVED: true');
+  });
+
+  it('posts terminal-signal text_end (DONE:) to chatMessage', () => {
+    const { session, fire } = makeMockSession();
+    (executor as any).subscribeToSession(session, 'Implementer WI-1');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: 'DONE: Added login handler' }));
+
+    expect(chatMessage).toHaveBeenCalledOnce();
+    expect(chatMessage.mock.calls[0][0]).toContain('DONE: Added login handler');
+  });
+
+  it('does NOT post non-terminal text_end to chatMessage (routes to live.log only)', () => {
+    const { session, fire } = makeMockSession();
+    (executor as any).subscribeToSession(session, 'Implementer WI-1');
+
+    fire(makeMessageUpdateEvent({ type: 'text_end', content: "I'll read the file first to understand the structure." }));
+
+    expect(chatMessage).toHaveBeenCalledTimes(0);
   });
 
   it('skips text_end when content is empty or whitespace', () => {
@@ -293,9 +251,9 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
     expect(chatMessage).not.toHaveBeenCalled();
   });
 
-  // ── tool_execution_start ──────────────────────────────────────────────────
+  // ── tool_execution_start → live.log only, never chatMessage ─────────────
 
-  it('posts tool name with arg hint on tool_execution_start', () => {
+  it('does NOT post tool_execution_start to chatMessage (routes to live.log only)', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Impl WI-3');
 
@@ -305,38 +263,20 @@ describe('subscribeToSession — event → chatMessage mapping', () => {
       args: { file_path: 'src/auth.ts', content: 'export function login() {}' },
     });
 
-    expect(chatMessage).toHaveBeenCalledOnce();
-    const posted = chatMessage.mock.calls[0][0] as string;
-    expect(posted).toContain('[Impl WI-3]');
-    expect(posted).toContain('`edit_file`');
-    expect(posted).toContain('src/auth.ts');
+    expect(chatMessage).not.toHaveBeenCalled();
   });
 
-  it('truncates long tool args to 60 chars', () => {
+  it('does NOT post tool_execution_start to chatMessage even for bash commands', () => {
     const { session, fire } = makeMockSession();
     (executor as any).subscribeToSession(session, 'Label');
 
     fire({
       type: 'tool_execution_start',
       toolName: 'bash',
-      args: { command: 'a'.repeat(120) },
+      args: { command: 'npm test' },
     });
 
-    const posted = chatMessage.mock.calls[0][0] as string;
-    // arg hint should be truncated — message shouldn't contain 120 'a's
-    expect(posted).not.toContain('a'.repeat(120));
-    expect(posted).toContain('…');
-  });
-
-  it('posts tool name without arg hint when args are absent', () => {
-    const { session, fire } = makeMockSession();
-    (executor as any).subscribeToSession(session, 'Label');
-
-    fire({ type: 'tool_execution_start', toolName: 'list_files', args: {} });
-
-    const posted = chatMessage.mock.calls[0][0] as string;
-    expect(posted).toContain('`list_files`');
-    expect(posted).not.toContain(':');
+    expect(chatMessage).not.toHaveBeenCalled();
   });
 
   // ── unrelated events are ignored ─────────────────────────────────────────

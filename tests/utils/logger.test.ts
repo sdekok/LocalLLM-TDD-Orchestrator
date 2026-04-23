@@ -26,7 +26,7 @@ describe('Logger', () => {
     expect(fs.existsSync(tmpDir)).toBe(true);
   });
 
-  it('writes log entries to file', async () => {
+  it('writes log entries to the structured log file', async () => {
     tmpDir = path.join(os.tmpdir(), `logger-test-${Date.now()}-b`);
     logger = new Logger(tmpDir, 'debug');
     logger.debug('debug message');
@@ -35,10 +35,12 @@ describe('Logger', () => {
     logger.error('error message');
     await logger.closeAsync();
 
+    // Two files: workflow-<timestamp>.log + live.log
     const files = fs.readdirSync(tmpDir);
-    expect(files.length).toBe(1);
+    expect(files.length).toBe(2);
 
-    const content = fs.readFileSync(path.join(tmpDir, files[0]!), 'utf-8');
+    const structuredLog = files.find(f => f.startsWith('workflow-'))!;
+    const content = fs.readFileSync(path.join(tmpDir, structuredLog), 'utf-8');
     expect(content).toContain('DEBUG');
     expect(content).toContain('debug message');
     expect(content).toContain('INFO');
@@ -59,7 +61,8 @@ describe('Logger', () => {
     await logger.closeAsync();
 
     const files = fs.readdirSync(tmpDir);
-    const content = fs.readFileSync(path.join(tmpDir, files[0]!), 'utf-8');
+    const structuredLog = files.find(f => f.startsWith('workflow-'))!;
+    const content = fs.readFileSync(path.join(tmpDir, structuredLog), 'utf-8');
     expect(content).not.toContain('should not appear');
     expect(content).toContain('should appear');
     logger = null; // already closed

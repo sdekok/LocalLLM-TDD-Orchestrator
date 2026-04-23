@@ -11,7 +11,8 @@ const LOG_LEVELS: Record<LogLevel, number> = {
 };
 
 export class Logger {
-  private stream: fs.WriteStream | null = null;
+  private logStream: fs.WriteStream | null = null;
+  private liveStream: fs.WriteStream | null = null;
   private minLevel: number;
 
   constructor(
@@ -21,18 +22,26 @@ export class Logger {
     this.minLevel = LOG_LEVELS[level];
     fs.mkdirSync(logDir, { recursive: true });
     const logFile = path.join(logDir, `workflow-${Date.now()}.log`);
-    this.stream = fs.createWriteStream(logFile, { flags: 'a' });
+    this.logStream = fs.createWriteStream(logFile, { flags: 'a' });
+    // Fixed-name file truncated each run — safe to `tail -f .tdd-workflow/logs/live.log`
+    this.liveStream = fs.createWriteStream(path.join(logDir, 'live.log'), { flags: 'w' });
   }
 
   private write(level: LogLevel, msg: string): void {
     if (LOG_LEVELS[level] < this.minLevel) return;
     const timestamp = new Date().toISOString();
     const line = `[${level.toUpperCase().padEnd(5)} ${timestamp}] ${msg}\n`;
-    this.stream?.write(line);
+    this.logStream?.write(line);
     // stderr is safe for MCP servers — stdout is the JSON-RPC transport
     if (LOG_LEVELS[level] >= LOG_LEVELS.warn) {
       process.stderr.write(`[tdd-workflow] ${msg}\n`);
     }
+  }
+
+  /** Write verbose agent output to live.log only (not the structured log). */
+  stream(label: string, msg: string): void {
+    const ts = new Date().toISOString().substring(11, 23); // HH:MM:SS.mmm
+    this.liveStream?.write(`[${ts}] [${label}] ${msg}\n`);
   }
 
   debug(msg: string): void { this.write('debug', msg); }
@@ -41,20 +50,28 @@ export class Logger {
   error(msg: string): void { this.write('error', msg); }
 
   close(): void {
-    this.stream?.end();
-    this.stream = null;
+    this.logStream?.end();
+    this.logStream = null;
+    this.liveStream?.end();
+    this.liveStream = null;
   }
 
   closeAsync(): Promise<void> {
     return new Promise((resolve) => {
-      if (!this.stream) {
+      if (!this.logStream && !this.liveStream) {
         resolve();
         return;
       }
-      this.stream.end(() => {
-        this.stream = null;
-        resolve();
-      });
+      let pending = 0;
+      const done = () => { if (--pending === 0) resolve(); };
+      if (this.logStream) {
+        pending++;
+        this.logStream.end(() => { this.logStream = null; done(); });
+      }
+      if (this.liveStream) {
+        pending++;
+        this.liveStream.end(() => { this.liveStream = null; done(); });
+      }
     });
   }
 }
