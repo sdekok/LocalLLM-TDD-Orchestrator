@@ -113,7 +113,7 @@ export default function(pi: ExtensionAPI) {
       const isSingleTask = subcommand === 'task';
 
       // Lazy init orchestrator state
-      if (!stateManager) {
+      if (!executor) {
         stateManager = new StateManager(ctx.cwd);
         const modelRouter = new ModelRouter(null, ctx.cwd);
         if (modelRouter.isPassthrough) {
@@ -175,7 +175,7 @@ export default function(pi: ExtensionAPI) {
       };
 
       if (isSingleTask) {
-        if (!stateManager.hasWorkflow()) {
+        if (!stateManager!.hasWorkflow()) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
           return;
         }
@@ -191,7 +191,7 @@ export default function(pi: ExtensionAPI) {
         );
         runAndReport(executor!.runTask(taskId, taskMode));
       } else if (isResume) {
-        if (!stateManager.hasWorkflow()) {
+        if (!stateManager!.hasWorkflow()) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
           return;
         }
@@ -331,7 +331,7 @@ export default function(pi: ExtensionAPI) {
         `- After all fixes are committed, run \`/lens-booboo\` (if available) and confirm the report is clean before signalling DONE.`;
 
       // Lazy-init the same executor used by /tdd so event wiring is shared.
-      if (!stateManager) {
+      if (!executor) {
         stateManager = new StateManager(ctx.cwd);
         const modelRouter = new ModelRouter(null, ctx.cwd);
         if (modelRouter.isPassthrough) {
