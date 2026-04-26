@@ -1343,6 +1343,154 @@ export class WorkflowExecutor {
    * merged. The feedback is posted to chat for the user to act on.
    */
   /**
+   * Run the hostile reviewer against an arbitrary diff outside the TDD cycle.
+   *
+   * @param scope  'uncommitted' | 'N' (last N commits as string) | 'all' (since branch base)
+   * @param context  Optional free-text description or pre-formatted epic context
+   */
+  async runStandaloneReview(scope: string, context?: string): Promise<void> {
+    const logger = getLogger();
+
+    // ── 1. Get diff ────────────────────────────────────────────────────────
+    let diff = '';
+    let changedFiles: string[] = [];
+    let scopeLabel = '';
+
+    try {
+      let baseRef: string;
+
+      if (scope === 'uncommitted') {
+        baseRef = 'HEAD';
+        scopeLabel = 'uncommitted changes';
+      } else if (scope === 'all') {
+        scopeLabel = 'all changes since branch base';
+        // Find the common ancestor with main / master
+        const tryBase = async (branch: string) => {
+          const { stdout } = await execFileAsync('git', ['merge-base', 'HEAD', branch], {
+            cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+          });
+          return stdout.trim();
+        };
+        try { baseRef = await tryBase('main'); }
+        catch { try { baseRef = await tryBase('master'); }
+          catch { baseRef = 'HEAD~20'; scopeLabel += ' (fallback: last 20 commits)'; } }
+      } else {
+        const n = parseInt(scope, 10);
+        if (isNaN(n) || n < 1) throw new Error(`Unknown scope "${scope}". Use: uncommitted, a number, or all`);
+        baseRef = `HEAD~${n}`;
+        scopeLabel = `last ${n} commit${n === 1 ? '' : 's'}`;
+      }
+
+      const [diffResult, namesResult] = await Promise.all([
+        execFileAsync('git', ['diff', baseRef], {
+          cwd: this.state.projectDir, timeout: 15_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+        execFileAsync('git', ['diff', '--name-only', baseRef], {
+          cwd: this.state.projectDir, timeout: 15_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+      ]);
+      diff = diffResult.stdout;
+      changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
+    } catch (err) {
+      this.chatMessage?.(`❌ **Review** failed to retrieve diff: ${(err as Error).message}`, 'tdd-reviewer');
+      return;
+    }
+
+    if (!diff.trim()) {
+      this.chatMessage?.(`ℹ️ **Review** — no changes found for scope: ${scopeLabel}`, 'tdd-reviewer');
+      return;
+    }
+
+    this.chatMessage?.(`🔍 **Review** — reviewing ${scopeLabel} (${changedFiles.length} file${changedFiles.length === 1 ? '' : 's'})…`, 'tdd-reviewer');
+
+    // ── 2. Build prompt ────────────────────────────────────────────────────
+    const contextSection = context
+      ? `\n\n## Context\n${context}`
+      : '';
+
+    let lensSection = '';
+    try {
+      const lensNow = await runLensAnalysis(this.state.projectDir);
+      if (lensNow) lensSection = `\n\n## Lens Analysis (Current State)\n${lensNow}`;
+    } catch { /* non-fatal */ }
+
+    const diffSummary = `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${diff.length > 8000 ? diff.substring(0, 8000) + '\n… (truncated)' : diff}\n\`\`\``;
+
+    const reviewPrompt =
+      `Standalone review of ${scopeLabel}. ` +
+      `Note: this is outside the TDD cycle — quality gates have not been pre-verified.` +
+      contextSection +
+      lensSection +
+      diffSummary;
+
+    // ── 3. Run reviewer ────────────────────────────────────────────────────
+    const reviewerSession = await createSubAgentSession({
+      taskType: 'review',
+      systemPrompt: REVIEWER_PROMPT,
+      cwd: this.state.projectDir,
+      modelRouter: this.modelRouter,
+      tools: 'review',
+    });
+    const reviewerHandle = this.subscribeToSession(reviewerSession, 'Review', 'tdd-reviewer');
+
+    let reviewText = '';
+    try {
+      await withTimeout(
+        reviewerSession.prompt(reviewPrompt),
+        MAX_REVIEWER_DURATION_MS,
+        `Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
+      );
+      reviewText = reviewerHandle.getTurnText();
+
+      const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000;
+      if (!reviewText.includes('APPROVED:')) {
+        logger.warn('[EXECUTOR] Standalone reviewer missing structured verdict — sending format reminder');
+        const saved = reviewText;
+        reviewerHandle.resetTurnText();
+        try {
+          await withTimeout(
+            reviewerSession.prompt(
+              'STOP all tool calls. Do NOT read any more files.\n\n' +
+              'Your review is complete but is missing the required structured verdict. ' +
+              'Output ONLY these three lines right now — nothing else:\n\n' +
+              'APPROVED: true/false\n' +
+              'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
+              'FEEDBACK: <your feedback based on what you have already read>'
+            ),
+            FORMAT_RETRY_TIMEOUT_MS,
+            'format-retry-timeout',
+          );
+          reviewText = reviewerHandle.getTurnText();
+        } catch { reviewText = saved; }
+        if (!reviewText.includes('APPROVED:')) reviewText = saved;
+      }
+    } finally {
+      reviewerHandle.dispose();
+      reviewerSession.dispose();
+      logger.info('[EXECUTOR] Standalone reviewer disposed.');
+      await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+    }
+
+    // ── 4. Post verdict ────────────────────────────────────────────────────
+    const isApproved = /APPROVED:\s*true/i.test(reviewText);
+    const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
+    const feedback = feedbackMatch?.[1]?.trim()
+      || (reviewText.trim() ? `Reviewer did not follow structured format:\n${reviewText.substring(0, 600)}` : 'Reviewer produced no output.');
+
+    if (isApproved) {
+      this.chatMessage?.(
+        `✅ **Review Approved** — ${scopeLabel}\n\n${feedback}`,
+        'tdd-reviewer'
+      );
+    } else {
+      this.chatMessage?.(
+        `⚠️ **Review: concerns raised** — ${scopeLabel}\n\n${feedback}`,
+        'tdd-reviewer'
+      );
+    }
+  }
+
+  /**
    * Neutral arbiter: called when an implementer exhausts all normal attempts.
    * It reviews the final diff and reviewer feedback and decides whether to approve,
    * grant extra rounds, or escalate to the user.

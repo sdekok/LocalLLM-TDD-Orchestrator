@@ -20,6 +20,7 @@ import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { runQualityGates } from '../../orchestrator/quality-gates.js';
 import { getTestRunner } from '../../orchestrator/test-runner.js';
 import { planProject } from '../../agents/project-planner.js';
+import { EpicLoader } from '../../orchestrator/epic-loader.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
 import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo } from './pi-models.js';
@@ -209,6 +210,67 @@ export default function(pi: ExtensionAPI) {
         runAndReport(executor!.startNew(epicRef));
       }
     }
+  });
+
+  pi.registerCommand('review', {
+    description: 'Run the hostile code reviewer outside the TDD cycle. Usage: /review [uncommitted|<n>|all] [epic <ref>] [<description>]',
+    handler: async (args: string, ctx) => {
+      if (!args) {
+        args = await ctx.ui.input(
+          'Scope: uncommitted | <number of commits> | all\n' +
+          'Optionally append: epic <ref>  or a plain description\n\n' +
+          'Examples: uncommitted  /  3  /  all epic 2  /  uncommitted "fixed auth"'
+        ) || '';
+        if (!args) return;
+      }
+
+      const tokens = args.trim().split(/\s+/);
+      const scope = tokens[0] ?? 'uncommitted';
+      const rest = tokens.slice(1).join(' ').trim();
+
+      // Extract optional epic ref: "epic <ref>" anywhere in the remainder
+      let context: string | undefined;
+      const epicMatch = rest.match(/^epic\s+(\S+)(.*)/i);
+      if (epicMatch) {
+        const epicRef = epicMatch[1]!;
+        const extraDesc = epicMatch[2]?.trim();
+        try {
+          if (!stateManager) stateManager = new StateManager(ctx.cwd);
+          const epicLoader = new EpicLoader(ctx.cwd);
+          const epicPath = epicLoader.findEpic(epicRef);
+          if (epicPath) {
+            const epic = epicLoader.parseEpic(epicPath);
+            context = `**Epic: ${epic.title}**\n${epic.summary || ''}\n\nWork Items:\n` +
+              epic.workItems.map(wi => `- **${wi.id}**: ${wi.description}`).join('\n');
+            if (extraDesc) context += `\n\n**Additional context:** ${extraDesc}`;
+          } else {
+            ctx.ui.notify(`Epic "${epicRef}" not found — reviewing without epic context.`, 'warning');
+            context = extraDesc || undefined;
+          }
+        } catch {
+          context = extraDesc || undefined;
+        }
+      } else if (rest) {
+        context = rest;
+      }
+
+      if (!executor) {
+        stateManager = new StateManager(ctx.cwd);
+        const modelRouter = new ModelRouter(null, ctx.cwd);
+        executor = new WorkflowExecutor(stateManager, modelRouter, {
+          chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
+        });
+      }
+
+      ctx.ui.setStatus('review', '🔍 Reviewing…');
+      ctx.ui.notify('Review running in background…', 'info');
+      executor.runStandaloneReview(scope, context)
+        .then(() => ctx.ui.setStatus('review', undefined))
+        .catch((err: any) => {
+          ctx.ui.setStatus('review', undefined);
+          ctx.ui.notify(`🔥 Review error: ${err.message}`, 'error');
+        });
+    },
   });
 
   pi.registerCommand('plan', {
