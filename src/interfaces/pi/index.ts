@@ -18,12 +18,35 @@ import {
 import { SearchClient } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { runQualityGates } from '../../orchestrator/quality-gates.js';
+import type { CoverageMetrics } from '../../orchestrator/quality-gates.js';
 import { getTestRunner } from '../../orchestrator/test-runner.js';
 import { planProject } from '../../agents/project-planner.js';
 import { EpicLoader } from '../../orchestrator/epic-loader.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
 import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo } from './pi-models.js';
+
+// Gate output can be 10MB+ from large monorepo test runs. The planner only
+// needs enough to identify failing files/tests — not full stack traces.
+// The full output is available at reportPath for agents that need more detail.
+function truncateGateOutput(output: string, reportPath?: string, maxLines = 150, maxChars = 8000): string {
+  const lines = output.split('\n');
+  if (lines.length <= maxLines && output.length <= maxChars) return output;
+
+  const truncatedByLines = lines.slice(0, maxLines).join('\n');
+  const truncated = truncatedByLines.length > maxChars
+    ? truncatedByLines.slice(0, maxChars)
+    : truncatedByLines;
+
+  const omittedLines = lines.length - maxLines;
+  const suffix = reportPath
+    ? `Full output: ${reportPath}`
+    : 'run the gate locally for full output';
+  const note = omittedLines > 0
+    ? `\n[… ${omittedLines} lines truncated — ${suffix} …]`
+    : `\n[… output truncated — ${suffix} …]`;
+  return truncated + note;
+}
 
 function guessArchitecture(modelId: string): 'moe' | 'dense' | 'unknown' {
   const lower = modelId.toLowerCase();
@@ -351,7 +374,7 @@ export default function(pi: ExtensionAPI) {
 
       let report;
       try {
-        report = await runQualityGates(ctx.cwd);
+        report = await runQualityGates(ctx.cwd, { collectCoverage: true });
       } catch (err) {
         ctx.ui.setStatus('tdd-cleanup', undefined);
         ctx.ui.notify(`Quality gate scan failed: ${(err as Error).message}`, 'error');
@@ -377,14 +400,26 @@ export default function(pi: ExtensionAPI) {
         'tdd-progress'
       );
 
+      // Format coverage snapshot for the planner — informational only, never blocking.
+      const cov: CoverageMetrics | undefined = report.coverageMetrics;
+      const coverageSection = cov
+        ? `\n\n## Current Coverage (informational — not a failing gate)\n` +
+          `Lines: ${cov.lines}%  |  Functions: ${cov.functions}%  |  Branches: ${cov.branches}%\n\n` +
+          `If coverage is notably low (<60%) for any area, include a subtask to add tests for that area. ` +
+          `Do NOT fail the workflow or block on coverage — just include it if meaningful.`
+        : '';
+
       // Build a structured cleanup request for the on-the-fly planner.
-      // Include the full gate output so the planner can assign the right files to each subtask.
+      // Gate output is truncated — the planner only needs file paths and error
+      // summaries, not full stack traces. Agents can read report.reportPath for
+      // the complete output when they need more detail.
       const cleanupRequest =
         `Fix all pre-existing quality gate failures in this project.\n\n` +
         `## Failing Gates\n\n` +
         failures.map(g =>
-          `### ${g.gate.toUpperCase()} (${g.blocking ? 'BLOCKING' : 'warning'})\n${g.output}`
+          `### ${g.gate.toUpperCase()} (${g.blocking ? 'BLOCKING' : 'warning'})\n${truncateGateOutput(g.output, report.reportPath)}`
         ).join('\n\n') +
+        coverageSection +
         `\n\n## Rules\n` +
         `- Fix ONLY what is explicitly listed above. Do not refactor unrelated code.\n` +
         `- Each subtask should be scoped to a single package or file group.\n` +

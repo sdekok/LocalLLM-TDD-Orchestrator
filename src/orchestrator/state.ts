@@ -21,6 +21,8 @@ export interface Subtask {
   security?: string;
   tests?: string[];
   devNotes?: string;
+  /** When true the implementer is told to verify using the coverage command, not just the plain test command. */
+  requiresCoverageRun?: boolean;
 }
 
 export interface WorkflowState {

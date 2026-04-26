@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, diffGateFailures } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, diffGateFailures, collectCoverageSnapshot, type CoverageMetrics } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -14,7 +14,7 @@ import type { AgentSession } from '@mariozechner/pi-coding-agent';
 import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT, ARBITER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
 import { execFileAsync, DEFAULT_MAX_BUFFER, sanitizeBranchName } from '../utils/exec.js';
-import { getTestCommand, detectPackageManager } from './test-runner.js';
+import { getTestCommand, getCoverageTestCommand, detectPackageManager } from './test-runner.js';
 
 /**
  * Derive a short, stable, git-safe slug from an original workflow request.
@@ -449,6 +449,13 @@ export class WorkflowExecutor {
       this.state.setSubtasks(plan.subtasks);
     }
 
+    // Mark coverage-focused tasks so the implementer verifies with the coverage command.
+    for (const task of this.state.getState().subtasks) {
+      if (/\bcoverage\b|\badd.*tests?\b|\bmissing tests?\b/i.test(task.description)) {
+        this.state.updateSubtask(task.id, { requiresCoverageRun: true });
+      }
+    }
+
     // Post task checklist to chat so the user can track progress
     const subtasks = this.state.getState().subtasks;
     if (subtasks.length > 0) {
@@ -601,9 +608,12 @@ export class WorkflowExecutor {
     // errors that appear in the current run but NOT in the baseline as genuine
     // regressions. Otherwise a baseline of "3 tsc errors" would silently mask
     // an implementer that adds 7 more tsc errors.
+    // Also collect a coverage baseline so the final reviewer can flag regressions.
     const baselineGateOutputs = new Map<string, string>();
+    let baselineCoverage: CoverageMetrics | undefined;
     try {
-      const baseline = await runQualityGates(this.state.projectDir);
+      const baseline = await runQualityGates(this.state.projectDir, { collectCoverage: true });
+      baselineCoverage = baseline.coverageMetrics;
       const failing = baseline.gates.filter(g => g.blocking && !g.passed);
       for (const g of failing) baselineGateOutputs.set(g.gate, g.output);
       if (failing.length > 0) {
@@ -613,6 +623,9 @@ export class WorkflowExecutor {
           `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${list}**. ` +
           `Only NEW errors introduced by the implementer will block tasks — existing ones are ignored.`
         );
+      }
+      if (baselineCoverage) {
+        logger.info(`Coverage baseline: lines=${baselineCoverage.lines}% functions=${baselineCoverage.functions}% branches=${baselineCoverage.branches}%`);
       }
     } catch (err) {
       logger.warn(`Could not capture quality gate baseline: ${err}`);
@@ -760,6 +773,9 @@ export class WorkflowExecutor {
                   devNotes: task.devNotes,
                   testCommand: getTestCommand(this.state.projectDir),
                   packageManager: detectPackageManager(this.state.projectDir),
+                  coverageCommand: task.requiresCoverageRun
+                    ? getCoverageTestCommand(this.state.projectDir)
+                    : undefined,
                 },
               });
               implementerHandle = this.subscribeToSession(implementerSession, `Implementer ${task.id}`, 'tdd-implementer');
@@ -1332,7 +1348,7 @@ export class WorkflowExecutor {
     // check across all changes. A rejection here is advisory — all changes are already merged.
     const allCompleted = this.state.getState().subtasks.every(t => t.status === 'completed');
     if (allCompleted && totalSubtasks > 1) {
-      await this.runFinalWorkflowReview(workflowStartSha);
+      await this.runFinalWorkflowReview(workflowStartSha, baselineCoverage);
     }
   }
 
@@ -1609,12 +1625,19 @@ export class WorkflowExecutor {
     return { action: 'stop', rounds: 0 };
   }
 
-  private async runFinalWorkflowReview(workflowStartSha: string): Promise<void> {
+  private async runFinalWorkflowReview(workflowStartSha: string, baselineCoverage?: CoverageMetrics): Promise<void> {
     const logger = getLogger();
     const subtasks = this.state.getState().subtasks;
 
     this.chatMessage?.(`🔍 **Final Review** — reviewing all ${subtasks.length} task(s) together…`, 'tdd-reviewer');
     this.events.emit('taskProgress', { id: 'final-review', phase: 'reviewing', message: 'Running final workflow review…' });
+
+    // Collect final coverage snapshot in parallel with the diff so the reviewer
+    // can comment on any coverage regression or gaps across the whole epic.
+    const [finalCoverage] = await Promise.allSettled([
+      collectCoverageSnapshot(this.state.projectDir),
+    ]);
+    const currentCoverage = finalCoverage.status === 'fulfilled' ? finalCoverage.value : undefined;
 
     // Build cumulative diff from the start of the workflow to current HEAD
     let cumulativeDiff = '';
@@ -1640,6 +1663,29 @@ export class WorkflowExecutor {
       if (fs.existsSync(notesPath)) implementerNotes = fs.readFileSync(notesPath, 'utf-8').trim();
     } catch { /* non-fatal */ }
 
+    // Format coverage comparison for the reviewer
+    let coverageSummary = '';
+    if (baselineCoverage || currentCoverage) {
+      const fmt = (m: CoverageMetrics) =>
+        `lines=${m.lines}% functions=${m.functions}% branches=${m.branches}%`;
+      if (baselineCoverage && currentCoverage) {
+        const delta = (a: number, b: number) => {
+          const d = Math.round((b - a) * 10) / 10;
+          return d > 0 ? `+${d}` : `${d}`;
+        };
+        coverageSummary =
+          `\n\n## Coverage\n` +
+          `- Baseline (start of epic): ${fmt(baselineCoverage)}\n` +
+          `- Current (end of epic):    ${fmt(currentCoverage)}\n` +
+          `- Delta: lines=${delta(baselineCoverage.lines, currentCoverage.lines)}% ` +
+          `functions=${delta(baselineCoverage.functions, currentCoverage.functions)}% ` +
+          `branches=${delta(baselineCoverage.branches, currentCoverage.branches)}%\n\n` +
+          `Flag any significant coverage drops (>2%) as a concern in your FEEDBACK.`;
+      } else if (currentCoverage) {
+        coverageSummary = `\n\n## Coverage (end of epic)\n${fmt(currentCoverage)}\n\nFlag any areas with notably low coverage in your FEEDBACK.`;
+      }
+    }
+
     const subtaskSummary = subtasks.map(t => `- **${t.id}**: ${t.description}`).join('\n');
     const notesSummary = implementerNotes ? `\n\n## Implementer Notes (last task)\n${implementerNotes}` : '';
     const diffSummary = changedFiles.length > 0
@@ -1659,7 +1705,7 @@ export class WorkflowExecutor {
     try {
       await withTimeout(
         reviewerSession.prompt(
-          `Review the complete workflow.\n\n## Tasks Completed\n${subtaskSummary}${notesSummary}${diffSummary}`
+          `Review the complete workflow.\n\n## Tasks Completed\n${subtaskSummary}${notesSummary}${coverageSummary}${diffSummary}`
         ),
         MAX_REVIEWER_DURATION_MS,
         `Final reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,

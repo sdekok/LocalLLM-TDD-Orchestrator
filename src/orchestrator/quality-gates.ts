@@ -19,6 +19,8 @@ export interface QualityReport {
   allBlockingPassed: boolean;
   testMetrics?: TestMetrics;
   coverageMetrics?: CoverageMetrics;
+  /** Absolute path to the full gate report written to .tdd-workflow/logs/ */
+  reportPath?: string;
 }
 
 /**
@@ -174,7 +176,43 @@ export function diffGateFailures(
   return { newErrors, baselineCount: baseline.size, currentCount: current.size };
 }
 
-export async function runQualityGates(projectDir: string): Promise<QualityReport> {
+export interface RunQualityGatesOptions {
+  /**
+   * When true, run coverage after the tests gate and populate `report.coverageMetrics`
+   * regardless of whether `tddConfig.coverageThresholds` is configured. If thresholds
+   * are also set, the same coverage run is reused for the threshold gate — no double-run.
+   * Use this at workflow start (baseline), during cleanup (planner context), and before
+   * the final review.
+   */
+  collectCoverage?: boolean;
+}
+
+/**
+ * Run coverage only, returning metrics without running the full gate suite.
+ * Returns undefined when no coverage runner/tools are available.
+ * Used by the final workflow reviewer to compare against the baseline snapshot.
+ */
+export async function collectCoverageSnapshot(projectDir: string): Promise<CoverageMetrics | undefined> {
+  const runner = getTestRunner(projectDir);
+  if (!runner) return undefined;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    const hasCoverageTools =
+      pkg.devDependencies?.['@vitest/coverage-v8'] ||
+      pkg.devDependencies?.['@vitest/coverage-istanbul'] ||
+      pkg.scripts?.['test:coverage'] ||
+      pkg.scripts?.coverage;
+    if (!hasCoverageTools) return undefined;
+  } catch { return undefined; }
+  try {
+    const result = await runner.runCoverage(projectDir, 120_000);
+    return result.coverage;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function runQualityGates(projectDir: string, options: RunQualityGatesOptions = {}): Promise<QualityReport> {
   const logger = getLogger();
   const gates: GateResult[] = [];
   let testMetrics: TestMetrics | undefined;
@@ -198,43 +236,44 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
       logger.warn(`Failed to parse ${pkgJsonPath}: ${(err as Error).message}`);
     }
 
-    // Check if we should run with coverage
-    const hasCoverageScript = pkg.scripts?.['test:coverage'] || pkg.scripts?.coverage;
-    const isVitest = runner.name === 'vitest' && (pkg.devDependencies?.['@vitest/coverage-v8'] || pkg.devDependencies?.['@vitest/coverage-istanbul']);
-
-    let result: TestResult;
-    if (hasCoverageScript || isVitest) {
-      result = await runner.runCoverage(projectDir, 120_000);
-      coverageMetrics = result.coverage;
-    } else {
-      result = await runner.runTests(projectDir, 120_000);
-    }
+    // Gate 2a: Tests pass — always run with the plain test command so this gate
+    // uses the exact same command the implementer agent will use. Running with
+    // --coverage here causes false failures: coverage instrumentation adds
+    // ~20-40% overhead (integration tests can tip over the timeout) and can
+    // produce different pass/fail results than a plain test run.
+    const testResult = await runner.runTests(projectDir, 120_000);
 
     gates.push({
       gate: 'tests',
-      passed: result.passed,
-      output: result.output,
+      passed: testResult.passed,
+      output: testResult.output,
       blocking: true,
     });
 
-    testMetrics = result.metrics;
+    testMetrics = testResult.metrics;
 
-    // Gate 2b: Coverage Threshold (BLOCKING, but only when project opts in)
-    // The coverage gate only runs when the project explicitly sets
-    // `tddConfig.coverageThresholds` in package.json. Projects that don't ask
-    // for coverage enforcement should not be blocked by a default threshold —
-    // they may not even have tests yet, and failing on "0% < 80%" would make
-    // every task fail before the implementer gets a chance.
-    if (coverageMetrics && pkg.tddConfig?.coverageThresholds) {
-      const thresholds = pkg.tddConfig.coverageThresholds;
-      const coveragePass = checkCoverageThresholds(coverageMetrics, thresholds);
+    // Gate 2b: Coverage — run when the caller needs a snapshot (collectCoverage:true)
+    // or when the project has explicit thresholds configured. A single coverage run
+    // serves both purposes so we never run tests twice for the same gate check.
+    const needsCoverageRun = options.collectCoverage || !!pkg.tddConfig?.coverageThresholds;
+    if (needsCoverageRun) {
+      try {
+        const coverageResult = await runner.runCoverage(projectDir, 120_000);
+        coverageMetrics = coverageResult.coverage;
+      } catch (err) {
+        logger.warn(`Coverage run failed (non-fatal): ${(err as Error).message}`);
+      }
 
-      gates.push({
-        gate: 'coverage',
-        passed: coveragePass.passed,
-        output: coveragePass.message,
-        blocking: true,
-      });
+      if (pkg.tddConfig?.coverageThresholds && coverageMetrics) {
+        const thresholds = pkg.tddConfig.coverageThresholds;
+        const coveragePass = checkCoverageThresholds(coverageMetrics, thresholds);
+        gates.push({
+          gate: 'coverage',
+          passed: coveragePass.passed,
+          output: coveragePass.message,
+          blocking: true,
+        });
+      }
     }
   } else {
     logger.warn('No test runner detected — skipping test gate');
@@ -261,7 +300,27 @@ export async function runQualityGates(projectDir: string): Promise<QualityReport
     logger.info(`Coverage: lines=${coverageMetrics.lines}% branches=${coverageMetrics.branches}% functions=${coverageMetrics.functions}%`);
   }
 
-  return { gates, allBlockingPassed, testMetrics, coverageMetrics };
+  // Persist full gate output to disk so agents can read the complete report
+  // when the truncated version embedded in the prompt isn't enough.
+  let reportPath: string | undefined;
+  try {
+    const logsDir = path.join(projectDir, '.tdd-workflow', 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    reportPath = path.join(logsDir, `gate-report-${timestamp}.log`);
+    const lines: string[] = [`Gate report — ${new Date().toISOString()}`, ''];
+    for (const g of gates) {
+      const status = g.passed ? 'PASS' : (g.blocking ? 'FAIL (BLOCKING)' : 'FAIL (warning)');
+      lines.push(`${'─'.repeat(60)}`, `[${g.gate.toUpperCase()}] ${status}`, g.output, '');
+    }
+    fs.writeFileSync(reportPath, lines.join('\n'), 'utf-8');
+    logger.info(`Gate report written to ${reportPath}`);
+  } catch (err) {
+    logger.warn(`Could not write gate report: ${(err as Error).message}`);
+    reportPath = undefined;
+  }
+
+  return { gates, allBlockingPassed, testMetrics, coverageMetrics, reportPath };
 }
 
 /**

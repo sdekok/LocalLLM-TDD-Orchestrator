@@ -200,7 +200,10 @@ The orchestrator runs in the background once `/tdd` is invoked, but you can inte
 
 `/tdd:project-cleanup` runs quality gates before any agent starts, summarises every failing gate in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
 
-The implementer is instructed to only fix failures in files it is already modifying, so cleanup stays scoped and doesn't cause unrelated drift.
+- The implementer is instructed to only fix failures in files it is already modifying, so cleanup stays scoped and doesn't cause unrelated drift.
+- A coverage snapshot is always collected during cleanup (even without `coverageThresholds`) so the planner can see where coverage is low and add test-improvement subtasks if meaningful. Coverage numbers never block the cleanup workflow unless thresholds are explicitly configured.
+- Full gate output (potentially large) is written to `.tdd-workflow/logs/gate-report-<timestamp>.log`. The cleanup brief embeds a truncated summary pointing to this file; implementer agents can read the full log when they need more context.
+- Subtasks whose descriptions mention "coverage" or "add tests" automatically tell the implementer to verify using the coverage command and include before/after numbers in the `DONE:` message.
 
 ## Multi-Language Support
 
@@ -258,7 +261,7 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
 
 | Key | Default | Description |
 |---|---|---|
-| `coverageThresholds` | _(unset)_ | **Opt-in.** When present, the coverage gate becomes blocking and enforces these minimums. Omit this key entirely to skip the coverage gate (useful for projects without tests yet). Supported thresholds: `lines`, `functions`, `branches`, `statements`. |
+| `coverageThresholds` | _(unset)_ | **Opt-in.** When present, the coverage gate becomes blocking and enforces these minimums. Omit this key entirely to disable the blocking coverage gate (coverage metrics are still collected for reporting). Supported thresholds: `lines`, `functions`, `branches`, `statements`. |
 | `fileSafetyAllowlist` | `[]` | Extra path prefixes the file-safety gate should not flag. See built-in prefixes below. |
 
 **Built-in file-safety prefixes** (always allowed — no config needed):

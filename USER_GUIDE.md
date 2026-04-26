@@ -117,7 +117,10 @@ Interrupt a running TDD workflow from chat — no need to kill Pi.
 
 Audits every quality gate across the whole project **before any agent runs**, summarises the failing gates in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
 
-- The implementer is instructed to only fix failures in files it is already modifying, so cleanup stays scoped and doesn't cause unrelated drift.
+- **Scoped fixes**: the implementer is instructed to only touch files related to the failures it was assigned, so cleanup doesn't cause unrelated drift.
+- **Coverage snapshot**: a coverage run is always included in the cleanup scan (regardless of `coverageThresholds`). The planner sees the numbers and will add a test-improvement subtask if any area is notably low. Coverage never blocks the cleanup workflow unless thresholds are explicitly configured.
+- **Full gate output on disk**: the complete (untruncated) gate output is written to `.tdd-workflow/logs/gate-report-<timestamp>.log`. The cleanup brief embeds a truncated summary with a pointer to this file; implementer agents can read it when they need the full stack traces.
+- **Coverage-fix verification**: subtasks whose descriptions mention "coverage" or "add tests" automatically receive the coverage command and are told to verify improvement before signalling `DONE:`.
 - Useful after onboarding a stale codebase, after a large refactor landed externally, or before starting a new feature on top of a currently-red tree.
 
 ### `/tdd:test`
@@ -210,14 +213,27 @@ The orchestrator does **not** ask an AI if the code is good enough. It runs dete
 |---|---|---|
 | **Lens Analysis** | Blocking | Structural bugs (ast-grep) + deep type errors (LSP) |
 | **TypeScript** | Blocking | `npx tsc --noEmit` — any type errors fail the gate |
-| **Tests** | Blocking | Auto-detects test framework and runs the suite |
-| **Coverage** | Blocking _(opt-in)_ | Only runs when `tddConfig.coverageThresholds` is set in `package.json` — otherwise skipped entirely |
+| **Tests** | Blocking | Auto-detects test framework; always runs the same command the implementer uses (`npm run test` / `npx vitest run`) — never with `--coverage`, which would add overhead and risk false failures |
+| **Coverage** | Blocking _(opt-in)_ | Runs separately from the tests gate, only when `tddConfig.coverageThresholds` is set in `package.json` |
 | **Lint** | Non-blocking | ESLint warnings are logged but don't block |
 | **File Safety** | Blocking | Ensures files were only written to expected directories |
 
-### Coverage Thresholds (opt-in)
+The tests gate and coverage gate are always **separate runs**. This keeps the tests gate consistent with what the implementer sees when it runs tests locally, preventing coverage-instrumentation overhead from causing false failures (especially in slower integration tests).
 
-The coverage gate is **disabled by default**. Add `tddConfig.coverageThresholds` to your `package.json` to turn it on as a blocking gate:
+### Coverage Collection
+
+Coverage is collected automatically at several points in the workflow — not just as a blocking gate:
+
+| When | What happens |
+|---|---|
+| **Workflow start** | A coverage baseline is captured so the final reviewer can detect regressions across the epic. |
+| **Final review** | Coverage is collected again and compared with the baseline. The reviewer sees a before/after delta table and is prompted to flag drops greater than 2%. |
+| **Project cleanup** | A coverage snapshot is always collected (even without `coverageThresholds`) so the planner knows which areas are low on tests and can include coverage-improvement subtasks. |
+| **Coverage-fix tasks** | Subtasks whose descriptions mention "coverage" or "add tests" automatically instruct the implementer to run the coverage command for final verification and include before/after numbers in its `DONE:` message. |
+
+### Coverage Thresholds (opt-in blocking gate)
+
+Add `tddConfig.coverageThresholds` to your `package.json` to make the coverage gate **blocking**:
 
 ```json
 {
@@ -232,7 +248,7 @@ The coverage gate is **disabled by default**. Add `tddConfig.coverageThresholds`
 }
 ```
 
-Only the thresholds you specify are enforced. A project without this key has no coverage-based failure mode — useful when you're starting out and haven't written tests yet.
+Only the thresholds you specify are enforced. Without this key there is no blocking coverage gate — but coverage metrics are still collected for reporting and the final reviewer still sees the delta. Useful when starting out and not yet ready to enforce hard limits.
 
 ## Safety & Controls
 
@@ -253,6 +269,7 @@ Only the thresholds you specify are enforced. A project without this key has no 
 | Model "X" not found | Run `/setup` to reconfigure, or check `models.config.json` routing keys match the model keys in `models` |
 | Workflow hangs | Check `.tdd-workflow/logs/` for details — usually the LLM is stuck or VRAM is exhausted |
 | Quality gates always fail | Verify your `package.json` scripts (`test`, `build`) work manually first |
+| Cleanup found failures that pass when re-run | The test output is saved in `.tdd-workflow/logs/gate-report-<timestamp>.log` — check it for timeout markers or environment-specific failures. The tests gate always uses the plain test command (no `--coverage`), so differences should be minimal. |
 | JSON parsing failure in /plan | The planner will automatically retry once with an explicit JSON prompt. If it still fails, the active model may not be capable of structured output — configure a stronger model via `/setup` |
 | Lens gate always fails in CI | Set `LENS_FAIL_POLICY=fail-open` if Lens is not installed, or ensure `pi-lens` is in your project's dependencies |
 | Workflow failed, unclear why | Search `.tdd-workflow/logs/` for the workflow ID shown at startup |

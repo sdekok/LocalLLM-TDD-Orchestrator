@@ -70,6 +70,8 @@ Violating this bypasses quality gate tracking and corrupts the workflow state.
 **Dev Notes**:
 {devNotes}
 
+{coverageVerification}
+
 ### Feedback Handling
 {feedbackContext}
 

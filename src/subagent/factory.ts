@@ -168,6 +168,8 @@ export interface SubAgentOptions {
     devNotes?: string;
     testCommand?: string;
     packageManager?: string;
+    /** When set, the implementer is instructed to verify with this coverage command as its final step. */
+    coverageCommand?: string;
   };
   tools?: 'coding' | 'review' | 'readonly' | 'none';
   // Optional: UI context for interactive tools (e.g., ask_user_for_clarification)
@@ -248,7 +250,10 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     .replace(/{tests}/g, meta?.tests?.length ? meta.tests.map(t => `- ${t}`).join('\n') : 'None specified')
     .replace(/{devNotes}/g, meta?.devNotes || 'None specified')
     .replace(/{testCommand}/g, meta?.testCommand || 'npm test')
-    .replace(/{packageManager}/g, meta?.packageManager || 'npm');
+    .replace(/{packageManager}/g, meta?.packageManager || 'npm')
+    .replace(/{coverageVerification}/g, meta?.coverageCommand
+      ? `**Coverage Verification (required for this task)**: This task is focused on improving test coverage. After all tests pass, run \`${meta.coverageCommand}\` as your final step and confirm coverage has improved for the files you modified. Include the before/after coverage numbers in your \`DONE:\` message.`
+      : '');
 
   const targetModelId = profile.modelId || profile.ggufFilename;
   logger.info(`Spawning sub-agent [${options.taskType}] with target model: ${targetModelId}`);

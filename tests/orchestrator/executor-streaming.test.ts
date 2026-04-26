@@ -29,6 +29,7 @@ vi.mock('../../src/utils/exec.js', () => ({
 
 vi.mock('../../src/orchestrator/quality-gates.js', () => ({
   runQualityGates: vi.fn(),
+  collectCoverageSnapshot: vi.fn().mockResolvedValue(undefined),
   detectTestCommand: vi.fn(),
   formatGateFailures: vi.fn(),
 }));

@@ -230,6 +230,20 @@ export function getTestCommand(projectDir: string): string {
 }
 
 /**
+ * Resolve the coverage command the project uses — mirrors VitestRunner.resolveCoverageCommand
+ * so coverage-focused implementer tasks can verify with the same command as quality gates.
+ */
+export function getCoverageTestCommand(projectDir: string): string {
+  const pm = detectPackageManager(projectDir);
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    if (pkg.scripts?.['test:coverage']) return `${pm} run test:coverage`;
+    if (pkg.scripts?.coverage) return `${pm} run coverage`;
+  } catch { /* ignore */ }
+  return 'npx vitest run --coverage';
+}
+
+/**
  * Factory to detect and create the appropriate runner
  */
 export function getTestRunner(projectDir: string): TestRunner | null {
