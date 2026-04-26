@@ -500,7 +500,7 @@ async function getSourceFiles(projectDir: string): Promise<string[]> {
       const fullPath = path.join(dir, file);
       const stat = fs.statSync(fullPath);
       if (stat && stat.isDirectory()) {
-        if (['node_modules', '.git', 'dist', 'lib', 'coverage'].includes(file)) continue;
+        if (['node_modules', '.git', 'dist', 'lib', 'coverage', 'tmp'].includes(file)) continue;
         results = results.concat(walk(fullPath));
       } else {
         if (file.endsWith('.ts') || file.endsWith('.js') || file.endsWith('.tsx') || file.endsWith('.jsx')) {
