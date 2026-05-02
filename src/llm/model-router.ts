@@ -17,7 +17,7 @@ export type ModelProvider = 'local' | 'openrouter' | 'openai' | 'custom';
 
 export interface ModelProfile {
   name: string;
-  ggufFilename: string;         // For local llama.cpp models
+  ggufFilename?: string;        // For local llama.cpp models (undefined for cloud)
   modelId?: string;              // For cloud providers (e.g., 'google/gemma-3-27b-it')
   provider: ModelProvider;       // 'local' for llama.cpp, 'openrouter' for cloud
   baseURL?: string;              // Override per-model (e.g., 'https://openrouter.ai/api/v1')
@@ -131,6 +131,59 @@ export function mergeConfigs(base: ModelRouterConfig, overlay: ModelRouterConfig
   };
 }
 
+export interface CloudModelInfo {
+  id: string;
+  name: string;
+  contextLength: number;
+  maxOutputTokens: number;
+  reasoning: boolean;
+}
+
+/**
+ * Fetch available models from any OpenAI-compatible cloud provider endpoint.
+ * Returns a sorted, filtered list — text-capable models only, context >= 4096.
+ * Passes the API key as a Bearer token when provided.
+ */
+export async function fetchCloudModels(baseURL: string, apiKey?: string): Promise<CloudModelInfo[]> {
+  try {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const response = await fetch(`${baseURL}/models`, {
+      headers,
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) return [];
+
+    const data = (await response.json()) as {
+      data?: {
+        id: string;
+        name?: string;
+        context_length?: number;
+        architecture?: { modality?: string };
+        top_provider?: { max_completion_tokens?: number };
+      }[];
+    };
+
+    return (data.data ?? [])
+      .filter(m => {
+        const modality = m.architecture?.modality ?? '';
+        // Keep text-capable models; exclude image/audio-only
+        if (modality && !modality.includes('text')) return false;
+        return (m.context_length ?? 0) >= 4096;
+      })
+      .map(m => ({
+        id: m.id,
+        name: m.name || m.id,
+        contextLength: m.context_length ?? 0,
+        maxOutputTokens: m.top_provider?.max_completion_tokens ?? 8192,
+        reasoning: /\br1\b|think|reason|o[134]\b/i.test(m.id),
+      }))
+      .sort((a, b) => a.id.localeCompare(b.id));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Discover available models from a running llama.cpp server in Router Mode.
  */
@@ -237,7 +290,7 @@ export class ModelRouter {
     if (profile.provider !== 'local' && profile.modelId) {
       return profile.modelId;
     }
-    return profile.ggufFilename;
+    return profile.ggufFilename ?? '';
   }
 
   /**

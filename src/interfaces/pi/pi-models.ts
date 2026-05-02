@@ -6,7 +6,40 @@ interface PiModelsJson {
   providers?: Record<string, {
     baseUrl?: string;
     api?: string;
+    apiKey?: string;
+    models?: Array<{ id: string }>;
   }>;
+}
+
+export interface PiCloudProvider {
+  name: string;
+  baseUrl: string;
+  /** API key read from Pi's config — use only for fetching model lists, never store. */
+  apiKey: string;
+  cachedModelIds: string[];
+}
+
+/**
+ * Return all non-llamacpp providers Pi has configured (e.g. OpenRouter, OpenAI).
+ * The apiKey is the raw value from Pi's config file — callers should use it only
+ * for API discovery and must never write it to TDD workflow config files.
+ */
+export function readPiCloudProviders(homeDir = os.homedir()): PiCloudProvider[] {
+  const piModelsPath = path.join(homeDir, '.pi', 'agent', 'models.json');
+  if (!fs.existsSync(piModelsPath)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(piModelsPath, 'utf-8')) as PiModelsJson;
+    return Object.entries(raw.providers ?? {})
+      .filter(([, p]) => p.api !== 'llamacpp' && p.baseUrl && p.apiKey)
+      .map(([name, p]) => ({
+        name,
+        baseUrl: p.baseUrl!,
+        apiKey: p.apiKey!,
+        cachedModelIds: (p.models ?? []).map(m => m.id),
+      }));
+  } catch {
+    return [];
+  }
 }
 
 interface PiLlamaCppCacheEntry {

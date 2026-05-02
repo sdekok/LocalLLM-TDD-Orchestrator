@@ -7,6 +7,7 @@ import { WorkflowExecutor } from '../../orchestrator/executor.js';
 import {
   ModelRouter,
   discoverModels,
+  fetchCloudModels,
   loadConfig,
   loadGlobalConfig,
   mergeConfigs,
@@ -24,7 +25,7 @@ import { planProject } from '../../agents/project-planner.js';
 import { EpicLoader } from '../../orchestrator/epic-loader.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
-import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo } from './pi-models.js';
+import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo, readPiCloudProviders } from './pi-models.js';
 
 // Gate output can be 10MB+ from large monorepo test runs. The planner only
 // needs enough to identify failing files/tests — not full stack traces.
@@ -726,6 +727,19 @@ export default function(pi: ExtensionAPI) {
 
       ctx.ui.notify('TDD Workflow — Model Setup', 'info');
 
+      // Internal type used only within this wizard — carries provider context
+      // alongside the model ID so we can build the right ModelProfile later.
+      interface SetupModelEntry {
+        displayName: string;
+        provider: 'local' | 'openrouter' | 'openai' | 'custom';
+        ggufFilename?: string;   // local models
+        modelId?: string;        // cloud models
+        apiKeyEnvVar?: string;   // cloud models
+        contextLength?: number;
+        maxOutputTokens?: number;
+        reasoning?: boolean;
+      }
+
       // ── 1. Check for existing config ──────────────────────────────────
       const existingConfig = isGlobal ? loadGlobalConfig() : loadConfig(ctx.cwd);
       const existingLocalKeys = existingConfig
@@ -735,7 +749,7 @@ export default function(pi: ExtensionAPI) {
         : [];
 
       let llamaUrl = process.env['LLAMA_CPP_URL'] || existingConfig?.llamaCppUrl || 'http://localhost:8080/v1';
-      let modelIds: string[] = [];
+      let localEntries: SetupModelEntry[] = [];
 
       if (existingLocalKeys.length > 0) {
         // ── 1a. Offer existing local models ───────────────────────────
@@ -756,7 +770,11 @@ export default function(pi: ExtensionAPI) {
           llamaUrl = trimmed;
         } else if (trimmed === '') {
           // Use all existing local models
-          modelIds = existingLocalKeys.map(k => existingConfig!.models[k]!.ggufFilename || k);
+          localEntries = existingLocalKeys.map(k => {
+            const p = existingConfig!.models[k]!;
+            const fname = p.ggufFilename || k;
+            return { displayName: fname, provider: 'local' as const, ggufFilename: fname };
+          });
         } else {
           // Numeric selection from existing list
           const indices = trimmed.split(',').map(s => parseInt(s.trim(), 10) - 1);
@@ -765,12 +783,16 @@ export default function(pi: ExtensionAPI) {
             ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
             return;
           }
-          modelIds = selected.map(k => existingConfig!.models[k]!.ggufFilename || k);
+          localEntries = selected.map(k => {
+            const p = existingConfig!.models[k]!;
+            const fname = p.ggufFilename || k;
+            return { displayName: fname, provider: 'local' as const, ggufFilename: fname };
+          });
         }
       }
 
-      // ── 2. Resolve URL: Pi providers → existing config → prompt ──────
-      if (modelIds.length === 0) {
+      // ── 2. Resolve URL and discover local models ──────────────────────
+      if (localEntries.length === 0) {
         const piProviders = readPiLlamaCppProviders();
 
         if (piProviders.length === 1) {
@@ -788,15 +810,12 @@ export default function(pi: ExtensionAPI) {
             if (idx >= 0 && idx < piProviders.length) {
               llamaUrl = piProviders[idx]!.baseUrl;
             }
-            // else: keep existing default
           }
         } else {
-          // No Pi providers — fall back to manual URL prompt
           const urlInput = await ctx.ui.input(`llama.cpp API URL [${llamaUrl}]:`);
           llamaUrl = urlInput?.trim() || llamaUrl;
         }
 
-        // ── 3. Discover models (try cache first, then live) ───────────
         let discovered = readPiCachedModels(llamaUrl);
         if (discovered.length > 0) {
           ctx.ui.notify(`Using ${discovered.length} cached models from Pi for ${llamaUrl}`, 'info');
@@ -810,26 +829,61 @@ export default function(pi: ExtensionAPI) {
           ctx.ui.notify('No models found at that URL. Enter model IDs manually.', 'warning');
           const manual = await ctx.ui.input('Model IDs (comma-separated), or leave empty to cancel:');
           if (!manual?.trim()) return;
-          modelIds = manual.split(',').map(s => s.trim()).filter(Boolean);
+          localEntries = manual.split(',').map(s => s.trim()).filter(Boolean)
+            .map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
         } else {
           const listText = discovered.map((id, i) => `${i + 1}. ${id}`).join('\n');
           ctx.ui.notify(`Available models:\n${listText}`, 'info');
 
           const sel = await ctx.ui.input('Select models to configure (e.g. "1,3") or Enter for all:');
-          if (sel?.trim()) {
-            const indices = sel.split(',').map(s => parseInt(s.trim(), 10) - 1);
-            modelIds = indices.filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!);
-            if (modelIds.length === 0) {
-              ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
-              return;
-            }
-          } else {
-            modelIds = discovered;
+          const selectedIds = sel?.trim()
+            ? sel.split(',').map(s => parseInt(s.trim(), 10) - 1)
+                .filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!)
+            : discovered;
+          if (selectedIds.length === 0) {
+            ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
+            return;
           }
+          localEntries = selectedIds.map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
         }
       }
 
-      // ── 3. Assign a model to each agent (configure on first use) ─────
+      // ── 3. Discover cloud models from Pi's configured providers ──────
+      // Pi's models.json already has API keys for cloud providers (e.g. OpenRouter).
+      // Fetch their available model lists and offer them alongside local models.
+      const cloudEntries: SetupModelEntry[] = [];
+      const piCloudProviders = readPiCloudProviders();
+      if (piCloudProviders.length > 0) {
+        ctx.ui.setStatus('setup', '🌐 Fetching cloud models...');
+        for (const cp of piCloudProviders) {
+          const fetched = await fetchCloudModels(cp.baseUrl, cp.apiKey);
+          // Determine the standard env var name for this provider's API key
+          const apiKeyEnvVar = cp.baseUrl.includes('openrouter') ? 'OPENROUTER_API_KEY'
+            : cp.baseUrl.includes('openai.com') ? 'OPENAI_API_KEY'
+            : undefined;
+          const provider: 'openrouter' | 'openai' | 'custom' =
+            cp.baseUrl.includes('openrouter') ? 'openrouter'
+            : cp.baseUrl.includes('openai.com') ? 'openai'
+            : 'custom';
+          for (const m of fetched) {
+            cloudEntries.push({
+              displayName: `${m.id}  (${Math.round(m.contextLength / 1000)}k ctx)  [${cp.name}]`,
+              provider,
+              modelId: m.id,
+              apiKeyEnvVar,
+              contextLength: m.contextLength,
+              maxOutputTokens: m.maxOutputTokens,
+              reasoning: m.reasoning,
+            });
+          }
+        }
+        ctx.ui.setStatus('setup', undefined);
+        if (cloudEntries.length > 0) {
+          ctx.ui.notify(`Found ${cloudEntries.length} cloud model(s) from ${piCloudProviders.length} provider(s).`, 'info');
+        }
+      }
+
+      // ── 4. Assign a model to each agent ──────────────────────────────
       const taskTypes: Array<{ type: TaskType; label: string }> = [
         { type: 'plan',         label: 'Task planning / breakdown'  },
         { type: 'project-plan', label: 'Project-level planning'     },
@@ -838,54 +892,90 @@ export default function(pi: ExtensionAPI) {
         { type: 'research',     label: 'Research'                   },
       ];
 
-      const modelList = modelIds; // full list available for selection
-      const listText = modelList.map((id, i) => `${i + 1}. ${id}`).join('\n');
+      // Combined list: local first, then cloud. Build the display text with a
+      // separator so local vs cloud is visually clear.
+      const allEntries: SetupModelEntry[] = [...localEntries, ...cloudEntries];
+      const listLines: string[] = [];
+      localEntries.forEach((e, i) => listLines.push(`${i + 1}. ${e.displayName}`));
+      if (cloudEntries.length > 0) {
+        listLines.push(`── cloud ──`);
+        cloudEntries.forEach((e, i) =>
+          listLines.push(`${localEntries.length + i + 1}. ${e.displayName}`)
+        );
+      }
+      const listText = listLines.join('\n');
+
       const piModelInfo = readPiCachedModelInfo(llamaUrl);
 
       const models: Record<string, ModelProfile> = {};
       const routing: Partial<Record<TaskType, string>> = {};
-      let lastKey: string | undefined;
+      let lastKeyIdx = 0; // index into allEntries for default suggestion
 
       for (const { type, label } of taskTypes) {
-        const defaultIdx = lastKey
-          ? modelList.indexOf(models[lastKey]!.ggufFilename) + 1
-          : 1;
-
+        const defaultIdx = lastKeyIdx + 1;
         const input = await ctx.ui.input(
           `${listText}\n\n${type} — ${label} [${defaultIdx}]:`
         );
         const idx = Math.max(0, Math.min(
           parseInt(input?.trim() || String(defaultIdx), 10) - 1,
-          modelList.length - 1
+          allEntries.length - 1
         ));
-        const chosenId = modelList[idx]!;
-        const key = chosenId.replace(/\.gguf$/i, '').replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').toLowerCase().substring(0, 30);
+        const entry = allEntries[idx]!;
+        lastKeyIdx = idx;
+
+        // Derive a stable config key from whichever identifier the entry has
+        const rawId = entry.modelId ?? entry.ggufFilename ?? entry.displayName;
+        const key = rawId.replace(/\.gguf$/i, '').replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').toLowerCase().substring(0, 30);
 
         // Configure this model the first time it's selected
         if (!models[key]) {
-          const cachedReasoning = piModelInfo.get(chosenId)?.reasoning ?? false;
-          const thinkDefault = cachedReasoning ? 'Y/n' : 'y/N';
-          const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${chosenId}"? (${thinkDefault}):`);
-          const enableThinking = thinkInput?.trim()
-            ? thinkInput.toLowerCase().startsWith('y')
-            : cachedReasoning;
+          if (entry.provider === 'local') {
+            // ── Local model ──────────────────────────────────────────
+            const chosenId = entry.ggufFilename!;
+            const cachedReasoning = piModelInfo.get(chosenId)?.reasoning ?? false;
+            const thinkDefault = cachedReasoning ? 'Y/n' : 'y/N';
+            const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${chosenId}"? (${thinkDefault}):`);
+            const enableThinking = thinkInput?.trim()
+              ? thinkInput.toLowerCase().startsWith('y')
+              : cachedReasoning;
 
-          const arch = guessArchitecture(chosenId);
-          const cached = piModelInfo.get(chosenId);
-          models[key] = {
-            name: chosenId,
-            ggufFilename: chosenId,
-            provider: 'local',
-            contextWindow: cached?.contextWindow ?? 128_000,
-            maxOutputTokens: cached?.maxTokens ?? 32_768,
-            architecture: arch,
-            speed: arch === 'moe' ? 'fast' : 'slow',
-            enableThinking,
-          };
+            const arch = guessArchitecture(chosenId);
+            const cached = piModelInfo.get(chosenId);
+            models[key] = {
+              name: chosenId,
+              ggufFilename: chosenId,
+              provider: 'local',
+              contextWindow: cached?.contextWindow ?? 128_000,
+              maxOutputTokens: cached?.maxTokens ?? 32_768,
+              architecture: arch,
+              speed: arch === 'moe' ? 'fast' : 'slow',
+              enableThinking,
+            };
+          } else {
+            // ── Cloud model (OpenRouter / OpenAI / custom) ────────────
+            const modelId = entry.modelId!;
+            const thinkDefault = entry.reasoning ? 'Y/n' : 'y/N';
+            const thinkInput = await ctx.ui.input(`Enable thinking/reasoning for "${modelId}"? (${thinkDefault}):`);
+            const enableThinking = thinkInput?.trim()
+              ? thinkInput.toLowerCase().startsWith('y')
+              : (entry.reasoning ?? false);
+
+            const arch = guessArchitecture(modelId);
+            models[key] = {
+              name: modelId,
+              modelId,
+              provider: entry.provider,
+              ...(entry.apiKeyEnvVar ? { apiKeyEnvVar: entry.apiKeyEnvVar } : {}),
+              contextWindow: entry.contextLength ?? 128_000,
+              maxOutputTokens: entry.maxOutputTokens ?? 32_768,
+              architecture: arch,
+              speed: arch === 'moe' ? 'fast' : 'slow',
+              enableThinking,
+            };
+          }
         }
 
         routing[type] = key;
-        lastKey = key;
       }
 
       // ── 5. Save location ──────────────────────────────────────────────
