@@ -740,112 +740,76 @@ export default function(pi: ExtensionAPI) {
         reasoning?: boolean;
       }
 
-      // ── 1. Check for existing config ──────────────────────────────────
+      // ── 1. Resolve llamaUrl ────────────────────────────────────────────
       const existingConfig = isGlobal ? loadGlobalConfig() : loadConfig(ctx.cwd);
-      const existingLocalKeys = existingConfig
-        ? Object.entries(existingConfig.models)
-            .filter(([, p]) => p.provider === 'local')
-            .map(([k]) => k)
-        : [];
-
       let llamaUrl = process.env['LLAMA_CPP_URL'] || existingConfig?.llamaCppUrl || 'http://localhost:8080/v1';
-      let localEntries: SetupModelEntry[] = [];
 
-      if (existingLocalKeys.length > 0) {
-        // ── 1a. Offer existing local models ───────────────────────────
-        const listText = existingLocalKeys.map((k, i) => {
-          const p = existingConfig!.models[k]!;
-          const label = p.name && p.name !== k ? `${p.name} (${p.ggufFilename || k})` : (p.ggufFilename || k);
-          return `${i + 1}. ${label}`;
-        }).join('\n');
-        ctx.ui.notify(`Existing llama.cpp models:\n${listText}`, 'info');
-
-        const sel = await ctx.ui.input(
-          `Select models to reconfigure (e.g. "1,2"), Enter to use all, or type a URL to discover new models:`
-        );
+      const piProviders = readPiLlamaCppProviders();
+      if (piProviders.length === 1) {
+        llamaUrl = piProviders[0]!.baseUrl;
+        ctx.ui.notify(`Using Pi llama.cpp provider: ${piProviders[0]!.name} (${llamaUrl})`, 'info');
+      } else if (piProviders.length > 1) {
+        const providerList = piProviders.map((p, i) => `${i + 1}. ${p.name}  ${p.baseUrl}`).join('\n');
+        ctx.ui.notify(`Pi llama.cpp providers:\n${providerList}`, 'info');
+        const sel = await ctx.ui.input(`Select provider (1-${piProviders.length}) or paste a custom URL:`);
         const trimmed = sel?.trim() ?? '';
-
         if (trimmed.startsWith('http')) {
-          // User supplied a URL — go through discovery
           llamaUrl = trimmed;
-        } else if (trimmed === '') {
-          // Use all existing local models
-          localEntries = existingLocalKeys.map(k => {
-            const p = existingConfig!.models[k]!;
-            const fname = p.ggufFilename || k;
-            return { displayName: fname, provider: 'local' as const, ggufFilename: fname };
-          });
         } else {
-          // Numeric selection from existing list
-          const indices = trimmed.split(',').map(s => parseInt(s.trim(), 10) - 1);
-          const selected = indices.filter(i => i >= 0 && i < existingLocalKeys.length).map(i => existingLocalKeys[i]!);
-          if (selected.length === 0) {
-            ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
-            return;
-          }
-          localEntries = selected.map(k => {
-            const p = existingConfig!.models[k]!;
-            const fname = p.ggufFilename || k;
-            return { displayName: fname, provider: 'local' as const, ggufFilename: fname };
-          });
+          const idx = parseInt(trimmed, 10) - 1;
+          if (idx >= 0 && idx < piProviders.length) llamaUrl = piProviders[idx]!.baseUrl;
         }
+      } else if (!process.env['LLAMA_CPP_URL'] && !existingConfig?.llamaCppUrl) {
+        const urlInput = await ctx.ui.input(`llama.cpp API URL [${llamaUrl}]:`);
+        llamaUrl = urlInput?.trim() || llamaUrl;
       }
 
-      // ── 2. Resolve URL and discover local models ──────────────────────
-      if (localEntries.length === 0) {
-        const piProviders = readPiLlamaCppProviders();
+      // ── 2. Discover all available local models ────────────────────────
+      // Always fetch the full list — never limit to what was previously
+      // configured, so newly loaded models always appear.
+      let discovered = readPiCachedModels(llamaUrl);
+      if (discovered.length > 0) {
+        ctx.ui.notify(`Found ${discovered.length} cached models from Pi for ${llamaUrl}`, 'info');
+      } else {
+        ctx.ui.setStatus('setup', '🔍 Discovering models...');
+        discovered = await discoverModels(llamaUrl);
+        ctx.ui.setStatus('setup', undefined);
+      }
 
-        if (piProviders.length === 1) {
-          llamaUrl = piProviders[0]!.baseUrl;
-          ctx.ui.notify(`Using Pi llama.cpp provider: ${piProviders[0]!.name} (${llamaUrl})`, 'info');
-        } else if (piProviders.length > 1) {
-          const listText = piProviders.map((p, i) => `${i + 1}. ${p.name}  ${p.baseUrl}`).join('\n');
-          ctx.ui.notify(`Pi llama.cpp providers:\n${listText}`, 'info');
-          const sel = await ctx.ui.input(`Select provider (1-${piProviders.length}) or paste a custom URL:`);
-          const trimmed = sel?.trim() ?? '';
-          if (trimmed.startsWith('http')) {
-            llamaUrl = trimmed;
-          } else {
-            const idx = parseInt(trimmed, 10) - 1;
-            if (idx >= 0 && idx < piProviders.length) {
-              llamaUrl = piProviders[idx]!.baseUrl;
-            }
-          }
-        } else {
-          const urlInput = await ctx.ui.input(`llama.cpp API URL [${llamaUrl}]:`);
-          llamaUrl = urlInput?.trim() || llamaUrl;
+      // Mark any model already in the config so the user can see at a glance
+      // which ones are new vs already assigned.
+      const configuredFilenames = new Set(
+        Object.values(existingConfig?.models ?? {})
+          .filter(p => p.provider === 'local')
+          .map(p => p.ggufFilename)
+          .filter(Boolean)
+      );
+
+      let localEntries: SetupModelEntry[] = [];
+      if (discovered.length === 0) {
+        ctx.ui.notify('No models found at that URL. Enter model IDs manually.', 'warning');
+        const manual = await ctx.ui.input('Model IDs (comma-separated), or leave empty to cancel:');
+        if (!manual?.trim()) return;
+        localEntries = manual.split(',').map(s => s.trim()).filter(Boolean)
+          .map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
+      } else {
+        const listText = discovered.map((id, i) => {
+          const marker = configuredFilenames.has(id) ? ' *' : '';
+          return `${i + 1}. ${id}${marker}`;
+        }).join('\n');
+        const note = configuredFilenames.size > 0 ? '  (* = already configured)' : '';
+        ctx.ui.notify(`Available models:${note}\n${listText}`, 'info');
+
+        const sel = await ctx.ui.input('Select models to include (e.g. "1,3") or Enter for all:');
+        const selectedIds = sel?.trim()
+          ? sel.split(',').map(s => parseInt(s.trim(), 10) - 1)
+              .filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!)
+          : discovered;
+        if (selectedIds.length === 0) {
+          ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
+          return;
         }
-
-        let discovered = readPiCachedModels(llamaUrl);
-        if (discovered.length > 0) {
-          ctx.ui.notify(`Using ${discovered.length} cached models from Pi for ${llamaUrl}`, 'info');
-        } else {
-          ctx.ui.setStatus('setup', '🔍 Discovering models...');
-          discovered = await discoverModels(llamaUrl);
-          ctx.ui.setStatus('setup', undefined);
-        }
-
-        if (discovered.length === 0) {
-          ctx.ui.notify('No models found at that URL. Enter model IDs manually.', 'warning');
-          const manual = await ctx.ui.input('Model IDs (comma-separated), or leave empty to cancel:');
-          if (!manual?.trim()) return;
-          localEntries = manual.split(',').map(s => s.trim()).filter(Boolean)
-            .map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
-        } else {
-          const listText = discovered.map((id, i) => `${i + 1}. ${id}`).join('\n');
-          ctx.ui.notify(`Available models:\n${listText}`, 'info');
-
-          const sel = await ctx.ui.input('Select models to configure (e.g. "1,3") or Enter for all:');
-          const selectedIds = sel?.trim()
-            ? sel.split(',').map(s => parseInt(s.trim(), 10) - 1)
-                .filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!)
-            : discovered;
-          if (selectedIds.length === 0) {
-            ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
-            return;
-          }
-          localEntries = selectedIds.map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
-        }
+        localEntries = selectedIds.map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
       }
 
       // ── 3. Discover cloud models from Pi's configured providers ──────
