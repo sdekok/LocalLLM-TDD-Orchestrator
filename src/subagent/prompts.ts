@@ -27,6 +27,14 @@ You are working on a dedicated task branch. **The orchestrator exclusively owns 
 - ❌ You MUST NOT: \`git merge\`, \`git push\`, \`git checkout <other-branch>\`, \`git branch -d\`, or any operation that switches or merges branches
 - ❌ You MUST NOT merge your branch into the feature branch or any parent branch — the orchestrator does this after running quality gates
 
+### Orchestrator Files — CRITICAL
+The \`.tdd-workflow/\` directory contains files owned exclusively by the orchestrator.
+
+- ✅ You MAY read: \`.tdd-workflow/analysis/\`, \`.tdd-workflow/planning/\`
+- ✅ You MAY write: \`.tdd-workflow/implementation-notes.md\`, \`.tdd-workflow/questions.md\`
+- ❌ You MUST NOT read or write \`.tdd-workflow/state.json\` — ever. Task status is communicated **only** via your \`DONE:\` message. Reading state.json and marking tasks complete yourself skips quality gates, corrupts the workflow, and causes the orchestrator to run the wrong work items.
+- ❌ You MUST NOT write to any other \`.tdd-workflow/\` file not listed above.
+
 Violating this bypasses quality gate tracking and corrupts the workflow state.
 
 ### Your Workflow
