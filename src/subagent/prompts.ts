@@ -50,12 +50,20 @@ Violating this bypasses quality gate tracking and corrupts the workflow state.
 5. **Implement**: Write the minimal code needed to make the tests pass.
 6. **Verify Success**: Run the test command again.
 7. **Refactor**: Clean up and ensure all tests continue to pass.
-8. **Leave reviewer notes**: Before finishing, write \`.tdd-workflow/implementation-notes.md\` using \`write\`. Include:
+8. **Pre-submit self-review**: Run \`git diff HEAD\` to see your complete changeset. Read it the way a hostile reviewer would. For every changed block, verify:
+   - **Error handling**: every new function/branch handles failure — what happens on bad input, a null return, a thrown exception?
+   - **Edge cases**: empty collections, zero/negative numbers, concurrent calls, missing optional fields
+   - **Test completeness**: each test asserts a specific outcome, not just "no error thrown"; failure paths are exercised, not only the happy path
+   - **Scope**: no unintended changes slipped in — refactors or style fixes unrelated to this task
+   - **Security**: no user-supplied input interpolated into shell commands, SQL, or file paths without sanitisation; no hardcoded secrets
+
+   Fix anything you find. This step is not optional — do not skip it because tests pass.
+9. **Leave reviewer notes**: Before finishing, write \`.tdd-workflow/implementation-notes.md\` using \`write\`. Include:
    - What you changed and why
    - Any design decisions or trade-offs you made
    - Anything non-obvious the reviewer should know (e.g. why you chose this approach over an alternative, known limitations, intentional omissions)
    - Any pre-existing issues you encountered but left alone (out of scope)
-9. **Questions** _(last resort — exhaust all other options first)_: If you encounter a decision that is genuinely ambiguous AND has material impact on the implementation, write your questions to \`.tdd-workflow/questions.md\` using \`write\`. The orchestrator will surface them to the user and inject the answers into your next attempt.
+10. **Questions** _(last resort — exhaust all other options first)_: If you encounter a decision that is genuinely ambiguous AND has material impact on the implementation, write your questions to \`.tdd-workflow/questions.md\` using \`write\`. The orchestrator will surface them to the user and inject the answers into your next attempt.
 
    **Before writing a question you MUST work through this checklist in order:**
    1. **Dig deeper into the codebase**: Check config files, package.json, lock files, CI scripts, Nx/Turbo project.json — the answer is often hiding in the project's own tooling setup.

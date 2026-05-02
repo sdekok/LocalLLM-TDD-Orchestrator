@@ -698,6 +698,8 @@ export class WorkflowExecutor {
       if (task.phase !== 'merging') {
         // Accumulates one entry per implement→review cycle for arbiter loop detection.
         const iterationHistory: IterationRecord[] = [];
+        // Per-round feedback log shown to the implementer on retries (newest first).
+        const feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }> = [];
         // Two-pass outer loop: pass 0 = normal attempts, pass 1 = arbiter-granted extra rounds.
         let arbiterExtraRounds = 0;
         for (let pass = 0; pass <= 1 && !approved; pass++) {
@@ -794,10 +796,31 @@ export class WorkflowExecutor {
               this.chatMessage?.(
                 `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — continuing implementer session with reviewer feedback`
               );
+
+              // Build structured history so the implementer can see which issues are
+              // new this round vs. raised (and presumably addressed) in prior rounds.
+              const historySection = feedbackHistory.length > 1
+                ? feedbackHistory
+                    .slice()
+                    .reverse() // newest first
+                    .map((h, i) => {
+                      const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
+                      const marker = i === 0 ? ' ← address this round' : ' (previously raised)';
+                      return `### Round ${h.round} — ${label}${marker}\n${h.text}`;
+                    })
+                    .join('\n\n---\n\n')
+                : feedback;
+
               implementerPrompt =
-                `The reviewer rejected your implementation. Your previous code is still on this branch — ` +
-                `do not start from scratch. Read the feedback below, apply only the necessary changes, ` +
-                `run the tests to confirm everything passes, and commit.\n\n## Reviewer Feedback\n${feedback}`;
+                `Your previous code is still on this branch — do not start from scratch.\n\n` +
+                `## Feedback\n\n${historySection}\n\n` +
+                `## How to apply this feedback\n\n` +
+                `For each issue raised in the latest round:\n` +
+                `1. Find the exact location in your code.\n` +
+                `2. Understand *why* it is wrong, not just what to change.\n` +
+                `3. Fix it.\n` +
+                `4. Check whether the **same pattern** exists elsewhere in files you have already modified — if so, fix those instances too. Do not touch files outside your existing diff.\n\n` +
+                `When done: run the tests, do a final \`git diff HEAD\` to confirm there are no regressions or unintended changes, then commit and signal \`DONE:\`.`;
             } else {
               // First turn: full task description + metadata.
               implementerPrompt = technicalDescription;
@@ -971,6 +994,7 @@ export class WorkflowExecutor {
               } else {
                 // There are genuine new failures. Build feedback from those only.
                 feedback = regressionReports.join('\n\n');
+                feedbackHistory.push({ round: attempt, type: 'gates', text: feedback });
                 logger.info(`Quality gates failed (new failures only):\n${feedback.substring(0, 300)}`);
 
                 // Emit detailed feedback for TUI
@@ -1135,6 +1159,7 @@ export class WorkflowExecutor {
               feedback = reviewerAnswers
                 ? `${reviewerFeedback}\n\n${reviewerAnswers}`
                 : reviewerFeedback;
+              feedbackHistory.push({ round: attempt, type: 'review', text: feedback });
 
               iterationHistory.push({
                 attempt,
