@@ -17,6 +17,7 @@ import { createRequire } from 'module';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
 import { getAskUserForClarificationParams, type AskUserForClarificationArgs } from './tools.js';
+import { ensureModelInPiProvider } from '../interfaces/pi/pi-models.js';
 
 const PI_AGENT_DIR = path.join(os.homedir(), '.pi', 'agent');
 
@@ -371,33 +372,41 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
 
     // Cloud model not in the registry — this happens when the model was configured in the TDD
     // workflow but Pi's own models.json only has a different model for this provider (or none).
-    // Dynamically register it for this ephemeral session so the correct model is used.
+    // Persist it to Pi's models.json so all future sessions find it without needing a fallback.
     if (!targetModel && profile.provider !== 'local') {
       const baseUrl = options.modelRouter.getBaseURL(profile);
-      let apiKey: string | undefined;
-      try { apiKey = options.modelRouter.getApiKey(profile); } catch { /* will rely on Pi's stored auth */ }
+      const added = ensureModelInPiProvider(profile.modelId!, baseUrl);
+      if (added) {
+        logger.info(`[SUBAGENT FACTORY] Cloud model '${targetModelId}' added to Pi's models.json — refreshing registry`);
+        session.modelRegistry.refresh();
+        allModels = session.modelRegistry.getAll();
+        targetModel = allModels.find((m) => m.id === targetModelId);
+      }
 
-      const providerConfig: ProviderConfig = {
-        baseUrl,
-        ...(apiKey ? { apiKey } : {}),
-        models: [{
-          id: profile.modelId!,
-          name: profile.name,
-          api: 'openai-completions',
-          reasoning: profile.enableThinking ?? false,
-          input: ['text'],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: profile.contextWindow,
-          maxTokens: profile.maxOutputTokens,
-        }],
-      };
-      // registerProvider with models: [...] replaces all models for this provider in the session.
-      // Safe here because each subagent session is ephemeral and runs a single model.
-      session.modelRegistry.registerProvider(profile.provider, providerConfig);
-      allModels = session.modelRegistry.getAll();
-      targetModel = allModels.find((m) => m.id === targetModelId);
-      if (targetModel) {
-        logger.info(`[SUBAGENT FACTORY] Cloud model '${targetModelId}' dynamically registered for provider '${profile.provider}'`);
+      // Final fallback: if no matching provider in Pi's models.json, register for this session only
+      if (!targetModel) {
+        let apiKey: string | undefined;
+        try { apiKey = options.modelRouter.getApiKey(profile); } catch { /* rely on Pi's stored auth */ }
+        const providerConfig: ProviderConfig = {
+          baseUrl,
+          ...(apiKey ? { apiKey } : {}),
+          models: [{
+            id: profile.modelId!,
+            name: profile.name,
+            api: 'openai-completions',
+            reasoning: profile.enableThinking ?? false,
+            input: ['text'],
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: profile.contextWindow,
+            maxTokens: profile.maxOutputTokens,
+          }],
+        };
+        session.modelRegistry.registerProvider(profile.provider, providerConfig);
+        allModels = session.modelRegistry.getAll();
+        targetModel = allModels.find((m) => m.id === targetModelId);
+        if (targetModel) {
+          logger.info(`[SUBAGENT FACTORY] Cloud model '${targetModelId}' registered for this session (no matching Pi provider found)`);
+        }
       }
     }
 

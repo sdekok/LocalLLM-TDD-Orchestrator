@@ -110,3 +110,40 @@ export function readPiCachedModelInfo(baseUrl: string, homeDir = os.homedir()): 
   }
   return map;
 }
+
+/**
+ * Ensure a cloud model ID is present in Pi's ~/.pi/agent/models.json for the
+ * provider whose baseUrl matches `targetBaseUrl`.
+ *
+ * Returns true if the model was already present or was successfully added,
+ * false if no matching provider was found or the file could not be written.
+ */
+export function ensureModelInPiProvider(
+  modelId: string,
+  targetBaseUrl: string,
+  homeDir = os.homedir()
+): boolean {
+  const piModelsPath = path.join(homeDir, '.pi', 'agent', 'models.json');
+  if (!fs.existsSync(piModelsPath)) return false;
+  try {
+    const raw = JSON.parse(fs.readFileSync(piModelsPath, 'utf-8')) as PiModelsJson;
+    const providers = raw.providers ?? {};
+
+    const normalizedTarget = targetBaseUrl.replace(/\/$/, '');
+    const providerKey = Object.keys(providers).find(key =>
+      (providers[key]?.baseUrl ?? '').replace(/\/$/, '') === normalizedTarget
+    );
+    if (!providerKey) return false;
+
+    const provider = providers[providerKey]!;
+    const models = provider.models ?? [];
+    if (models.some(m => m.id === modelId)) return true;
+
+    provider.models = [...models, { id: modelId }];
+    raw.providers = providers;
+    fs.writeFileSync(piModelsPath, JSON.stringify(raw, null, 4), 'utf-8');
+    return true;
+  } catch {
+    return false;
+  }
+}
