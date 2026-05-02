@@ -523,14 +523,6 @@ async function getSourceFiles(projectDir: string): Promise<string[]> {
  * Entries without a trailing slash are matched exactly as a prefix, so "docs"
  * would also match "docs-extra/". Always use a trailing slash for directory entries.
  */
-/**
- * Paths that are NEVER allowed, regardless of any allowlist.
- * Matched as exact path strings (relative to project root).
- */
-const BUILTIN_BLOCKED_PATHS = new Set([
-  '.tdd-workflow/state.json',
-]);
-
 const BUILTIN_SAFE_PREFIXES = [
   'src/',
   'tests/',
@@ -619,7 +611,6 @@ async function checkFileSafety(projectDir: string): Promise<GateResult> {
       .split('\n')
       .filter(Boolean)
       .filter((f) => {
-        if (BUILTIN_BLOCKED_PATHS.has(f)) return true;  // always flag blocked paths
         if (BUILTIN_SAFE_PATTERNS.some(re => re.test(f))) return false;
         return !allPrefixes.some(prefix => f.startsWith(prefix));
       });

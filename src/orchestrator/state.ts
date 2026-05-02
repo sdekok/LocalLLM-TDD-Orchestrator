@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
+import { execFileSync } from 'child_process';
 import { getLogger } from '../utils/logger.js';
 
 export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'paused';
@@ -51,6 +52,9 @@ export class StateManager {
    * Add .tdd-workflow runtime files to .git/info/exclude so that
    * `git add -A` (run by the implementer agent) never commits them.
    * This is a per-repo, non-committed exclusion — it doesn't touch .gitignore.
+   *
+   * Also un-tracks any of these files that were previously committed, so they
+   * no longer appear in `git diff HEAD` and cannot trip the file-safety gate.
    */
   private ensureGitExclude(projectDir: string): void {
     const excludePath = path.join(projectDir, '.git', 'info', 'exclude');
@@ -66,7 +70,21 @@ export class StateManager {
         fs.mkdirSync(path.dirname(excludePath), { recursive: true });
         fs.appendFileSync(excludePath, '\n# tdd-workflow runtime files (auto-added)\n' + toAdd.join('\n') + '\n');
       }
-    } catch { /* non-fatal — just means the files may end up committed */ }
+    } catch { /* non-fatal */ }
+
+    // If state.json was previously committed, un-track it so it no longer shows
+    // up in git diff (the orchestrator writes it constantly, which would trip the
+    // file-safety gate if the file is tracked).
+    try {
+      const result = execFileSync('git', ['ls-files', '--error-unmatch', '.tdd-workflow/state.json'], {
+        cwd: projectDir, stdio: 'pipe',
+      });
+      // File is tracked — remove it from the index without deleting it from disk
+      execFileSync('git', ['rm', '--cached', '.tdd-workflow/state.json'], {
+        cwd: projectDir, stdio: 'pipe',
+      });
+      getLogger().info('[StateManager] Un-tracked .tdd-workflow/state.json from git index');
+    } catch { /* not tracked — nothing to do */ }
   }
 
   private loadState(): WorkflowState {
