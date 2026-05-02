@@ -818,8 +818,8 @@ export class WorkflowExecutor {
                 `For each issue raised in the latest round:\n` +
                 `1. Find the exact location in your code.\n` +
                 `2. Understand *why* it is wrong, not just what to change.\n` +
-                `3. Fix it.\n` +
-                `4. Check whether the **same pattern** exists elsewhere in files you have already modified — if so, fix those instances too. Do not touch files outside your existing diff.\n\n` +
+                `3. Fix it — touch whatever files are needed to fully address the feedback.\n` +
+                `4. Check whether the **same pattern** exists elsewhere in files you have already modified — if so, fix those instances too. This generalisation sweep is scoped to your existing diff; do not refactor unrelated code that the reviewer did not mention.\n\n` +
                 `When done: run the tests, do a final \`git diff HEAD\` to confirm there are no regressions or unintended changes, then commit and signal \`DONE:\`.`;
             } else {
               // First turn: full task description + metadata.
