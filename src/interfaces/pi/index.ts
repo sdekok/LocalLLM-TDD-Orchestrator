@@ -965,7 +965,32 @@ export default function(pi: ExtensionAPI) {
       fs.mkdirSync(targetDir, { recursive: true });
       saveConfig(finalConfig, targetDir);
 
-      // ── 6. Summary ───────────────────────────────────────────────────
+      // ── 6. Local override warning (global save only) ─────────────────
+      if (saveGlobal) {
+        const localConfigPath = path.join(ctx.cwd, 'models.config.json');
+        if (fs.existsSync(localConfigPath)) {
+          ctx.ui.notify(
+            `⚠️  A local config exists at ${localConfigPath} and will override the global settings for this project.`,
+            'warning'
+          );
+          const LOCAL_OPT_KEEP   = 'Leave it as-is  (local overrides global for this project)';
+          const LOCAL_OPT_UPDATE = 'Update it with these same settings';
+          const LOCAL_OPT_REMOVE = 'Remove it  (global config will apply to this project)';
+          const localAction = await ctx.ui.select(
+            'What would you like to do with the local config?',
+            [LOCAL_OPT_KEEP, LOCAL_OPT_UPDATE, LOCAL_OPT_REMOVE]
+          );
+          if (localAction === LOCAL_OPT_REMOVE) {
+            fs.rmSync(localConfigPath);
+            ctx.ui.notify(`Removed ${localConfigPath} — global config now applies here.`, 'info');
+          } else if (localAction === LOCAL_OPT_UPDATE) {
+            saveConfig(finalConfig, ctx.cwd);
+            ctx.ui.notify(`Updated ${localConfigPath} to match global settings.`, 'info');
+          }
+        }
+      }
+
+      // ── 7. Summary ───────────────────────────────────────────────────
       const savedPath = path.join(targetDir, 'models.config.json');
       const routingSummary = taskTypes
         .map(({ type }) => `  ${type.padEnd(14)} → ${models[routing[type]!]?.name ?? routing[type]}`)
