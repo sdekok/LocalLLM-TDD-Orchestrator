@@ -8,6 +8,7 @@ import {
   type AgentToolResult,
   type AgentToolUpdateCallback,
   type ExtensionFactory,
+  type ProviderConfig,
 } from '@mariozechner/pi-coding-agent';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -365,8 +366,41 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   // (or the built-in ID for cloud providers). We look it up in the full registry so we get a
   // fully populated Model<TApi> object (with api, baseUrl, etc.) rather than a partial stub.
   if (targetModelId) {
-    const allModels = session.modelRegistry.getAll();
-    const targetModel = allModels.find((m) => m.id === targetModelId);
+    let allModels = session.modelRegistry.getAll();
+    let targetModel = allModels.find((m) => m.id === targetModelId);
+
+    // Cloud model not in the registry — this happens when the model was configured in the TDD
+    // workflow but Pi's own models.json only has a different model for this provider (or none).
+    // Dynamically register it for this ephemeral session so the correct model is used.
+    if (!targetModel && profile.provider !== 'local') {
+      const baseUrl = options.modelRouter.getBaseURL(profile);
+      let apiKey: string | undefined;
+      try { apiKey = options.modelRouter.getApiKey(profile); } catch { /* will rely on Pi's stored auth */ }
+
+      const providerConfig: ProviderConfig = {
+        baseUrl,
+        ...(apiKey ? { apiKey } : {}),
+        models: [{
+          id: profile.modelId!,
+          name: profile.name,
+          api: 'openai-completions',
+          reasoning: profile.enableThinking ?? false,
+          input: ['text'],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: profile.contextWindow,
+          maxTokens: profile.maxOutputTokens,
+        }],
+      };
+      // registerProvider with models: [...] replaces all models for this provider in the session.
+      // Safe here because each subagent session is ephemeral and runs a single model.
+      session.modelRegistry.registerProvider(profile.provider, providerConfig);
+      allModels = session.modelRegistry.getAll();
+      targetModel = allModels.find((m) => m.id === targetModelId);
+      if (targetModel) {
+        logger.info(`[SUBAGENT FACTORY] Cloud model '${targetModelId}' dynamically registered for provider '${profile.provider}'`);
+      }
+    }
+
     if (targetModel) {
       // Set the model directly on agent state to avoid the side-effect in session.setModel()
       // which persists to ~/.pi/agent/settings.json — undesirable for ephemeral subagents.
