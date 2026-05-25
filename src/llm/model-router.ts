@@ -13,7 +13,7 @@ export interface SamplingParams {
   presence_penalty?: number;
 }
 
-export type ModelProvider = 'local' | 'openrouter' | 'openai' | 'custom';
+export type ModelProvider = 'local' | 'openrouter' | 'openai';
 
 export interface ModelProfile {
   name: string;
@@ -25,7 +25,20 @@ export interface ModelProfile {
   // Use apiKeyEnvVar to name the env var, e.g. 'OPENROUTER_API_KEY'.
   apiKeyEnvVar?: string;         // Environment variable name for API key
   enableThinking?: boolean;      // Whether to activate reasoning mode + thinking-block history filter
+  /**
+   * Refresh the implementer session every N reviewer-rejection rounds.
+   * Keeps context windows manageable; lower values suit local models with
+   * small windows, higher values (or omit) suit frontier models.
+   * Default: SESSION_REFRESH_AFTER (2). Set to a large number to disable.
+   */
+  sessionRefreshAfter?: number;
   contextWindow: number;
+  /**
+   * Soft cap (in tokens) at which the in-session context pruner starts stubbing
+   * old tool results. When omitted, defaults to 70% of `contextWindow`. Set to
+   * 0 to disable pruning entirely (not recommended for long implementer runs).
+   */
+  contextBudgetTokens?: number;
   maxOutputTokens: number;
   architecture: 'dense' | 'moe' | 'unknown';
   parameterCount?: string;
@@ -158,7 +171,9 @@ export async function fetchCloudModels(baseURL: string, apiKey?: string): Promis
       data?: {
         id: string;
         name?: string;
+        // OpenRouter / OpenAI use context_length; vLLM uses max_model_len.
         context_length?: number;
+        max_model_len?: number;
         architecture?: { modality?: string };
         top_provider?: { max_completion_tokens?: number };
       }[];
@@ -167,17 +182,20 @@ export async function fetchCloudModels(baseURL: string, apiKey?: string): Promis
     return (data.data ?? [])
       .filter(m => {
         const modality = m.architecture?.modality ?? '';
-        // Keep text-capable models; exclude image/audio-only
         if (modality && !modality.includes('text')) return false;
-        return (m.context_length ?? 0) >= 4096;
+        const ctx = m.context_length ?? m.max_model_len ?? 0;
+        return ctx >= 4096;
       })
-      .map(m => ({
-        id: m.id,
-        name: m.name || m.id,
-        contextLength: m.context_length ?? 0,
-        maxOutputTokens: m.top_provider?.max_completion_tokens ?? 8192,
-        reasoning: /\br1\b|think|reason|o[134]\b/i.test(m.id),
-      }))
+      .map(m => {
+        const ctx = m.context_length ?? m.max_model_len ?? 0;
+        return {
+          id: m.id,
+          name: m.name || m.id,
+          contextLength: ctx,
+          maxOutputTokens: m.top_provider?.max_completion_tokens ?? 8192,
+          reasoning: /\br1\b|think|reason|o[134]\b/i.test(m.id),
+        };
+      })
       .sort((a, b) => a.id.localeCompare(b.id));
   } catch {
     return [];

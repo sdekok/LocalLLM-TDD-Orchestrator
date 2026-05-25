@@ -1,5 +1,5 @@
 import { createSubAgentSession } from '../subagent/factory.js';
-import type { AgentSession } from '@mariozechner/pi-coding-agent';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { ModelRouter } from '../llm/model-router.js';
 import { createResearchTools } from '../subagent/research-tools.js';
 import { SearchClient } from '../search/searxng.js';

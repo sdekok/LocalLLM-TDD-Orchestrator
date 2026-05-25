@@ -43,6 +43,8 @@ Or to save as a system-wide default that applies to all your projects:
 
 ## Slash Commands
 
+> **Tab completion**: Pi's editor supports argument autocomplete on every command below. Press Tab after the command name to get context-aware suggestions: epic IDs for `/tdd <epic>` and `/plan show <epic>`, work item IDs after `task`, branches after `/review branch`, research session dirs after `/research --resume`, subcommands and flags for `/plan` and `/research`. Cycle through suggestions with arrow keys, accept with Enter.
+
 ### `/setup [--global]`
 
 Configures model routing for all agent roles.
@@ -131,14 +133,47 @@ Runs the project's test suite using the same runner + command the TDD executor u
 - Uses `<pkgManager> run test` when a `test` script is defined, else falls back to `npx vitest run`.
 - Useful as a quick sanity check before kicking off `/tdd` on a task, or to inspect what failures the gates will report.
 
-### `/plan <request>`
+### `/plan [subcommand] [flags] [request]`
 
-Decomposes a project or feature into Epics and WorkItems.
+Decomposes a project or feature into Epics and WorkItems. Generates structured markdown files including per-task Security Considerations, Dev Notes, and test suggestions, written to `WorkItems/`. Runs `/analyze` first if the codebase blueprint is stale. If the model doesn't return structured JSON on the first attempt, automatically retries with an explicit follow-up prompt — works reliably in passthrough mode (no config) as well as with configured models.
 
-- Generates structured markdown files including per-task Security Considerations, Dev Notes, and test suggestions.
-- Creates a `WorkItems/` directory at the project root.
-- Runs `/analyze` first if the codebase blueprint is stale.
-- If the model doesn't return structured JSON on the first attempt, automatically retries with an explicit follow-up prompt — works reliably in passthrough mode (no config) as well as with configured models.
+#### Default behavior: append, not overwrite
+
+When you run `/plan` against a project that already has epics in `WorkItems/`, the planner now **appends** by default:
+
+- Existing epic files are not touched unless the planner returns a matching slug (in which case they're updated in place).
+- New epics are numbered past the existing `maxIndex`, so `epic-01-auth.md` and `epic-02-billing.md` keep their numbers — a new epic lands at `epic-03-...`.
+- The Phase 1 prompt is augmented with a summary of existing epics + prior architectural decisions, and the planner is explicitly instructed not to redefine them.
+- `_overview.md`'s prior summary and architectural decisions are merged with the new ones (no duplicates).
+
+To opt out of append mode and clobber from `epic-01-...` like the old behavior, pass `--replace`.
+
+#### Subcommands
+
+| Form | What it does |
+|---|---|
+| `/plan <description>` | New planning run. Appends by default. |
+| `/plan list` | Lists every epic in `WorkItems/` with its title and work-item count. |
+| `/plan show <epic>` | Renders one epic's markdown to chat. `<epic>` accepts ID (`02`), slug (`billing`), or filename. |
+| `/plan revise [feedback]` | Re-runs planning using the previous request saved to `.tdd-workflow/planning/_request.json`, combined with your revision feedback. Append mode. If feedback isn't given inline, you're prompted for it. |
+
+#### Flags
+
+| Flag | Effect |
+|---|---|
+| `--replace` | Opts out of append mode. Starts numbering from `epic-01-...` and ignores existing epics. |
+| `--from-epic <id>` | Loads the referenced epic and inlines it as a "build on top of this" header in the request. |
+| `--brownfield` | Adds a "this is an existing codebase, explore first" header so the planner emphasizes integration over greenfield design. |
+
+#### Iterative feedback (no restart)
+
+When you give feedback at the plan-review prompt, it's persisted to `.tdd-workflow/planning/_pending_feedback.txt`. Instead of retyping `/plan <original args>` to apply your changes, just run:
+
+```
+/plan revise
+```
+
+The planner picks up the original request, layers your feedback on top, and runs in append mode — preserving any epics it already wrote while updating the ones that need to change. Reusing existing slugs makes the planner update those files in place rather than creating duplicates.
 
 ### `/research <topic> [flags]`
 
@@ -200,10 +235,11 @@ If no config file is found anywhere, the orchestrator runs in **passthrough mode
 
 For complex features, the recommended flow is:
 
-1. **Plan**: `/plan "Feature description"` — generates epics with acceptance criteria, security notes, and test suggestions.
-2. **Review**: Open the generated `WorkItems/epic-XX.md` files and edit if needed.
-3. **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
-4. **Execute**: `/tdd 1` — the orchestrator parses all rich metadata and injects it into the sub-agent's prompt.
+1. **Plan**: `/plan "Feature description"` — generates epics with acceptance criteria, security notes, and test suggestions. Defaults to append mode, so this is safe to re-run on an existing plan.
+2. **Review**: Open the generated `WorkItems/epic-XX.md` files and edit if needed. Use `/plan list` to see what was produced and `/plan show <epic>` to inspect one without leaving chat.
+3. **Iterate**: Type revision feedback at the chat-based plan-review prompt, then run `/plan revise` — the planner picks up the original request and applies your feedback without you needing to retype anything.
+4. **Refine**: Update `agents.md` if the architect identified new cross-cutting constraints.
+5. **Execute**: `/tdd 1` — the orchestrator parses all rich metadata and injects it into the sub-agent's prompt.
 
 ## Quality Gates
 
@@ -278,5 +314,5 @@ Only the thresholds you specify are enforced. Without this key there is no block
 | Need to step away mid-workflow | Run `/tdd:pause`, then `/tdd:resume` later — WIP branch and feedback are kept |
 | Current task is going nowhere | Run `/tdd:stop` — rolls the task back to base so you can re-plan or edit by hand |
 | `/tdd:resume` says "no paused tasks" | Your task failed rather than being paused — use `/tdd <epic> resume` instead |
-| Wrong epic files after /plan | Re-run `/plan` — each epic now gets a fresh session, preventing cross-contamination from prior epics' JSON |
+| Wrong epic files after /plan | Run `/plan revise` and describe what should change — the planner picks up the saved original request and updates in place. Or `/plan show <epic>` to inspect a single file, then `/plan revise "fix epic-02 to use Postgres"`. |
 | Quality gates crash (lens-bridge) | Run `npm run build` in the plugin directory to ensure `dist/interfaces/pi/lens-bridge.js` is present |

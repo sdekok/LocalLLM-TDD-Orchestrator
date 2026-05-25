@@ -10,6 +10,7 @@ vi.mock('fs', () => ({
     existsSync: vi.fn(),
     mkdirSync: vi.fn(),
     writeFileSync: vi.fn(),
+    readFileSync: vi.fn(),
     readdirSync: vi.fn(),
     createWriteStream: vi.fn().mockReturnValue({
       write: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('fs', () => ({
   existsSync: vi.fn(),
   mkdirSync: vi.fn(),
   writeFileSync: vi.fn(),
+  readFileSync: vi.fn(),
   readdirSync: vi.fn(),
   createWriteStream: vi.fn().mockReturnValue({
     write: vi.fn(),
@@ -567,6 +569,194 @@ describe('planProject', () => {
       (args: any[]) => typeof args[0] === 'string' && (args[0].includes('WorkItems') || args[0].includes('epic-') || args[0].includes('_overview'))
     );
     expect(planFilesWritten).toHaveLength(0);
+  });
+});
+
+describe('planProject — append vs replace mode', () => {
+  const mockFs = fs as any;
+  const mockModelRouter = new ModelRouter({
+    models: {
+      'test-model': {
+        name: 'Test Model',
+        ggufFilename: 'test.gguf',
+        provider: 'local',
+        contextWindow: 8192,
+        maxOutputTokens: 1024,
+        architecture: 'dense',
+        speed: 'fast',
+        enableThinking: false,
+      },
+    },
+    routing: { 'project-plan': 'test-model' },
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /**
+   * Seed the fs mocks so scanExistingPlan() sees two epics + a prior overview
+   * in WorkItems/. Must be called BEFORE planProject() so scanExistingPlan
+   * (which runs at function entry, before the agent session is created) picks
+   * up the mocked state.
+   */
+  function seedExistingPlanState() {
+    const epic01 = '# Epic: User Authentication\n\n## Summary\nLogin flows.\n\n## Work Items\n\n### WI-1: Email login\n';
+    const epic02 = '# Epic: Billing\n\n## Summary\nStripe.\n\n## Work Items\n\n### WI-1: Stripe integration\n';
+    const overview = '# Project Overview\n\nA web app.\n\n## Architectural Decisions\n\n- Use Postgres\n- Stateless auth\n';
+
+    mockFs.existsSync.mockImplementation((p: string) => {
+      if (typeof p !== 'string') return false;
+      if (p.endsWith('WorkItems')) return true;
+      if (p.endsWith('_overview.md')) return true;
+      if (p.endsWith('epic-01-auth.md') || p.endsWith('epic-02-billing.md')) return true;
+      return false;
+    });
+    mockFs.readdirSync.mockReturnValue(['epic-01-auth.md', 'epic-02-billing.md']);
+    mockFs.readFileSync.mockImplementation((p: string) => {
+      if (typeof p !== 'string') return '';
+      if (p.endsWith('epic-01-auth.md')) return epic01;
+      if (p.endsWith('epic-02-billing.md')) return epic02;
+      if (p.endsWith('_overview.md')) return overview;
+      return '';
+    });
+  }
+
+  /**
+   * Build a mock AgentSession whose `prompt()` returns canned JSON for both
+   * Phase 1 (overview) and Phase 2 (per-epic). Phase 2 uses a fresh session
+   * per epic, so the response is derived from the prompt content rather than
+   * a turn counter.
+   */
+  function buildPlannerSession(newEpicSlug: string) {
+    const messagesStore: any[] = [];
+    const overviewJson = `{"summary":"Adding caching","epics":[{"title":"Caching","slug":"${newEpicSlug}","description":"Add a cache."}],"architecturalDecisions":["Use Redis"]}`;
+    const epicJson = `{"title":"Caching","slug":"${newEpicSlug}","description":"Cache layer.","workItems":[{"id":"WI-1","title":"Add cache","description":"add","acceptance":["a"],"tests":["t"]}]}`;
+    return {
+      prompt: vi.fn().mockImplementation(async (text: string) => {
+        const isPhase1 = text.includes('epic overview JSON');
+        messagesStore.push({
+          role: 'assistant',
+          content: [{ type: 'text', text: isPhase1 ? overviewJson : epicJson }],
+        });
+      }),
+      dispose: vi.fn(),
+      get messages() { return messagesStore; },
+    };
+  }
+
+  it('append mode (default) bumps past maxIndex when slug is new', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    (createSubAgentSession as any).mockImplementation(async () => buildPlannerSession('caching'));
+
+    await planProject('Add a caching layer', mockModelRouter, '/tmp/project');
+
+    const writtenEpicFiles = (mockFs.writeFileSync as any).mock.calls
+      .map((args: any[]) => args[0])
+      .filter((p: string) => typeof p === 'string' && /epic-\d+-/.test(p));
+
+    // The new epic should land at epic-03 (max was 02), NOT epic-01.
+    expect(writtenEpicFiles.some((p: string) => p.endsWith('epic-03-caching.md'))).toBe(true);
+    expect(writtenEpicFiles.some((p: string) => p.endsWith('epic-01-caching.md'))).toBe(false);
+  });
+
+  it('append mode reuses the existing filename when the slug matches', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    // Planner re-emits an epic with the existing 'auth' slug — should update in
+    // place by reusing the on-disk filename rather than picking maxIndex+1.
+    (createSubAgentSession as any).mockImplementation(async () => buildPlannerSession('auth'));
+
+    await planProject('Tighten the auth epic', mockModelRouter, '/tmp/project');
+
+    const writtenEpicFiles = (mockFs.writeFileSync as any).mock.calls
+      .map((args: any[]) => args[0])
+      .filter((p: string) => typeof p === 'string' && /epic-\d+-/.test(p));
+
+    expect(writtenEpicFiles.some((p: string) => p.endsWith('epic-01-auth.md'))).toBe(true);
+    expect(writtenEpicFiles.some((p: string) => p.endsWith('epic-03-auth.md'))).toBe(false);
+  });
+
+  it('append mode injects existing-plan context into the Phase 1 prompt', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    const session = buildPlannerSession('caching');
+    (createSubAgentSession as any).mockImplementation(async () => session);
+
+    await planProject('Add caching', mockModelRouter, '/tmp/project');
+
+    const phase1Prompt = session.prompt.mock.calls[0]?.[0] as string;
+    expect(phase1Prompt).toContain('EXTENDING this');
+    expect(phase1Prompt).toContain('epic-01 "User Authentication"');
+    expect(phase1Prompt).toContain('epic-02 "Billing"');
+    expect(phase1Prompt).toContain('Use Postgres'); // existing architectural decisions surfaced
+  });
+
+  it('append mode merges architectural decisions in _overview.md (no duplicates)', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    (createSubAgentSession as any).mockImplementation(async () => buildPlannerSession('caching'));
+
+    await planProject('Add caching', mockModelRouter, '/tmp/project');
+
+    const overviewWrite = (mockFs.writeFileSync as any).mock.calls.find(
+      (args: any[]) => typeof args[0] === 'string' && args[0].endsWith('_overview.md'),
+    );
+    expect(overviewWrite).toBeDefined();
+    const content = overviewWrite![1] as string;
+    expect(content).toContain('Use Postgres');     // preserved from prior
+    expect(content).toContain('Stateless auth');   // preserved from prior
+    expect(content).toContain('Use Redis');        // new decision appended
+    // No duplicate of an existing decision (case-insensitive)
+    expect((content.match(/Use Postgres/g) || []).length).toBe(1);
+  });
+
+  it('replace mode does NOT inject existing-plan context and starts numbering at 01', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    const session = buildPlannerSession('caching');
+    (createSubAgentSession as any).mockImplementation(async () => session);
+
+    await planProject('Replan from scratch', mockModelRouter, '/tmp/project', undefined, { mode: 'replace' });
+
+    const phase1Prompt = session.prompt.mock.calls[0]?.[0] as string;
+    expect(phase1Prompt).not.toContain('EXTENDING this');
+
+    const writtenEpicFiles = (mockFs.writeFileSync as any).mock.calls
+      .map((args: any[]) => args[0])
+      .filter((p: string) => typeof p === 'string' && /epic-\d+-/.test(p));
+    // Replace mode falls back to the prior numbering: first new epic is epic-01.
+    expect(writtenEpicFiles.some((p: string) => p.endsWith('epic-01-caching.md'))).toBe(true);
+  });
+
+  it('persists _request.json so /plan revise can pick it up later', async () => {
+    const { planProject } = await import('../../src/agents/project-planner.js');
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+
+    seedExistingPlanState();
+    (createSubAgentSession as any).mockImplementation(async () => buildPlannerSession('caching'));
+
+    await planProject('Add caching', mockModelRouter, '/tmp/project');
+
+    const requestWrite = (mockFs.writeFileSync as any).mock.calls.find(
+      (args: any[]) => typeof args[0] === 'string' && args[0].endsWith('_request.json'),
+    );
+    expect(requestWrite).toBeDefined();
+    const payload = JSON.parse(requestWrite![1] as string);
+    expect(payload.request).toBe('Add caching');
+    expect(payload.mode).toBe('append');
+    expect(typeof payload.timestamp).toBe('string');
   });
 });
 

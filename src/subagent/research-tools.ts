@@ -2,10 +2,8 @@ import { Type } from 'typebox';
 import { JSDOM } from 'jsdom';
 import { Readability } from '@mozilla/readability';
 import TurndownService from 'turndown';
-// @ts-expect-error - Importing ESM dist directly for bundle compatibility
-import * as yt from 'youtube-transcript/dist/youtube-transcript.esm.js';
-const YoutubeTranscript = yt.YoutubeTranscript;
-import type { ToolDefinition } from '@mariozechner/pi-coding-agent';
+import { YoutubeTranscript } from 'youtube-transcript';
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent';
 import { validateExternalUrl } from '../utils/url-validator.js';
 
 // HTML parsing tool schema

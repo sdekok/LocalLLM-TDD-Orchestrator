@@ -40,7 +40,7 @@ The orchestrator spawns **ephemeral, headless sub-agent sessions** for planning,
 
 ### 1. Prerequisites
 
-- **Node.js 20+**
+- **Node.js 22.19+** (required by `@earendil-works/pi-coding-agent`)
 - **llama.cpp** running (with [Pi-llama.cpp-provider](https://github.com/sdekok/Pi-llama.cpp-provider) recommended for automatic model settings)
 
 ### 2. Install & Register
@@ -68,7 +68,7 @@ This discovers your available models from llama.cpp, lets you assign each to an 
 Inside any project, use the slash commands:
 
 - **Setup**: `/setup` — configure model routing interactively
-- **Plan**: `/plan "Build a secure login system"` — decomposes into Epics/WorkItems
+- **Plan**: `/plan "Build a secure login system"` — decomposes into Epics/WorkItems. Defaults to **append mode**: existing epics in `WorkItems/` are preserved and used as context. Subcommands: `/plan list`, `/plan show <epic>`, `/plan revise [feedback]`. Flags: `--replace` (overwrite from epic-01), `--from-epic <id>` (extend a specific epic), `--brownfield` (force codebase exploration first).
 - **Implement**: `/tdd 1` — loads Epic 1 from `WorkItems/` and executes
 - **Resume from failure**: `/tdd 1 retry` — retry failed tasks from scratch; `/tdd 1 resume` — retry with reviewer feedback preserved; `/tdd 1 continue` — skip failed and continue
 - **Pause/Stop/Resume** _(mid-workflow)_:
@@ -79,6 +79,8 @@ Inside any project, use the slash commands:
 - **Run tests**: `/tdd:test` — run the project's test suite and report failures
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
 - **Analyze**: `/analyze` — architectural blueprinting
+
+> **Tab completion**: every slash command above supports argument autocomplete inside Pi's editor. Press Tab after the command name to get suggestions — epic IDs for `/tdd <epic>` and `/plan show <epic>`, work item IDs after `task`, git branches after `/review branch`, research sessions after `/research --resume`, etc.
 
 ### 5. MCP Server Mode
 
@@ -205,6 +207,37 @@ The orchestrator runs in the background once `/tdd` is invoked, but you can inte
 - Full gate output (potentially large) is written to `.tdd-workflow/logs/gate-report-<timestamp>.log`. The cleanup brief embeds a truncated summary pointing to this file; implementer agents can read the full log when they need more context.
 - Subtasks whose descriptions mention "coverage" or "add tests" automatically tell the implementer to verify using the coverage command and include before/after numbers in the `DONE:` message.
 
+## Planning Workflow (`/plan`)
+
+`/plan` decomposes a request into Epics and WorkItems. It runs in two phases inside a fresh sub-agent session: Phase 1 produces the epic overview, Phase 2 fills in work items for each epic (one ephemeral session per epic).
+
+**Append vs replace (mode):**
+
+| | Append (default) | Replace (`--replace`) |
+|---|---|---|
+| Existing epics in `WorkItems/` | Preserved; surfaced to the planner as context with instructions not to redefine them | Ignored by the planner |
+| New epic numbering | Starts at `maxIndex + 1` (no clobbering) | Starts at `01` (clobbers prior epics with the same index) |
+| Matching slug | Updates the existing `epic-NN-slug.md` in place | Writes a fresh `epic-01-slug.md` regardless of prior state |
+| `_overview.md` | Prior summary + decisions are merged with the new ones, dedup'd | Overwritten from scratch |
+
+Use **append** when extending a plan with new scope; use **`--replace`** only when you genuinely want to throw away the existing plan.
+
+**Subcommands:**
+
+- `/plan list` — Print existing epics with their work-item counts.
+- `/plan show <epic>` — Post the full markdown of one epic to chat. Accepts an epic ID, slug, or filename.
+- `/plan revise [feedback]` — Re-run planning in append mode, picking up the previous request from `.tdd-workflow/planning/_request.json` and incorporating your feedback. You no longer need to retype the original request when you want changes. If you don't pass feedback inline, the command prompts for it.
+
+**Flags (combine freely with subcommands):**
+
+- `--from-epic <id>` — Inline the markdown of an existing epic as planner context so the new plan extends that specific epic.
+- `--brownfield` — Force the planner to explore the codebase before proposing epics. Useful when adding to a mature project.
+- `--replace` — Opt out of append mode (see table above).
+
+**Iterative feedback loop:**
+
+When you give feedback at the plan-review prompt, it's now saved to `.tdd-workflow/planning/_pending_feedback.txt`. Run `/plan revise` and the planner will pick up where it left off — original request plus your revision request, in append mode — instead of starting from scratch.
+
 ## Multi-Language Support
 
 The orchestrator includes a native code analyzer that supports:
@@ -287,3 +320,14 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
 | `LENS_FAIL_POLICY` | `fail-closed` | `fail-open` skips the Lens gate on crash; `fail-closed` treats a crash as a failure |
 | `TDD_SLOT_RECOVERY_MS` | `5000` | Milliseconds to wait after sub-agent disposal before reusing the slot |
 | `TDD_MCP_STARTUP_MS` | `5000` | Milliseconds to wait for MCP servers (context-mode, searxng) to register tools after session creation |
+
+## Diagnostics
+
+Every sub-agent session emits per-LLM-call telemetry to the standard plugin log:
+
+```
+[SUBAGENT TELEMETRY implement] status=200 latency=1843ms rate-remaining=99
+[SUBAGENT TELEMETRY review]    status=429 latency=420ms  rate-remaining=0
+```
+
+`status` and HTTP latency come from the SDK's `after_provider_response` hook; any non-2xx response is logged as a warning so rate limits and provider errors surface without needing a dashboard. The `taskType` tag distinguishes implementer / reviewer / planner / arbiter / research calls when grepping the log.

@@ -10,7 +10,7 @@ import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
 import { EpicLoader, EpicPlan } from './epic-loader.js';
 import { createSubAgentSession, type SubAgentOptions } from '../subagent/factory.js';
-import type { AgentSession } from '@mariozechner/pi-coding-agent';
+import type { AgentSession } from '@earendil-works/pi-coding-agent';
 import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT, ARBITER_PROMPT } from '../subagent/prompts.js';
 import { getLogger } from '../utils/logger.js';
 import { execFileAsync, DEFAULT_MAX_BUFFER, sanitizeBranchName } from '../utils/exec.js';
@@ -70,6 +70,14 @@ const MAX_ATTEMPTS = 5;
 const MAX_IMPLEMENTER_DURATION_MS = 60 * 60 * 1000;  // 60 minutes for the implementer
 const MAX_REVIEWER_DURATION_MS    = 60 * 60 * 1000;  // 60 minutes for the reviewer
 const MAX_ARBITER_DURATION_MS     = 20 * 60 * 1000;  // 20 minutes for the arbiter
+/** Silence threshold for mid-turn steer nudges — 5 minutes with no activity. */
+const IDLE_NUDGE_MS               =  5 * 60 * 1000;
+/**
+ * Refresh the implementer session every N reviewer-rejection rounds to prevent
+ * the context window from growing unbounded. The fresh session gets the original
+ * ticket, the latest feedback, and a path to a history file with prior rounds.
+ */
+const SESSION_REFRESH_AFTER = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
@@ -137,6 +145,61 @@ export function outputSimilarity(a: string, b: string): number {
   return matches / longer.length;
 }
 
+/**
+ * Write (or overwrite) a per-task feedback history file with full round details.
+ * Used as a reference; the inline fixer prompt uses summarizeFeedbackHistory instead.
+ */
+function writeFeedbackHistory(
+  taskId: string,
+  feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }>,
+  projectDir: string,
+): string {
+  const logsDir = path.join(projectDir, '.tdd-workflow', 'logs');
+  fs.mkdirSync(logsDir, { recursive: true });
+  const filePath = path.join(logsDir, `feedback-history-${taskId}.md`);
+
+  const lines: string[] = [`# Feedback History — ${taskId}\n`];
+  for (const h of feedbackHistory) {
+    const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
+    lines.push(`## Round ${h.round} — ${label}\n\n${h.text}\n`);
+  }
+  fs.writeFileSync(filePath, lines.join('\n'));
+  return filePath;
+}
+
+/**
+ * Produce a compact inline summary of all prior feedback rounds for inclusion
+ * in the session-reset fixer prompt.
+ *
+ * - For review rounds: extracts only the FEEDBACK: section from the structured
+ *   reviewer output, truncated to maxCharsPerRound.
+ * - For gate rounds: takes the text as-is (already compact), truncated.
+ *
+ * This keeps the "history" contribution to the context window bounded no matter
+ * how many rounds have elapsed.
+ */
+function summarizeFeedbackHistory(
+  feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }>,
+  maxCharsPerRound = 400,
+): string {
+  return feedbackHistory
+    .map(h => {
+      const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
+      let summary: string;
+      if (h.type === 'review') {
+        const match = h.text.match(/FEEDBACK:\s*([\s\S]*?)$/im);
+        summary = match ? match[1]!.trim() : h.text;
+      } else {
+        summary = h.text;
+      }
+      if (summary.length > maxCharsPerRound) {
+        summary = summary.slice(0, maxCharsPerRound) + '…';
+      }
+      return `**Round ${h.round} (${label})**: ${summary}`;
+    })
+    .join('\n\n');
+}
+
 export class WorkflowExecutor {
   private state: StateManager;
   private modelRouter: ModelRouter;
@@ -170,7 +233,7 @@ export class WorkflowExecutor {
    * at session lifetime boundaries inside processQueue.
    */
   private activeImplementerSession: AgentSession | null = null;
-  private activeImplementerHandle: { dispose(): void } | null = null;
+  private activeImplementerHandle: { getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } | null = null;
   public events = new EventEmitter();
 
   constructor(
@@ -226,6 +289,23 @@ export class WorkflowExecutor {
   }
 
   /**
+   * Send an immediate steer-nudge to the active implementer session.
+   * Safe to call at any time — no-ops if no session is active.
+   */
+  nudge(): void {
+    if (!this.activeImplementerSession) {
+      this.chatMessage?.('No active implementer session to nudge.', 'tdd-orchestrator');
+      return;
+    }
+    getLogger().info('[EXECUTOR] Manual nudge requested');
+    this.chatMessage?.('⏩ Manual nudge sent to implementer.', 'tdd-orchestrator');
+    (this.activeImplementerSession as AgentSession).prompt(
+      'Continue your work. You have not signalled DONE yet — write the remaining files, run the tests, commit, then end your message with `DONE: <summary>`.',
+      { streamingBehavior: 'steer' },
+    ).catch(() => {});
+  }
+
+  /**
    * Subscribe to a sub-agent session ONCE and return a handle that:
    *  - streams thinking / text / tool calls to Pi chat (`chatMessage`)
    *  - accumulates the agent's visible `text_end` output so callers can
@@ -239,31 +319,124 @@ export class WorkflowExecutor {
    * twice — once here, once inline for text capture — which duplicated
    * chat output on every retry and made the text accumulator race.
    */
+  /**
+   * The Pi SDK's `session.prompt()` resolves when the prompt is accepted, NOT
+   * when the agent has finished streaming its response. If we let the
+   * orchestrator advance to the next phase as soon as prompt() returns, the
+   * previous agent can keep generating in parallel — interleaving output,
+   * producing stale `getTurnText()` reads (e.g. "Reviewer missing structured
+   * verdict" because we grabbed text before APPROVED: was emitted), and
+   * making the workflow's state machine race with the model.
+   *
+   * Wait for the agent's `waitForIdle()` so the next phase only starts when
+   * the current one is genuinely done.
+   */
+  private async promptUntilIdle(session: any, text: string, options?: any): Promise<void> {
+    await session.prompt(text, options);
+    const agent = (session as any)?.agent;
+    if (agent?.waitForIdle) {
+      try {
+        await agent.waitForIdle();
+      } catch (err) {
+        getLogger().warn(`promptUntilIdle: waitForIdle threw — ${err}`);
+      }
+    }
+  }
+
   private subscribeToSession(
     session: any,
     label: string,
     messageType: string,
-  ): { getTurnText(): string; resetTurnText(): void; dispose(): void } {
+  ): { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } {
     const chatMessage = this.chatMessage;
     const logger = getLogger();
     const CHUNK_SIZE = 800;
     let thinkingBuffer = '';
     let turnText = '';
     let disposed = false;
+    let lastEventTime = Date.now();
+
+    // Per-turn thinking-loop detection. The cross-attempt similarity detector
+    // catches loops between attempts; this catches loops WITHIN a single thinking
+    // block where the model emits thousands of repeating chars and never
+    // produces text_end or a tool call.
+    const LOOP_MIN_THINKING_CHARS = 8000;      // don't start checking until enough thinking accumulated
+    const LOOP_WINDOW_CHARS       = 3000;      // size of rolling buffer to inspect
+    const LOOP_SAMPLE_LEN         = 100;       // substring sample size
+    const LOOP_MIN_REPEATS        = 3;         // sample must appear this many times
+    const MAX_DIRECT_ABORTS       = 3;         // cap on session.abort() calls from this subscriber
+    let totalThinkingThisTurn = 0;
+    let recentThinking = '';
+    let thinkingLoopDetected = false;
+    let directAbortCount = 0;
+
+    const resetTurnProgress = () => {
+      totalThinkingThisTurn = 0;
+      recentThinking = '';
+      thinkingLoopDetected = false;
+    };
+
+    const checkThinkingLoop = () => {
+      if (thinkingLoopDetected) return;
+      if (totalThinkingThisTurn < LOOP_MIN_THINKING_CHARS) return;
+      // Sample from the middle of the rolling window — the start may include
+      // legitimate setup thinking that doesn't repeat.
+      const mid = Math.floor(recentThinking.length / 2);
+      const sample = recentThinking.substring(mid, mid + LOOP_SAMPLE_LEN);
+      if (sample.length < LOOP_SAMPLE_LEN) return;
+      let count = 0;
+      let idx = 0;
+      while ((idx = recentThinking.indexOf(sample, idx)) !== -1) {
+        count++;
+        idx += sample.length;
+        if (count >= LOOP_MIN_REPEATS) break;
+      }
+      if (count >= LOOP_MIN_REPEATS) {
+        thinkingLoopDetected = true;
+        logger.warn(`[${label}] Thinking loop detected: same ${LOOP_SAMPLE_LEN}-char window appears ${count}× in last ${recentThinking.length} chars (turn total: ${totalThinkingThisTurn} chars)`);
+
+        // Take action immediately from inside the subscriber. The orchestrator's
+        // watchdog timer may not be active (e.g. between attempts after a
+        // cross-attempt similarity bail, or during user input from the arbiter
+        // escalation prompt). Calling session.abort() here guarantees the loop
+        // terminates regardless of the outer control flow.
+        if (directAbortCount < MAX_DIRECT_ABORTS) {
+          directAbortCount++;
+          logger.warn(`[${label}] Calling session.abort() from detector (${directAbortCount}/${MAX_DIRECT_ABORTS})`);
+          try {
+            // Fire-and-forget — abort() returns a promise but we don't need to
+            // await it inside an event callback. The awaiting prompt() will
+            // resolve when the agent finishes aborting.
+            (session as any).abort?.().catch((err: unknown) => {
+              logger.warn(`[${label}] session.abort() rejected: ${err}`);
+            });
+          } catch (err) {
+            logger.warn(`[${label}] session.abort() threw synchronously: ${err}`);
+          }
+        } else {
+          logger.error(`[${label}] Loop persists after ${MAX_DIRECT_ABORTS} direct aborts — letting outer logic handle`);
+        }
+      }
+    };
 
     /** Terminal signals that are worth surfacing in Pi chat. */
     const isTerminalSignal = (text: string) => /DONE:|APPROVED:|DECISION:/i.test(text);
 
     session.subscribe((event: any) => {
       if (disposed) return;
+      lastEventTime = Date.now();
 
       if (event.type === 'message_update') {
         const ae = event.assistantMessageEvent;
         if (ae?.type === 'thinking_start') {
           thinkingBuffer = '';
+          resetTurnProgress();
           logger.stream(label, '💭 Thinking…');
         } else if (ae?.type === 'thinking_delta' && ae.delta) {
           thinkingBuffer += ae.delta;
+          totalThinkingThisTurn += ae.delta.length;
+          recentThinking = (recentThinking + ae.delta).slice(-LOOP_WINDOW_CHARS);
+          checkThinkingLoop();
           while (thinkingBuffer.length >= CHUNK_SIZE) {
             logger.stream(label, `💭 ${thinkingBuffer.substring(0, CHUNK_SIZE)}`);
             thinkingBuffer = thinkingBuffer.substring(CHUNK_SIZE);
@@ -274,6 +447,8 @@ export class WorkflowExecutor {
             thinkingBuffer = '';
           }
         } else if (ae?.type === 'text_end' && ae.content?.trim()) {
+          // text_end is a sign of progress — clear loop state.
+          resetTurnProgress();
           // Accumulate for the caller (e.g. DONE:/APPROVED: detection).
           turnText += ae.content;
           logger.stream(label, ae.content);
@@ -295,7 +470,10 @@ export class WorkflowExecutor {
             chatMessage(`**[${label}]** ${text}`, messageType);
           }
         }
+        resetTurnProgress();
       } else if (event.type === 'tool_execution_start') {
+        // Tool calls are progress — clear loop state.
+        resetTurnProgress();
         const toolName: string = event.toolName;
         const args = (event.args && typeof event.args === 'object') ? event.args as Record<string, unknown> : {};
         let msg = `🔧 \`${toolName}\``;
@@ -332,6 +510,9 @@ export class WorkflowExecutor {
     return {
       getTurnText: () => turnText,
       resetTurnText: () => { turnText = ''; },
+      getLastEventTime: () => lastEventTime,
+      hasThinkingLoop: () => thinkingLoopDetected,
+      clearThinkingLoop: () => { resetTurnProgress(); },
       dispose: () => { disposed = true; },
     };
   }
@@ -543,6 +724,76 @@ export class WorkflowExecutor {
    * been started at least once so its subtasks were planned and saved).
    * If the task is 'failed' or 'completed', it is reset to 'pending' first.
    */
+  /**
+   * Mark a task as externally completed (done manually outside the TDD agent)
+   * then continue the rest of the epic with any remaining pending tasks.
+   *
+   * If the current branch looks like this task's WI branch (tdd-workflow/slug/WI-x),
+   * automatically merges it into the feature branch (or reflog-detected parent branch)
+   * before marking the task complete — matching what the normal TDD flow would do.
+   */
+  async markTaskDone(taskId: string): Promise<void> {
+    const logger = getLogger();
+    if (!this.state.hasWorkflow()) {
+      throw new Error('No workflow state found. Start the epic first to generate its task list.');
+    }
+    const task = this.state.getSubtask(taskId);
+    if (!task) {
+      const ids = this.state.getState().subtasks.map(t => t.id).join(', ');
+      throw new Error(`Task "${taskId}" not found. Available tasks: ${ids}`);
+    }
+
+    if (task.status !== 'completed') {
+      // Check whether we're sitting on this task's WI branch and should merge it.
+      const currentBranch = await this.sandbox.getCurrentBranch();
+      const taskSlug = taskId.substring(0, 12);
+      const isOnWiBranch = currentBranch.startsWith('tdd-workflow/') && currentBranch.endsWith(`/${taskSlug}`);
+
+      if (isOnWiBranch) {
+        // Determine the target branch: prefer the stored feature branch, then reflog.
+        let targetBranch = this.state.getState().featureBranch ?? null;
+
+        if (!targetBranch) {
+          try {
+            const { stdout } = await execFileAsync('git', ['reflog', 'show', '--pretty=%gs', currentBranch], {
+              cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+            });
+            const created = stdout.split('\n').find(l => l.startsWith('branch: Created from'));
+            if (created) targetBranch = created.replace('branch: Created from ', '').trim();
+          } catch { /* non-fatal */ }
+        }
+
+        if (targetBranch) {
+          this.chatMessage?.(`🔀 Merging \`${currentBranch}\` into \`${targetBranch}\`…`, 'tdd-orchestrator');
+          try {
+            await this.sandbox.mergeAndCleanup(currentBranch, targetBranch);
+            this.chatMessage?.(`✅ Merged and branch deleted.`, 'tdd-orchestrator');
+          } catch (mergeErr) {
+            this.chatMessage?.(
+              `⚠️ Merge failed: ${(mergeErr as Error).message}\n\nResolve conflicts manually, then re-run the command.`,
+              'tdd-orchestrator'
+            );
+            throw mergeErr;
+          }
+        } else {
+          this.chatMessage?.(
+            `⚠️ On WI branch \`${currentBranch}\` but could not determine target branch — merge skipped. Merge manually if needed.`,
+            'tdd-orchestrator'
+          );
+          logger.warn(`[markTaskDone] Could not determine target branch for merge of ${currentBranch}`);
+        }
+      }
+
+      this.state.updateSubtask(taskId, { status: 'completed', tests_written: true, code_implemented: true });
+      this.chatMessage?.(`✅ **${taskId}** marked as externally completed.`, 'tdd-orchestrator');
+      this.events.emit('taskCompleted', { id: taskId, task: this.state.getSubtask(taskId) });
+    } else {
+      this.chatMessage?.(`Task **${taskId}** is already marked completed.`, 'tdd-orchestrator');
+    }
+
+    await this.resume('skip');
+  }
+
   async runTask(taskId: string, mode: 'retry' | 'resume' = 'retry'): Promise<void> {
     const logger = getLogger();
     if (!this.state.hasWorkflow()) {
@@ -681,9 +932,13 @@ export class WorkflowExecutor {
       let lastAttemptDiff = '';
       let currentDiff = '';
       let changedFiles: string[] = [];
+      let currentCommitLog = '';
       let lastAttemptBlockedByPreexisting = false;
       let lastQualityGatesPassed = false; // tracks whether the latest committed state passed QA
       const startAttempt = task.attempts || 1;
+      // Per-model session-refresh threshold (falls back to the module default).
+      const effectiveRefreshAfter =
+        this.modelRouter.selectModel('implement').sessionRefreshAfter ?? SESSION_REFRESH_AFTER;
       // Implementer session is kept alive across reviewer-rejection retries so the agent
       // can continue patching its own work in a multi-turn conversation.
       // It is nulled out (and disposed) only when a runtime error forces a rollback.
@@ -692,7 +947,7 @@ export class WorkflowExecutor {
       // whole lifetime of the session, with a per-turn text accumulator that we reset
       // before each prompt() call. This avoids the multi-subscribe bug where text
       // accumulated across turns and duplicated chat output.
-      let implementerHandle: { getTurnText(): string; resetTurnText(): void; dispose(): void } | null = null;
+      let implementerHandle: { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } | null = null;
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
@@ -704,6 +959,19 @@ export class WorkflowExecutor {
         let arbiterExtraRounds = 0;
         for (let pass = 0; pass <= 1 && !approved; pass++) {
           if (pass === 1 && arbiterExtraRounds === 0) break;
+
+          // Reset the cross-attempt similarity baseline when entering pass 1.
+          // The user (or arbiter) just granted extra rounds — they're explicitly
+          // giving the model another chance after seeing the prior diff. If we
+          // leave lastAttemptDiff set to pass 0's final diff, the very first
+          // extra attempt will almost certainly hit >90% similarity and bail
+          // out, burning only 1 of the granted N rounds. Clearing it lets the
+          // extra rounds actually run; the similarity check will rebuild from
+          // attempt-to-attempt within pass 1.
+          if (pass > 0) {
+            lastAttemptDiff = '';
+            lastAttemptBlockedByPreexisting = false;
+          }
 
           const attemptStart = pass === 0 ? startAttempt : MAX_ATTEMPTS + 1;
           const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : MAX_ATTEMPTS + arbiterExtraRounds;
@@ -759,9 +1027,35 @@ export class WorkflowExecutor {
                 : `Agent is building implementation (Read -> Test -> Code)...`
             });
 
-            // Create the implementer session on the first attempt.
-            // On reviewer-rejection retries the same session is reused (multi-turn) so
-            // the agent has full context of its prior work and just applies the fixes.
+            // Session refresh: every SESSION_REFRESH_AFTER rounds, replace the long-running
+            // session with a fresh one. Local models are most affected — their context windows
+            // fill up fast and quality degrades after a few rounds of accumulated conversation.
+            // The fresh session gets a compact "fixer" first-turn prompt with the ticket,
+            // latest feedback, and a path to the on-disk feedback history file.
+            let sessionWasReset = false;
+            if (
+              implementerSession &&
+              attempt > 1 &&
+              (attempt - 1) % effectiveRefreshAfter === 0 &&
+              feedbackHistory.length > 0
+            ) {
+              logger.info(`[${task.id}] Refreshing implementer session at attempt ${attempt} to reset context window`);
+              this.chatMessage?.(
+                `🔄 **[${task.id}]** Session reset at attempt ${attempt} — fresh context window, history preserved on disk`,
+                'tdd-implementer',
+              );
+              try { implementerHandle?.dispose(); } catch { /* best-effort */ }
+              try { (implementerSession as AgentSession).dispose(); } catch { /* best-effort */ }
+              implementerSession = null;
+              implementerHandle = null;
+              this.activeImplementerSession = null;
+              this.activeImplementerHandle = null;
+              sessionWasReset = true;
+            }
+
+            // Create the implementer session on the first attempt (or after a session reset).
+            // On reviewer-rejection retries within the same window the session is reused
+            // (multi-turn) so the agent has full context of its prior work.
             if (!implementerSession) {
               implementerSession = await createSubAgentSession({
                 taskType: 'implement',
@@ -789,10 +1083,82 @@ export class WorkflowExecutor {
 
             // Build the prompt for this turn.
             let implementerPrompt: string;
-            if (implementerSession && feedback && attempt > 1) {
-              // Retry turn: send reviewer/gate feedback as a follow-up message.
-              // The branch still has the previous implementation so the agent only
-              // needs to apply the requested changes.
+            if (sessionWasReset && feedback) {
+              // Session-reset first turn: self-contained fixer prompt.
+              // Write the full history to disk for reference, then include an
+              // inline summary (bounded size) and the current diff so the model
+              // has complete context without relying on conversation history.
+              writeFeedbackHistory(task.id, feedbackHistory, this.state.projectDir);
+              const latestFeedback = feedbackHistory[feedbackHistory.length - 1]!;
+              const latestLabel = latestFeedback.type === 'gates' ? 'Quality Gates' : 'Code Review';
+
+              // Fetch the current diff to include inline (cap at ~6 KB to avoid flooding context).
+              const MAX_DIFF_CHARS = 6000;
+              let inlineDiff = '';
+              try {
+                const { stdout } = await execFileAsync(
+                  'git', ['diff', originalBranch],
+                  { cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER },
+                );
+                inlineDiff = stdout.trim();
+                if (inlineDiff.length > MAX_DIFF_CHARS) {
+                  inlineDiff = inlineDiff.slice(0, MAX_DIFF_CHARS) +
+                    `\n… (diff truncated — run \`git diff ${originalBranch}\` to see the rest)`;
+                }
+              } catch { /* non-fatal — model can run git diff itself */ }
+
+              this.chatMessage?.(
+                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — fresh session, fixer prompt`,
+              );
+
+              implementerPrompt =
+                `## Context Reset — Round ${attempt} Fixer\n\n` +
+                `Session reset after ${feedbackHistory.length} round(s) to keep context manageable. ` +
+                `All work is preserved on branch \`${branchName}\`.\n\n` +
+                `### Task: ${task.id}\n${technicalDescription}\n`;
+
+              if (task.acceptance?.length) {
+                implementerPrompt += `\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}\n`;
+              }
+              if (task.security) {
+                implementerPrompt += `\n### Security Requirements\n${task.security}\n`;
+              }
+              if (task.tests?.length) {
+                implementerPrompt += `\n### Required Tests\n- ${task.tests.join('\n- ')}\n`;
+              }
+              if (task.devNotes) {
+                implementerPrompt += `\n### Developer Notes\n${task.devNotes}\n`;
+              }
+
+              // Include the current diff inline so the model sees the existing
+              // implementation immediately without needing a tool call.
+              implementerPrompt += inlineDiff
+                ? `\n### Current Implementation (git diff ${originalBranch})\n\`\`\`diff\n${inlineDiff}\n\`\`\`\n`
+                : `\n### Current Implementation\nBranch \`${branchName}\` — no committed changes yet.\n`;
+
+              // Include the latest feedback verbatim — most actionable.
+              implementerPrompt +=
+                `\n### Latest Feedback — Round ${latestFeedback.round} (${latestLabel})\n` +
+                `${feedback}\n`;
+
+              // Include a size-bounded summary of all prior rounds so the model
+              // knows what has already been tried.
+              if (feedbackHistory.length > 1) {
+                const priorRounds = feedbackHistory.slice(0, -1);
+                implementerPrompt +=
+                  `\n### Prior Round Summary (${priorRounds.length} round(s))\n` +
+                  summarizeFeedbackHistory(priorRounds) + '\n';
+              }
+
+              implementerPrompt +=
+                `\n### Instructions\n` +
+                `Fix the issues in the latest feedback above. Do not start from scratch — patch the existing implementation.\n` +
+                `When done: run the tests, do a final \`git diff HEAD\` to confirm no regressions, commit, and signal \`DONE: <summary>\`.`;
+
+            } else if (!sessionWasReset && feedback && attempt > 1) {
+              // Retry turn within the same session: send reviewer/gate feedback as a
+              // follow-up. The branch still has the previous implementation so the agent
+              // only needs to apply the requested changes.
               this.chatMessage?.(
                 `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — continuing implementer session with reviewer feedback`
               );
@@ -845,18 +1211,99 @@ export class WorkflowExecutor {
             // re-armed on each nudge. Otherwise MAX_NUDGES × per-prompt timeouts could
             // compound into a 6-hour attempt.
             const MAX_NUDGES = 5;
+            const MAX_IDLE_STEER_NUDGES = 3;
+            const MAX_LOOP_ABORTS = 3;
             const attemptDeadline = Date.now() + MAX_IMPLEMENTER_DURATION_MS;
+            let loopAbortCount = 0;        // per-attempt count across nudges
+            let lastTurnAbortedForLoop = false; // set when watchdog aborts the in-flight turn
+
             for (let nudge = 0; nudge <= MAX_NUDGES; nudge++) {
               handle.resetTurnText();
               const remaining = attemptDeadline - Date.now();
               if (remaining <= 0) {
                 throw new Error(`Implementer attempt exceeded deadline (${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes)`);
               }
-              await withTimeout(
-                implementerSession.prompt(implementerPrompt),
-                remaining,
-                `Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes (across ${nudge + 1} prompt(s))`,
-              );
+
+              // Watchdog: send a mid-turn steer nudge if the model goes silent,
+              // OR call `session.abort()` if the model is cycling inside a thinking
+              // block. `streamingBehavior: 'steer'` only queues a message — it does
+              // NOT interrupt the current generation — so once the model is stuck
+              // in a thinking loop the only reliable way out is to abort the turn.
+              let idleTimer: ReturnType<typeof setTimeout> | null = null;
+              let turnDone = false;
+              let idleSteerCount = 0;
+              let lastSteerTime = 0;
+              const armIdleCheck = () => {
+                idleTimer = setTimeout(async () => {
+                  if (turnDone) return;
+
+                  // Priority check 1: thinking loop — abort the in-flight turn so
+                  // the prompt() resolves and we can send a fresh anti-loop nudge.
+                  if (handle.hasThinkingLoop()) {
+                    if (loopAbortCount >= MAX_LOOP_ABORTS) {
+                      logger.error(`[${task.id}] Thinking loop persists after ${MAX_LOOP_ABORTS} aborts — disposing session to end attempt`);
+                      this.chatMessage?.(
+                        `🚨 **[${task.id}]** Model keeps entering thinking loops despite aborts — ending this attempt`,
+                        'tdd-implementer',
+                      );
+                      turnDone = true;
+                      handle.clearThinkingLoop();
+                      try { implementerSession?.dispose(); } catch { /* dispose may throw if already gone */ }
+                      return;
+                    }
+                    loopAbortCount++;
+                    lastTurnAbortedForLoop = true;
+                    logger.warn(`[${task.id}] Thinking loop detected — calling session.abort() (${loopAbortCount}/${MAX_LOOP_ABORTS})`);
+                    this.chatMessage?.(
+                      `🔁 **[${task.id}]** Thinking loop detected — aborting turn and steering`,
+                      'tdd-implementer',
+                    );
+                    handle.clearThinkingLoop();
+                    // abort() cancels the agent's current generation and resolves the
+                    // pending prompt() promise. Fire-and-forget — the watchdog finishes;
+                    // the awaiting prompt() at the bottom of this iteration unblocks.
+                    implementerSession?.abort().catch((err: unknown) => {
+                      logger.warn(`[${task.id}] session.abort() failed: ${err}`);
+                    });
+                    return;
+                  }
+
+                  // Priority check 2: idle (genuine silence — no events at all).
+                  const silentMs = Date.now() - handle.getLastEventTime();
+                  const sinceLastSteer = Date.now() - lastSteerTime;
+                  if (
+                    silentMs >= IDLE_NUDGE_MS &&
+                    sinceLastSteer >= IDLE_NUDGE_MS &&
+                    idleSteerCount < MAX_IDLE_STEER_NUDGES
+                  ) {
+                    idleSteerCount++;
+                    lastSteerTime = Date.now();
+                    const silentMin = Math.round(silentMs / 60_000);
+                    logger.info(`[${task.id}] No output for ${silentMin}m — idle steer-nudge ${idleSteerCount}/${MAX_IDLE_STEER_NUDGES}`);
+                    this.chatMessage?.(
+                      `⏱️ **[${task.id}]** Silent for ${silentMin} minutes — nudging to continue (${idleSteerCount}/${MAX_IDLE_STEER_NUDGES})`,
+                      'tdd-implementer',
+                    );
+                    implementerSession!.prompt(
+                      'You have been silent for several minutes. Continue your work — write code, run tests, commit, then end with `DONE: <summary>`.',
+                      { streamingBehavior: 'steer' },
+                    ).catch(() => {});
+                  }
+                  if (!turnDone) armIdleCheck();
+                }, 60_000);
+              };
+              armIdleCheck();
+
+              try {
+                await withTimeout(
+                  this.promptUntilIdle(implementerSession, implementerPrompt),
+                  remaining,
+                  `Implementer timed out after ${MAX_IMPLEMENTER_DURATION_MS / 60000} minutes (across ${nudge + 1} prompt(s))`,
+                );
+              } finally {
+                turnDone = true;
+                if (idleTimer) clearTimeout(idleTimer);
+              }
 
               // Interrupt check after each prompt returns: pause + stop both
               // bail out of the nudge loop. Stop additionally throws (caught
@@ -871,7 +1318,16 @@ export class WorkflowExecutor {
               if (nudge < MAX_NUDGES) {
                 logger.info(`[${task.id}] Implementer did not signal DONE — nudging (${nudge + 1}/${MAX_NUDGES})`);
                 this.chatMessage?.(`⏩ **[${task.id}]** Implementer hasn't finished — nudging to continue (${nudge + 1}/${MAX_NUDGES})`, 'tdd-implementer');
-                implementerPrompt = 'You have not signalled DONE yet. Continue implementing — write the remaining files, run the tests, commit, then end your message with `DONE: <summary>`.';
+                if (lastTurnAbortedForLoop) {
+                  implementerPrompt =
+                    'Your previous turn was aborted because you were stuck in a thinking loop, ' +
+                    'repeating the same sentences. **Do not think for this turn.** Immediately call ' +
+                    'a tool — `read` a specific file, `bash` to run tests, or `write`/`edit` to make a ' +
+                    'concrete change. Skip the reasoning step and act.';
+                  lastTurnAbortedForLoop = false;
+                } else {
+                  implementerPrompt = 'You have not signalled DONE yet. Continue implementing — write the remaining files, run the tests, commit, then end your message with `DONE: <summary>`.';
+                }
               } else {
                 logger.warn(`[${task.id}] Implementer never signalled DONE after ${MAX_NUDGES} nudges — proceeding to quality gates anyway`);
               }
@@ -893,26 +1349,55 @@ export class WorkflowExecutor {
               feedback = feedback ? `${feedback}\n\n${implementerAnswers}` : implementerAnswers;
             }
 
-            // Capture diff for loop detection and reviewer context
+            // Capture the full WI-branch diff for loop detection and reviewer context.
+            // Three-dot syntax (`originalBranch...HEAD`) diffs from the merge-base —
+            // i.e. every commit the implementer made on this branch — regardless of
+            // how originalBranch has moved since. Also fetch the commit log so the
+            // reviewer can see the per-commit story, plus any uncommitted changes.
             currentDiff = '';
+            changedFiles = [];
+            let commitLog = '';
+            let uncommittedDiff = '';
             try {
-              const [diffResult, namesResult] = await Promise.all([
-                execFileAsync('git', ['diff', 'HEAD'], {
-                  cwd: this.state.projectDir,
-                  timeout: 10_000,
-                  maxBuffer: DEFAULT_MAX_BUFFER,
+              const [diffResult, namesResult, logResult, uncommittedResult] = await Promise.all([
+                execFileAsync('git', ['diff', `${originalBranch}...HEAD`], {
+                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
                 }),
-                execFileAsync('git', ['diff', '--name-only', 'HEAD'], {
-                  cwd: this.state.projectDir,
-                  timeout: 10_000,
-                  maxBuffer: DEFAULT_MAX_BUFFER,
+                execFileAsync('git', ['diff', '--name-only', `${originalBranch}...HEAD`], {
+                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+                }),
+                execFileAsync('git', ['log', `${originalBranch}..HEAD`, '--pretty=format:%h %s'], {
+                  cwd: this.state.projectDir, timeout: 5_000, maxBuffer: DEFAULT_MAX_BUFFER,
+                }),
+                execFileAsync('git', ['diff', 'HEAD'], {
+                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
                 }),
               ]);
               currentDiff = diffResult.stdout;
               changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
-            } catch {
-              // Non-fatal — skip loop detection / pre-existing check if diff fails
+              commitLog = logResult.stdout.trim();
+              uncommittedDiff = uncommittedResult.stdout;
+
+              // Append uncommitted changes to the captured diff. The implementer is
+              // supposed to commit before DONE, but in failure modes (loop, timeout)
+              // there may still be unsaved work worth surfacing to the reviewer.
+              if (uncommittedDiff.trim()) {
+                currentDiff += `\n\n# === UNCOMMITTED CHANGES ===\n${uncommittedDiff}`;
+              }
+
+              if (!currentDiff.trim() && commitLog === '') {
+                logger.warn(`[${task.id}] Captured diff is empty — WI branch has no commits and no uncommitted changes vs ${originalBranch}`);
+              }
+            } catch (err) {
+              // Surface git failures instead of silently producing an empty diff,
+              // which previously caused the reviewer to receive a blank prompt.
+              logger.warn(`[${task.id}] Failed to capture branch diff vs ${originalBranch}: ${(err as Error).message}`);
             }
+
+            // Stash the commit log on a closure-scoped var so the prompt builder below
+            // can pick it up. (Kept separate from currentDiff because the log goes
+            // into its own section, not the diff fence.)
+            currentCommitLog = commitLog;
 
             if (lastAttemptDiff && currentDiff && !lastAttemptBlockedByPreexisting) {
               const similarity = outputSimilarity(lastAttemptDiff, currentDiff);
@@ -1081,13 +1566,18 @@ export class WorkflowExecutor {
                 }
               } catch { /* non-fatal */ }
 
-              // Build reviewer prompt: notes first (context), then diff (evidence)
+              // Build reviewer prompt: notes first (context), then commit log, then diff (evidence).
+              // The commit log lets the reviewer see the per-commit story of the WI branch —
+              // useful when there are several iterations and the cumulative diff is large.
               const notesSummary = implementerNotes
                 ? `\n\n## Implementer Notes\n${implementerNotes}`
                 : '';
-              const diffSummary = changedFiles.length > 0
-                ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
+              const commitLogSummary = currentCommitLog
+                ? `\n\n## Commits on this branch (vs ${originalBranch})\n${currentCommitLog}`
                 : '';
+              const diffSummary = changedFiles.length > 0 || currentDiff.trim().length > 0
+                ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff (full branch diff vs ${originalBranch})\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
+                : '\n\n## Diff\n_(no diff captured — check workflow log for git failures)_';
 
               // Capture lens state after implementation and include before/after for the reviewer.
               // The reviewer uses this to judge whether new structural/type issues were introduced.
@@ -1100,7 +1590,7 @@ export class WorkflowExecutor {
               } catch { /* non-fatal — omit lens section */ }
 
               await withTimeout(
-                reviewerSession.prompt(`Review the implementation for task: ${task.description}${notesSummary}${lensSection}${diffSummary}`),
+                this.promptUntilIdle(reviewerSession, `Review the implementation for task: ${task.description}${notesSummary}${commitLogSummary}${lensSection}${diffSummary}`),
                 MAX_REVIEWER_DURATION_MS,
                 `Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
               );
@@ -1225,6 +1715,22 @@ export class WorkflowExecutor {
           // Skip when a pause/stop interrupt is pending — the user has told us to
           // halt the workflow, not spend more budget calling another agent.
           if (pass === 0 && !approved && !this.stopRequested && !this.pauseRequested) {
+            // Quiesce the implementer first. session.prompt() can resolve while
+            // the underlying agent is still streaming (we've observed implementer
+            // events firing minutes after its last prompt supposedly returned),
+            // which lets the implementer keep generating in parallel with the
+            // arbiter and produce confusing interleaved output. abort() blocks
+            // until the agent is idle, so calling it here guarantees a single
+            // active model at a time.
+            if (implementerSession) {
+              try {
+                await (implementerSession as any).abort?.();
+                logger.info(`[${task.id}] Implementer aborted prior to arbiter call.`);
+              } catch (err) {
+                logger.warn(`[${task.id}] implementer.abort() before arbiter failed: ${err}`);
+              }
+            }
+
             const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed, iterationHistory);
             if (arbiterDecision.decision === 'approve') {
               if (lastQualityGatesPassed) {
@@ -1346,7 +1852,7 @@ export class WorkflowExecutor {
           : rawRequest.substring(0, 60).trim();
         const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
         this.chatMessage?.(
-          `❌ **${task.id}** failed after ${MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
+          `❌ **${task.id}** failed after ${task.attempts || MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
           `**Feedback:** ${feedbackPreview}\n\n` +
           `**Inspect:** branch \`${branchName}\` · State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\`\n\n` +
           `**Next step:**\n` +
@@ -1386,7 +1892,7 @@ export class WorkflowExecutor {
   /**
    * Run the hostile reviewer against an arbitrary diff outside the TDD cycle.
    *
-   * @param scope  'uncommitted' | 'N' (last N commits as string) | 'all' (since branch base)
+   * @param scope  'uncommitted' | 'N' (last N commits as string) | 'all' (since branch base) | 'branch:<name>' | 'parent-branch'
    * @param context  Optional free-text description or pre-formatted epic context
    */
   async runStandaloneReview(scope: string, context?: string): Promise<void> {
@@ -1415,9 +1921,55 @@ export class WorkflowExecutor {
         try { baseRef = await tryBase('main'); }
         catch { try { baseRef = await tryBase('master'); }
           catch { baseRef = 'HEAD~20'; scopeLabel += ' (fallback: last 20 commits)'; } }
+      } else if (scope === 'parent-branch') {
+        let parentBranch: string | null = null;
+        try {
+          const { stdout: reflogOut } = await execFileAsync('git', ['reflog', 'show', '--pretty=%gs', 'HEAD'], {
+            cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+          });
+          const createdLine = reflogOut.split('\n').find(l => l.startsWith('branch: Created from'));
+          if (createdLine) {
+            parentBranch = createdLine.replace('branch: Created from ', '').trim();
+          }
+        } catch { /* non-fatal — fall through to main/master */ }
+
+        if (parentBranch) {
+          scopeLabel = `all changes vs parent branch "${parentBranch}"`;
+          try {
+            const { stdout } = await execFileAsync('git', ['merge-base', 'HEAD', parentBranch], {
+              cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+            });
+            baseRef = stdout.trim();
+          } catch {
+            throw new Error(`Parent branch "${parentBranch}" found in reflog but has no common ancestor with HEAD`);
+          }
+        } else {
+          // Reflog didn't record a creation entry — fall back to main/master
+          scopeLabel = 'all changes since branch base (reflog unavailable, falling back to main/master)';
+          const tryBase = async (branch: string) => {
+            const { stdout } = await execFileAsync('git', ['merge-base', 'HEAD', branch], {
+              cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+            });
+            return stdout.trim();
+          };
+          try { baseRef = await tryBase('main'); }
+          catch { try { baseRef = await tryBase('master'); }
+            catch { baseRef = 'HEAD~20'; scopeLabel += ' (fallback: last 20 commits)'; } }
+        }
+      } else if (scope.startsWith('branch:')) {
+        const branchName = scope.slice('branch:'.length);
+        scopeLabel = `all changes vs branch "${branchName}"`;
+        try {
+          const { stdout } = await execFileAsync('git', ['merge-base', 'HEAD', branchName], {
+            cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER,
+          });
+          baseRef = stdout.trim();
+        } catch {
+          throw new Error(`Branch "${branchName}" not found or has no common ancestor with HEAD`);
+        }
       } else {
         const n = parseInt(scope, 10);
-        if (isNaN(n) || n < 1) throw new Error(`Unknown scope "${scope}". Use: uncommitted, a number, or all`);
+        if (isNaN(n) || n < 1) throw new Error(`Unknown scope "${scope}". Use: uncommitted, a number, all, or branch <name>`);
         baseRef = `HEAD~${n}`;
         scopeLabel = `last ${n} commit${n === 1 ? '' : 's'}`;
       }
@@ -1577,7 +2129,7 @@ export class WorkflowExecutor {
     let arbiterText = '';
     try {
       await withTimeout(
-        arbiterSession.prompt(arbiterPrompt),
+        this.promptUntilIdle(arbiterSession, arbiterPrompt),
         MAX_ARBITER_DURATION_MS,
         `Arbiter timed out after ${MAX_ARBITER_DURATION_MS / 60000} minutes`,
       );
@@ -1598,6 +2150,17 @@ export class WorkflowExecutor {
     const decision  = (decisionMatch?.[1]?.toLowerCase() ?? 'escalate') as 'approve' | 'continue' | 'escalate';
     const rounds    = parseInt(roundsMatch?.[1] ?? '1', 10);
     const rationale = rationaleMatch?.[1]?.trim() ?? 'Arbiter provided no rationale.';
+
+    // Log the raw response when parsing fails so we can diagnose silent fallbacks
+    // (e.g. model returned empty content, wrong format, or thinking-only output).
+    if (!decisionMatch || !rationaleMatch) {
+      const preview = arbiterText.length === 0
+        ? '(empty response — no text emitted)'
+        : arbiterText.length > 1000
+          ? arbiterText.substring(0, 1000) + '… (truncated)'
+          : arbiterText;
+      logger.warn(`Arbiter response failed structured parse — raw text: ${preview}`);
+    }
 
     logger.info(`Arbiter decision: ${decision} (rounds=${rounds}) — ${rationale}`);
     this.chatMessage?.(`⚖️ **[${task.id}] Arbiter:** ${decision.toUpperCase()} — ${rationale}`, 'tdd-arbiter');

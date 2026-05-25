@@ -15,6 +15,80 @@ export interface ProjectPlanResult {
   plan?: ProjectPlan;
 }
 
+export type PlanMode = 'append' | 'replace';
+
+interface ExistingPlanState {
+  /** Highest epic-NN index found in WorkItems/. 0 when none. */
+  maxIndex: number;
+  /** Map of existing epic slug → bare filename in WorkItems/. */
+  slugToFile: Map<string, string>;
+  /** One-line summaries of each existing epic for prompt context. */
+  existingEpics: Array<{ id: string; title: string; summary: string; slug: string }>;
+  /** Prior architectural decisions read from WorkItems/_overview.md, if any. */
+  priorDecisions: string[];
+  /** Prior overview summary, if any. */
+  priorSummary: string | undefined;
+}
+
+/**
+ * Read existing WorkItems/ to know what we're appending to. Returns a zeroed
+ * state when the directory or files are missing.
+ */
+function scanExistingPlan(cwd: string): ExistingPlanState {
+  const workItemsDir = path.join(cwd, 'WorkItems');
+  const state: ExistingPlanState = {
+    maxIndex: 0,
+    slugToFile: new Map(),
+    existingEpics: [],
+    priorDecisions: [],
+    priorSummary: undefined,
+  };
+  if (!fs.existsSync(workItemsDir)) return state;
+
+  const files = fs.readdirSync(workItemsDir);
+  for (const f of files) {
+    const m = f.match(/^epic-(\d+)-(.+)\.md$/);
+    if (!m) continue;
+    const idx = parseInt(m[1]!, 10);
+    const slug = m[2]!;
+    state.maxIndex = Math.max(state.maxIndex, idx);
+    state.slugToFile.set(slug, f);
+
+    try {
+      const content = fs.readFileSync(path.join(workItemsDir, f), 'utf-8');
+      const titleMatch = content.match(/^# Epic:\s*(.*)$/m);
+      const summaryMatch = content.match(/## Summary\s*\n+([^\n]+(?:\n[^\n]+)*?)(?=\n##|$)/);
+      state.existingEpics.push({
+        id: String(idx).padStart(2, '0'),
+        title: titleMatch?.[1]?.trim() ?? slug,
+        slug,
+        summary: summaryMatch?.[1]?.trim().split('\n')[0]?.slice(0, 200) ?? '',
+      });
+    } catch { /* skip unreadable epic files */ }
+  }
+
+  // Sort existingEpics by index ascending so the prompt sees them in order.
+  state.existingEpics.sort((a, b) => parseInt(a.id, 10) - parseInt(b.id, 10));
+
+  const overviewPath = path.join(workItemsDir, '_overview.md');
+  if (fs.existsSync(overviewPath)) {
+    try {
+      const content = fs.readFileSync(overviewPath, 'utf-8');
+      const summaryMatch = content.match(/^# Project Overview\s*\n+([\s\S]*?)(?=\n##|$)/);
+      if (summaryMatch?.[1]) state.priorSummary = summaryMatch[1].trim();
+      const decisionsSection = content.match(/## Architectural Decisions\s*\n+([\s\S]*?)(?=\n##|$)/);
+      if (decisionsSection?.[1]) {
+        state.priorDecisions = decisionsSection[1]
+          .split('\n')
+          .map(l => l.replace(/^[-*]\s*/, '').trim())
+          .filter(Boolean);
+      }
+    } catch { /* ignore */ }
+  }
+
+  return state;
+}
+
 /**
  * Spawns a project planning sub-agent session.
  * This sub-agent is responsible for:
@@ -35,8 +109,18 @@ export async function planProject(
     confirm: (message: string) => Promise<boolean>;
     /** Post a message into the Pi chat history for live progress visibility. */
     chatMessage?: (content: string) => void;
+  },
+  options?: {
+    /**
+     * 'append' (default): preserve existing WorkItems/*.md, inject them as context
+     * so the planner extends rather than duplicates, and reuse filenames when
+     * slugs match. 'replace': prior behavior — clobber files at indexes 01..N.
+     */
+    mode?: PlanMode;
   }
 ): Promise<ProjectPlanResult> {
+  const mode: PlanMode = options?.mode ?? 'append';
+  const existing = mode === 'append' ? scanExistingPlan(cwd) : null;
   const logger = getLogger();
   logger.info(`Starting project-level planning for: ${request.substring(0, 100)}`);
 
@@ -101,6 +185,14 @@ export async function planProject(
 
     const planningDir = path.join(cwd, '.tdd-workflow', 'planning');
     fs.mkdirSync(planningDir, { recursive: true });
+
+    // Persist the request so `/plan revise` can pick it up later.
+    try {
+      fs.writeFileSync(
+        path.join(planningDir, '_request.json'),
+        JSON.stringify({ request, mode, timestamp: new Date().toISOString() }, null, 2),
+      );
+    } catch { /* non-fatal */ }
 
     const extractText = (msg: any): string => {
       if (typeof msg.content === 'string') return msg.content;
@@ -204,8 +296,24 @@ export async function planProject(
     const OVERVIEW_HINT = `{"summary":"...","architecturalDecisions":["..."],"epics":[{"title":"...","slug":"...","description":"..."}]}`;
     const overviewFile = path.join(planningDir, '_overview.json');
 
+    // In append mode, tell the planner what already exists so it produces NEW
+    // epics that extend the plan rather than restating it. Existing slugs are
+    // explicitly forbidden so we don't get spurious update-in-place rewrites
+    // from a fresh-start request.
+    const existingContext = existing && existing.existingEpics.length > 0
+      ? `\n\n## Existing Plan (you are EXTENDING this)\n\n` +
+        (existing.priorSummary ? `Project summary so far:\n${existing.priorSummary}\n\n` : '') +
+        `Existing epics — do NOT redefine these; propose ADDITIONAL epics that build on them:\n` +
+        existing.existingEpics.map(e => `- epic-${e.id} "${e.title}" (slug: ${e.slug}) — ${e.summary}`).join('\n') +
+        (existing.priorDecisions.length > 0
+          ? `\n\nPrior architectural decisions (do not repeat verbatim; add only NEW decisions):\n` +
+            existing.priorDecisions.map(d => `- ${d}`).join('\n')
+          : '') +
+        `\n\nReturn ONLY new epics in the overview JSON. Use slugs that are not in the list above.`
+      : '';
+
     const overview: EpicOverview = await promptAndReadFile(
-      `${request}\n\nWrite the epic overview JSON to \`.tdd-workflow/planning/_overview.json\` now. No work items yet — just the epic list.`,
+      `${request}${existingContext}\n\nWrite the epic overview JSON to \`.tdd-workflow/planning/_overview.json\` now. No work items yet — just the epic list.`,
       overviewFile,
       extractEpicOverview,
       OVERVIEW_HINT,
@@ -224,14 +332,32 @@ export async function planProject(
       if (!confirmed) return { summary: 'Planning cancelled by user.' };
     }
 
-    // Write overview file immediately
+    // Write overview file immediately. In append mode, merge with the prior
+    // overview so the user's accumulated decisions and summary aren't lost.
     const workItemsDir = path.join(cwd, 'WorkItems');
     if (!fs.existsSync(workItemsDir)) fs.mkdirSync(workItemsDir, { recursive: true });
 
+    let mergedSummary = overview.summary;
+    let mergedDecisions = overview.architecturalDecisions;
+    if (existing) {
+      if (existing.priorSummary && existing.priorSummary !== overview.summary) {
+        mergedSummary = `${existing.priorSummary}\n\n${overview.summary}`;
+      }
+      // De-duplicate decisions: keep prior order, append only those that are new.
+      const seen = new Set(existing.priorDecisions.map(d => d.toLowerCase().trim()));
+      const additions = overview.architecturalDecisions.filter(d => {
+        const norm = d.toLowerCase().trim();
+        if (seen.has(norm)) return false;
+        seen.add(norm);
+        return true;
+      });
+      mergedDecisions = [...existing.priorDecisions, ...additions];
+    }
+
     fs.writeFileSync(
       path.join(workItemsDir, '_overview.md'),
-      `# Project Overview\n\n${overview.summary}\n\n## Architectural Decisions\n\n` +
-      overview.architecturalDecisions.map(d => `- ${d}`).join('\n')
+      `# Project Overview\n\n${mergedSummary}\n\n## Architectural Decisions\n\n` +
+      mergedDecisions.map(d => `- ${d}`).join('\n')
     );
 
     if (overview.architecturalDecisions.length > 0) {
@@ -246,6 +372,10 @@ export async function planProject(
 
     const completedEpics: Epic[] = [];
 
+    // Track maxIndex as we go so new epics keep climbing past existing ones
+    // when in append mode. Replace mode starts from 0 (old behavior).
+    let nextIndex = existing ? existing.maxIndex : 0;
+
     // Shared context prefix injected at the start of every per-epic session
     const overviewContext =
       `Project overview: ${overview.summary}\n\n` +
@@ -256,6 +386,8 @@ export async function planProject(
 
     for (let i = 0; i < overview.epics.length; i++) {
       const epicStub = overview.epics[i]!;
+      // Placeholder number for the progress message; the final epic number is
+      // resolved per-epic below (existing slug → reuse old index, else maxIndex++).
       const epicNum = String(i + 1).padStart(2, '0');
       logger.info(`[PLANNER] Fetching work items for epic ${epicNum}: ${epicStub.title}`);
       uiContext?.chatMessage?.(`⏳ Epic ${i + 1}/${overview.epics.length}: ${epicStub.title}`);
@@ -368,8 +500,19 @@ export async function planProject(
         epicSession.dispose();
       }
 
+      // Resolve final filename:
+      //   - Append + slug already exists → reuse the existing file (update in place)
+      //   - Otherwise → bump nextIndex and create epic-NN-slug.md
+      let filename: string;
+      const reuse = existing?.slugToFile.get(epic.slug);
+      if (reuse) {
+        filename = reuse;
+      } else {
+        nextIndex += 1;
+        filename = `epic-${String(nextIndex).padStart(2, '0')}-${epic.slug}.md`;
+      }
+
       // Write epic file immediately
-      const filename = `epic-${epicNum}-${epic.slug}.md`;
       let epicMd = `# Epic: ${epic.title}\n\n## Summary\n${epic.description}\n\n`;
       if (epic.securityStrategy) epicMd += `## Security Strategy\n${epic.securityStrategy}\n\n`;
       if (epic.testStrategy) epicMd += `## Testing Strategy\n${epic.testStrategy}\n\n`;
@@ -389,8 +532,18 @@ export async function planProject(
       epics: completedEpics,
     };
 
+    const added = existing
+      ? completedEpics.filter(e => !existing.slugToFile.has(e.slug)).length
+      : completedEpics.length;
+    const updated = existing
+      ? completedEpics.filter(e => existing.slugToFile.has(e.slug)).length
+      : 0;
+    const summaryLine = mode === 'append' && existing && (existing.maxIndex > 0)
+      ? `Project planning complete (append mode). +${added} new, ${updated} updated. Total epics in WorkItems/: ${existing.maxIndex + added}.`
+      : `Project planning complete. Created ${completedEpics.length} epics in WorkItems/.`;
+
     return {
-      summary: `Project planning complete. Created ${completedEpics.length} epics in WorkItems/.`,
+      summary: summaryLine,
       plan,
     };
   } finally {
@@ -470,14 +623,25 @@ export async function writePlanFiles(plan: ProjectPlan, cwd: string): Promise<vo
 }
 
 /**
- * Appends architectural decisions to agents.md.
+ * Resolve the AGENTS.md filename in `cwd`, preferring uppercase to avoid
+ * creating a duplicate lowercase file alongside an existing AGENTS.md.
+ */
+function resolveAgentsMdPath(cwd: string): string {
+  for (const candidate of ['AGENTS.md', 'agents.md']) {
+    if (fs.existsSync(path.join(cwd, candidate))) return candidate;
+  }
+  return 'AGENTS.md';
+}
+
+/**
+ * Appends architectural decisions to AGENTS.md (or agents.md if that already exists).
  */
 export async function appendArchitecturalDecisions(
   decisions: string[],
   cwd: string,
-  agentsMdPath: string = 'agents.md'
+  agentsMdPath?: string
 ): Promise<void> {
-  const fullPath = path.join(cwd, agentsMdPath);
+  const fullPath = path.join(cwd, agentsMdPath ?? resolveAgentsMdPath(cwd));
   
   let content = '';
   if (fs.existsSync(fullPath)) {

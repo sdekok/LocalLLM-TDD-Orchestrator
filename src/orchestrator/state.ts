@@ -61,6 +61,7 @@ export class StateManager {
     const entries = [
       '.tdd-workflow/state.json',
       '.tdd-workflow/logs/',
+      '.pi-lens/',
     ];
     try {
       let current = '';
@@ -72,19 +73,24 @@ export class StateManager {
       }
     } catch { /* non-fatal */ }
 
-    // If state.json was previously committed, un-track it so it no longer shows
-    // up in git diff (the orchestrator writes it constantly, which would trip the
-    // file-safety gate if the file is tracked).
+    // Un-track any runtime files that were previously committed so they no longer
+    // show up in git diff and cannot trip the file-safety gate. .pi-lens/ has to
+    // be searched at any depth because monorepos commonly have per-package copies
+    // (e.g. apps/mobile/.pi-lens/turn-state.json).
     try {
-      const result = execFileSync('git', ['ls-files', '--error-unmatch', '.tdd-workflow/state.json'], {
-        cwd: projectDir, stdio: 'pipe',
-      });
-      // File is tracked — remove it from the index without deleting it from disk
-      execFileSync('git', ['rm', '--cached', '.tdd-workflow/state.json'], {
-        cwd: projectDir, stdio: 'pipe',
-      });
+      execFileSync('git', ['ls-files', '--error-unmatch', '.tdd-workflow/state.json'], { cwd: projectDir, stdio: 'pipe' });
+      execFileSync('git', ['rm', '--cached', '.tdd-workflow/state.json'], { cwd: projectDir, stdio: 'pipe' });
       getLogger().info('[StateManager] Un-tracked .tdd-workflow/state.json from git index');
-    } catch { /* not tracked — nothing to do */ }
+    } catch { /* not tracked */ }
+
+    try {
+      const tracked = execFileSync('git', ['ls-files'], { cwd: projectDir, encoding: 'utf-8' });
+      const piLensFiles = tracked.split('\n').filter(f => /(^|\/)\.pi-lens\//.test(f));
+      if (piLensFiles.length > 0) {
+        execFileSync('git', ['rm', '--cached', '--', ...piLensFiles], { cwd: projectDir, stdio: 'pipe' });
+        getLogger().info(`[StateManager] Un-tracked ${piLensFiles.length} .pi-lens file(s) from git index`);
+      }
+    } catch { /* not a git repo or git command failed */ }
   }
 
   private loadState(): WorkflowState {

@@ -3,14 +3,19 @@ import { createSubAgentSession, _activeSessionCount } from '../../src/subagent/f
 import { ModelRouter } from '../../src/llm/model-router.js';
 import { IMPLEMENTER_PROMPT } from '../../src/subagent/prompts.js';
 
+// Capture the most recent createAgentSession() call so individual tests can
+// inspect the tool allowlist that was passed in. Reset in beforeEach.
+const capturedCalls: { tools?: string[] }[] = [];
+
 // Mock Pi SDK
-vi.mock('@mariozechner/pi-coding-agent', () => {
+vi.mock('@earendil-works/pi-coding-agent', () => {
   const DefaultResourceLoader = vi.fn().mockImplementation(function(this: any, config) {
     this.systemPrompt = config.systemPrompt;
     this.reload = vi.fn().mockResolvedValue(undefined);
   });
 
   const createAgentSession = vi.fn().mockImplementation(async (options) => {
+    capturedCalls.push({ tools: options.tools });
     const systemPrompt = options.resourceLoader?.systemPrompt ?? '';
     return {
       session: {
@@ -62,6 +67,50 @@ describe('SubAgent Factory', () => {
 
     expect(session.agent.state.systemPrompt).toContain('BASE PROMPT');
     expect(session.agent.state.systemPrompt).toContain('FIX THIS');
+  });
+
+  it('passes a non-empty tool allowlist for coding tasks', async () => {
+    capturedCalls.length = 0;
+    await createSubAgentSession({
+      taskType: 'implement',
+      systemPrompt: 'PROMPT',
+      cwd: '/tmp',
+      modelRouter,
+    });
+    const call = capturedCalls.at(-1);
+    expect(call?.tools).toBeDefined();
+    // Base tools always included
+    expect(call!.tools).toEqual(expect.arrayContaining(['read', 'write', 'edit', 'bash']));
+  });
+
+  it('includes ctx_* tools in the allowlist when context-mode is detected', async () => {
+    // This test only meaningfully runs on machines where ~/.pi/agent/settings.json
+    // lists context-mode (the bug we're guarding against was that ctx_execute
+    // was silently filtered out of the session). On CI or fresh installs where
+    // context-mode is absent, the test is a no-op assertion.
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const settingsPath = path.join(os.homedir(), '.pi', 'agent', 'settings.json');
+    let hasContextMode = false;
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) as { packages?: string[] };
+      hasContextMode = (settings.packages ?? []).some(p =>
+        p.toLowerCase().includes('context-mode') || p.toLowerCase().includes('pi-mcp-adapter'),
+      );
+    } catch { /* settings.json absent — test is skipped */ }
+
+    if (!hasContextMode) return;
+
+    capturedCalls.length = 0;
+    await createSubAgentSession({
+      taskType: 'implement',
+      systemPrompt: 'PROMPT',
+      cwd: '/tmp',
+      modelRouter,
+    });
+    const call = capturedCalls.at(-1);
+    expect(call?.tools).toEqual(expect.arrayContaining(['ctx_execute', 'ctx_execute_file']));
   });
 
   it('sets thinking level based on model profile', async () => {

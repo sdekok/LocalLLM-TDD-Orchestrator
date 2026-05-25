@@ -14,15 +14,17 @@ interface PiModelsJson {
 export interface PiCloudProvider {
   name: string;
   baseUrl: string;
-  /** API key read from Pi's config — use only for fetching model lists, never store. */
-  apiKey: string;
+  /** API key read from Pi's config — undefined for no-auth endpoints (e.g. vLLM). */
+  apiKey?: string;
   cachedModelIds: string[];
 }
 
 /**
- * Return all non-llamacpp providers Pi has configured (e.g. OpenRouter, OpenAI).
- * The apiKey is the raw value from Pi's config file — callers should use it only
- * for API discovery and must never write it to TDD workflow config files.
+ * Return all non-llamacpp providers Pi has configured (OpenRouter, OpenAI, vLLM, etc.).
+ * Includes providers without an apiKey so that no-auth OpenAI-compatible servers
+ * (e.g. vLLM) are discovered alongside keyed cloud providers.
+ * The apiKey, when present, is the raw value from Pi's config — callers should use it
+ * only for API discovery and must never write it to TDD workflow config files.
  */
 export function readPiCloudProviders(homeDir = os.homedir()): PiCloudProvider[] {
   const piModelsPath = path.join(homeDir, '.pi', 'agent', 'models.json');
@@ -30,11 +32,11 @@ export function readPiCloudProviders(homeDir = os.homedir()): PiCloudProvider[] 
   try {
     const raw = JSON.parse(fs.readFileSync(piModelsPath, 'utf-8')) as PiModelsJson;
     return Object.entries(raw.providers ?? {})
-      .filter(([, p]) => p.api !== 'llamacpp' && p.baseUrl && p.apiKey)
+      .filter(([, p]) => p.api !== 'llamacpp' && p.baseUrl)
       .map(([name, p]) => ({
         name,
         baseUrl: p.baseUrl!,
-        apiKey: p.apiKey!,
+        apiKey: p.apiKey,
         cachedModelIds: (p.models ?? []).map(m => m.id),
       }));
   } catch {

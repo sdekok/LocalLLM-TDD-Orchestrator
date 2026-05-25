@@ -16,10 +16,18 @@
 
 | Role | Purpose |
 |---|---|
-| **Architect** | Strategic agent used for high-level project planning (via `/plan`). Decomposes requests into Epics and WorkItems in `WorkItems/`. |
+| **Architect** | Strategic agent used for high-level project planning (via `/plan`). Decomposes requests into Epics and WorkItems in `WorkItems/`. Defaults to **append mode** — preserves existing epics and only adds/updates what's needed (pass `--replace` to clobber). |
 | **Planner** | Refines high-level work items into technical subtasks during execution. |
 | **Implementer** | Native sub-session that writes tests and code to pass them for a specific work item. |
 | **Reviewer** | Adversarial sub-session that scores code on quality, security, and coverage. |
+
+## Telemetry
+
+Every sub-agent LLM call is observed via Pi's `after_provider_response` hook and logged with `[SUBAGENT TELEMETRY <role>]` — useful for spotting rate-limit issues, latency regressions, or failing requests without grepping through the SDK's own logs.
+
+## Saved planning state
+
+The architect persists `.tdd-workflow/planning/_request.json` at every run and saves user feedback to `.tdd-workflow/planning/_pending_feedback.txt` when the user rejects the chat-based review. `/plan revise` reads these to continue planning without making the user retype their original request.
 ## Architectural Decisions (Auto-generated)
 
 - Single Responsibility: Calculator class handles only arithmetic operations, UI handles presentation, inputs are validated separately.

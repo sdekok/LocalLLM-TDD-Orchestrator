@@ -178,13 +178,19 @@ describe('Provider-aware routing', () => {
     }
   });
 
-  it('throws for a custom provider with no apiKeyEnvVar configured', () => {
-    const config = makeTestConfig();
-    config.models['cloud-model']!.provider = 'custom' as any;
-    delete config.models['cloud-model']!.apiKeyEnvVar;
-    const router = new ModelRouter(config);
-    const profile = router.selectModel('research');
-    expect(() => router.getApiKey(profile)).toThrow('apiKeyEnvVar');
+  it('returns undefined for an openai provider with no apiKeyEnvVar and no OPENAI_API_KEY env (auth-free endpoints like vLLM)', () => {
+    const saved = process.env.OPENAI_API_KEY;
+    delete process.env.OPENAI_API_KEY;
+    try {
+      const config = makeTestConfig();
+      config.models['cloud-model']!.provider = 'openai';
+      delete config.models['cloud-model']!.apiKeyEnvVar;
+      const router = new ModelRouter(config);
+      const profile = router.selectModel('research');
+      expect(router.getApiKey(profile)).toBeUndefined();
+    } finally {
+      if (saved !== undefined) process.env.OPENAI_API_KEY = saved;
+    }
   });
 
   it('returns undefined API key for local models', () => {

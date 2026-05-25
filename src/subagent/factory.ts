@@ -9,7 +9,7 @@ import {
   type AgentToolUpdateCallback,
   type ExtensionFactory,
   type ProviderConfig,
-} from '@mariozechner/pi-coding-agent';
+} from '@earendil-works/pi-coding-agent';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -264,7 +264,11 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   logger.info(`[SUBAGENT FACTORY] System prompt: ~${estimatedTokens} tokens (${populatedPrompt.length} chars)`);
   logger.info(`[SUBAGENT FACTORY] System prompt preview: ${populatedPrompt.substring(0, 200)}...`);
 
-  // Build the tool allowlist (string names — 0.68.0 API)
+  // Build the tool allowlist (string names — 0.68.0 API).
+  // IMPORTANT: the allowlist passed to createAgentSession filters MCP-provided
+  // tools too. If we omit `ctx_execute` etc. they will not be callable even
+  // though context-mode is installed — that was the bug behind implementers
+  // burning context with `bash cat large-file` instead of `ctx_execute`.
   let toolNames: string[];
   if (options.tools === 'none') {
     toolNames = [];
@@ -278,7 +282,34 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     toolNames = ['read', 'write', 'edit', 'bash', 'grep', 'find', 'ls'];
   }
 
+  // Conditionally add MCP-provided tools when their extensions are present.
+  // Without these in the allowlist, the SDK silently filters them out — the
+  // implementer sees only built-in tools no matter what the prompt says.
+  if (toolNames.length > 0) {
+    if (hasContextMode) {
+      toolNames.push(
+        'ctx_execute',
+        'ctx_execute_file',
+        'ctx_search',
+        'ctx_index',
+        'ctx_fetch_and_index',
+        'ctx_batch_execute',
+        'ctx_stats',
+      );
+    }
+    if (hasLens) {
+      toolNames.push('lsp_navigation', 'lsp_diagnostics', 'ast_grep_search');
+      if (options.tools !== 'review' && options.tools !== 'readonly') {
+        toolNames.push('ast_grep_replace');
+      }
+    }
+    if (hasWebSearch) {
+      toolNames.push('searxng_web_search', 'web_url_read');
+    }
+  }
+
   logger.info(`[SUBAGENT FACTORY] Tools loaded: ${options.tools || 'coding'}`);
+  logger.info(`[SUBAGENT FACTORY] Allowlist: ${toolNames.join(', ') || '(none)'}`);
   logger.info(`[SUBAGENT FACTORY] Final prompt (first 500 chars):\n${populatedPrompt.substring(0, 500)}...`);
 
   // Add custom tools if uiContext is provided (for interactive planning)
@@ -324,6 +355,18 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     logger.info('[SUBAGENT FACTORY] Registered thinking-filter extension');
   }
 
+  // Context pruner: defaults to 70% of the model's context window. Set
+  // `contextBudgetTokens: 0` on a model profile to opt out.
+  const budgetTokens = profile.contextBudgetTokens ?? Math.floor(profile.contextWindow * 0.7);
+  if (budgetTokens > 0) {
+    extensionFactories.push(createContextPruner(options.taskType, budgetTokens));
+    logger.info(`[SUBAGENT FACTORY] Registered context-pruner extension (budget=${budgetTokens} tok, window=${profile.contextWindow})`);
+  } else {
+    logger.info(`[SUBAGENT FACTORY] Context pruner disabled (contextBudgetTokens=0)`);
+  }
+
+  extensionFactories.push(createProviderTelemetry(options.taskType));
+
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: PI_AGENT_DIR,
@@ -342,7 +385,11 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     cwd: options.cwd,
     sessionManager: SessionManager.inMemory(), // Ephemeral session
     resourceLoader: loader,
-    tools: toolNames,
+    // Pass undefined instead of an empty array when no tools are requested.
+    // vLLM rejects `tools: []` with HTTP 400 ("tools must not be an empty
+    // array"), causing the request to fail silently with zero stream events —
+    // the arbiter session was hitting this exact case.
+    tools: toolNames.length > 0 ? toolNames : undefined,
     customTools,
   });
 
@@ -438,6 +485,167 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   return trackSession(session);
 }
 
+// ─── Context pruning ───────────────────────────────────────────────────────
+//
+// Long implementer attempts accumulate huge tool_result payloads (bash/test
+// output, large file reads). The Pi SDK keeps the entire history in-context
+// for the model on every turn, so a 60-minute implementer run can easily
+// blow past 200K tokens even when the model's window is much smaller.
+//
+// This pruner hooks Pi's `context` event and stubs out tool_result + tool_use
+// payloads from older messages once the estimated token count crosses the
+// configured budget. Recent messages are kept verbatim so the model still
+// has the latest reviewer feedback and tool outputs to act on. The actual
+// transcript on disk is unaffected — this only trims what the model sees
+// for the next forward pass.
+
+const TOOL_RESULT_STUB = '[tool result elided by context pruner — re-run the tool if you need it]';
+
+export interface PruneStats {
+  totalBefore: number;
+  totalAfter: number;
+  stubbedBlocks: number;
+}
+
+function estimateBlockTokens(block: any): number {
+  if (!block || typeof block !== 'object') return 0;
+  if (block.type === 'text' && typeof block.text === 'string') {
+    return Math.ceil(block.text.length / 4);
+  }
+  if (block.type === 'thinking' && typeof block.thinking === 'string') {
+    return Math.ceil(block.thinking.length / 4);
+  }
+  if (block.type === 'tool_use') {
+    const inputStr = block.input ? JSON.stringify(block.input) : '';
+    return Math.ceil((inputStr.length + (typeof block.name === 'string' ? block.name.length : 0)) / 4);
+  }
+  if (block.type === 'tool_result') {
+    if (typeof block.content === 'string') return Math.ceil(block.content.length / 4);
+    if (Array.isArray(block.content)) {
+      return block.content.reduce((sum: number, c: any) => {
+        if (typeof c === 'string') return sum + Math.ceil(c.length / 4);
+        if (c?.type === 'text' && typeof c.text === 'string') return sum + Math.ceil(c.text.length / 4);
+        return sum + Math.ceil(JSON.stringify(c).length / 4);
+      }, 0);
+    }
+  }
+  return Math.ceil(JSON.stringify(block).length / 4);
+}
+
+function estimateMessageTokens(msg: any): number {
+  if (!msg) return 0;
+  if (typeof msg.content === 'string') return Math.ceil(msg.content.length / 4);
+  if (Array.isArray(msg.content)) {
+    return msg.content.reduce((sum: number, b: any) => sum + estimateBlockTokens(b), 0);
+  }
+  return 0;
+}
+
+/**
+ * Walk oldest→newest stubbing tool_result content (then tool_use input as a
+ * second pass) until the total estimated tokens drop under `budgetTokens`.
+ * The last `keepRecentMessages` messages are preserved verbatim so the model
+ * always has fresh ground truth (latest user turn, latest tool roundtrip).
+ *
+ * Returns a new array; the input is not mutated.
+ */
+export function pruneContextMessages(
+  messages: any[],
+  budgetTokens: number,
+  keepRecentMessages = 4,
+): { messages: any[]; stats: PruneStats } {
+  let totalBefore = 0;
+  for (const m of messages) totalBefore += estimateMessageTokens(m);
+
+  if (totalBefore <= budgetTokens || messages.length <= keepRecentMessages) {
+    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0 } };
+  }
+
+  const protectStart = Math.max(0, messages.length - keepRecentMessages);
+  let stubbedBlocks = 0;
+  let current = totalBefore;
+
+  // Quick scan: if nothing in the prunable range is a tool_use/tool_result,
+  // pruning can't help — return the original array unchanged for identity.
+  let hasPrunable = false;
+  for (let i = 0; i < protectStart && !hasPrunable; i++) {
+    const msg = messages[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type === 'tool_result' || block?.type === 'tool_use') {
+        hasPrunable = true;
+        break;
+      }
+    }
+  }
+  if (!hasPrunable) {
+    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0 } };
+  }
+
+  // Clone shallowly so the caller's array is untouched.
+  const result = messages.map(m => {
+    if (!m || !Array.isArray(m.content)) return m;
+    return { ...m, content: m.content.map((b: any) => ({ ...b })) };
+  });
+
+  // Pass 1: stub tool_result content (biggest payloads — bash/read output).
+  for (let i = 0; i < protectStart && current > budgetTokens; i++) {
+    const msg = result[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (let j = 0; j < msg.content.length && current > budgetTokens; j++) {
+      const block = msg.content[j];
+      if (block?.type === 'tool_result' && block.content !== TOOL_RESULT_STUB) {
+        const before = estimateBlockTokens(block);
+        block.content = TOOL_RESULT_STUB;
+        const after = estimateBlockTokens(block);
+        current -= (before - after);
+        stubbedBlocks++;
+      }
+    }
+  }
+
+  // Pass 2: stub tool_use input if still over (rarely needed — tool args are
+  // usually small, but a giant `write` payload can blow past on its own).
+  for (let i = 0; i < protectStart && current > budgetTokens; i++) {
+    const msg = result[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (let j = 0; j < msg.content.length && current > budgetTokens; j++) {
+      const block = msg.content[j];
+      if (block?.type === 'tool_use' && block.input && (block.input as any).__pruned !== true) {
+        const before = estimateBlockTokens(block);
+        block.input = { __pruned: true };
+        const after = estimateBlockTokens(block);
+        current -= (before - after);
+        stubbedBlocks++;
+      }
+    }
+  }
+
+  return { messages: result, stats: { totalBefore, totalAfter: current, stubbedBlocks } };
+}
+
+/** Wraps pruneContextMessages as a Pi SDK extension factory. */
+function createContextPruner(taskType: TaskType, budgetTokens: number): ExtensionFactory {
+  return (pi) => {
+    const log = getLogger();
+    let lastLogTokens = 0;
+    pi.on('context', (event) => {
+      const { messages: pruned, stats } = pruneContextMessages(event.messages, budgetTokens);
+      if (stats.stubbedBlocks > 0) {
+        log.warn(
+          `[CONTEXT PRUNER ${taskType}] stubbed ${stats.stubbedBlocks} block(s); ` +
+          `~${stats.totalBefore} → ${stats.totalAfter} tok (budget ${budgetTokens})`,
+        );
+        lastLogTokens = stats.totalAfter;
+      } else if (stats.totalBefore - lastLogTokens > 5000) {
+        log.info(`[CONTEXT PRUNER ${taskType}] history ~${stats.totalBefore} tok (budget ${budgetTokens})`);
+        lastLogTokens = stats.totalBefore;
+      }
+      return { messages: pruned };
+    });
+  };
+}
+
 /**
  * Strips `thinking` content blocks from prior assistant messages,
  * preserving thinking only in the most recent assistant message.
@@ -479,6 +687,34 @@ function createThinkingFilter(): ExtensionFactory {
   return (pi) => {
     pi.on('context', (event) => {
       return { messages: stripThinkingFromHistory(event.messages) };
+    });
+  };
+}
+
+/**
+ * Per-session provider-call telemetry. Pairs `before_provider_request` with
+ * `after_provider_response` to log status + latency, and warns on non-2xx so
+ * rate limits and provider errors surface in the existing log without needing
+ * a separate dashboard.
+ */
+function createProviderTelemetry(taskType: TaskType): ExtensionFactory {
+  return (pi) => {
+    const log = getLogger();
+    let requestStart = 0;
+    pi.on('before_provider_request', () => {
+      requestStart = Date.now();
+    });
+    pi.on('after_provider_response', (event) => {
+      const elapsedMs = requestStart > 0 ? Date.now() - requestStart : -1;
+      const rateLimit = event.headers['x-ratelimit-remaining'] ?? event.headers['anthropic-ratelimit-requests-remaining'];
+      const tag = `[SUBAGENT TELEMETRY ${taskType}]`;
+      const latencyStr = elapsedMs >= 0 ? `${elapsedMs}ms` : 'n/a';
+      const rateStr = rateLimit ? ` rate-remaining=${rateLimit}` : '';
+      if (event.status >= 400) {
+        log.warn(`${tag} status=${event.status} latency=${latencyStr}${rateStr}`);
+      } else {
+        log.info(`${tag} status=${event.status} latency=${latencyStr}${rateStr}`);
+      }
     });
   };
 }

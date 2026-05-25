@@ -21,15 +21,11 @@ export class LLMClient {
     const baseURL = this.router.getBaseURL(profile);
     const rawKey = this.router.getApiKey(profile);
 
-    // Only use the placeholder for local providers — cloud providers must have
-    // a real key or getApiKey() will have already thrown.
-    const apiKey = rawKey ?? (profile.provider === 'local' ? 'sk-no-key-required' : undefined);
-    if (!apiKey) {
-      throw new Error(
-        `No API key for "${profile.name}" (provider: ${profile.provider}). ` +
-        `Set the ${profile.apiKeyEnvVar ?? `${profile.provider.toUpperCase()}_API_KEY`} environment variable.`
-      );
-    }
+    // The OpenAI SDK requires `apiKey` to be set even for endpoints that don't
+    // authenticate (local llama.cpp, vLLM, etc.). When no key is configured pass
+    // a harmless placeholder — no-auth servers ignore it, and real cloud servers
+    // missing a key will respond with a clear 401.
+    const apiKey = rawKey ?? 'sk-no-key-required';
 
     // Hash the key so the raw secret never lives inside the Map key
     // (prevents accidental leakage if the Map is logged or inspected).

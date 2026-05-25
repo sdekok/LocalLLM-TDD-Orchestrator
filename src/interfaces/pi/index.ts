@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
+import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -21,11 +21,13 @@ import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { runQualityGates } from '../../orchestrator/quality-gates.js';
 import type { CoverageMetrics } from '../../orchestrator/quality-gates.js';
 import { getTestRunner } from '../../orchestrator/test-runner.js';
-import { planProject } from '../../agents/project-planner.js';
+import { planProject, type PlanMode } from '../../agents/project-planner.js';
 import { EpicLoader } from '../../orchestrator/epic-loader.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
 import { getLogger } from '../../utils/logger.js';
 import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo, readPiCloudProviders } from './pi-models.js';
+import { completeTddArgs, completeReviewArgs, completeResearchArgs, completePlanArgs } from './autocomplete.js';
+import { parsePlanArgs, listExistingEpics, readPriorRequest } from './plan-helpers.js';
 
 // Gate output can be 10MB+ from large monorepo test runs. The planner only
 // needs enough to identify failing files/tests — not full stack traces.
@@ -119,7 +121,8 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('tdd', {
-    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> resume | /tdd <epic> continue | /tdd <epic> task <id> [retry|resume]',
+    description: 'Start or resume a TDD Epic. Usage: /tdd <epic> | /tdd <epic> retry | /tdd <epic> resume | /tdd <epic> continue | /tdd <epic> task <id> [retry|resume|done]',
+    getArgumentCompletions: (argumentPrefix: string) => completeTddArgs(process.cwd(), argumentPrefix),
     handler: async (args: string, ctx) => {
       if (!args) {
         args = await ctx.ui.input('Enter TDD Epic number or description (append "retry", "resume", "continue", or "task <id>"):') || '';
@@ -131,11 +134,13 @@ export default function(pi: ExtensionAPI) {
       //   /tdd 1 retry|resume|continue — resume whole epic
       //   /tdd 1 task WI-36            — run single task (retry mode, clears feedback)
       //   /tdd 1 task WI-36 resume     — run single task (resume mode, preserves feedback)
+      //   /tdd 1 WI-36 done            — mark task as externally completed, then continue
       const parts = args.trim().split(/\s+/);
       const epicRef = parts[0] ?? '';
       const subcommand = parts[1]?.toLowerCase();
       const isResume = subcommand === 'retry' || subcommand === 'resume' || subcommand === 'continue';
       const isSingleTask = subcommand === 'task';
+      const isMarkDone = (parts[2]?.toLowerCase() === 'done' || parts[2]?.toLowerCase() === 'complete') && !!parts[1];
 
       // Lazy init orchestrator state
       if (!executor) {
@@ -199,7 +204,18 @@ export default function(pi: ExtensionAPI) {
         });
       };
 
-      if (isSingleTask) {
+      if (isMarkDone) {
+        if (!stateManager!.hasWorkflow()) {
+          ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
+          return;
+        }
+        const taskId = parts[1]!;
+        postToChat(
+          `📌 Marking **${taskId}** as externally completed for epic **${epicRef}**…`,
+          'tdd-progress'
+        );
+        runAndReport(executor!.markTaskDone(taskId));
+      } else if (isSingleTask) {
         if (!stateManager!.hasWorkflow()) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
           return;
@@ -209,12 +225,18 @@ export default function(pi: ExtensionAPI) {
           ctx.ui.notify('Usage: /tdd <epic> task <task-id>  e.g. /tdd 6 task WI-36', 'warning');
           return;
         }
-        const taskMode = parts[3]?.toLowerCase() === 'resume' ? 'resume' : 'retry';
-        postToChat(
-          `🎯 Running single task **${taskId}** for epic **${epicRef}** (mode=${taskMode})…`,
-          'tdd-progress'
-        );
-        runAndReport(executor!.runTask(taskId, taskMode));
+        const modeArg = parts[3]?.toLowerCase();
+        if (modeArg === 'done' || modeArg === 'complete') {
+          postToChat(`📌 Marking **${taskId}** as externally completed for epic **${epicRef}**…`, 'tdd-progress');
+          runAndReport(executor!.markTaskDone(taskId));
+        } else {
+          const taskMode = modeArg === 'resume' ? 'resume' : 'retry';
+          postToChat(
+            `🎯 Running single task **${taskId}** for epic **${epicRef}** (mode=${taskMode})…`,
+            'tdd-progress'
+          );
+          runAndReport(executor!.runTask(taskId, taskMode));
+        }
       } else if (isResume) {
         if (!stateManager!.hasWorkflow()) {
           ctx.ui.notify(`No active workflow for epic "${epicRef}". Run /tdd ${epicRef} to start one.`, 'warning');
@@ -237,20 +259,34 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('review', {
-    description: 'Run the hostile code reviewer outside the TDD cycle. Usage: /review [uncommitted|<n>|all] [epic <ref>] [<description>]',
+    description: 'Run the hostile code reviewer outside the TDD cycle. Usage: /review [uncommitted|<n>|all|branch <name>] [epic <ref>] [<description>]',
+    getArgumentCompletions: (argumentPrefix: string) => completeReviewArgs(process.cwd(), argumentPrefix),
     handler: async (args: string, ctx) => {
       if (!args) {
         args = await ctx.ui.input(
-          'Scope: uncommitted | <number of commits> | all\n' +
+          'Scope: uncommitted | <number of commits> | all | branch <name>\n' +
           'Optionally append: epic <ref>  or a plain description\n\n' +
-          'Examples: uncommitted  /  3  /  all epic 2  /  uncommitted "fixed auth"'
+          'Examples: uncommitted  /  3  /  all epic 2  /  branch main  /  branch feature/ep06 epic 2'
         ) || '';
         if (!args) return;
       }
 
       const tokens = args.trim().split(/\s+/);
-      const scope = tokens[0] ?? 'uncommitted';
-      const rest = tokens.slice(1).join(' ').trim();
+      let scope: string;
+      let rest: string;
+      if (tokens[0] === 'branch') {
+        if (!tokens[1]) {
+          // No branch name — find the branch this was created from via reflog
+          scope = 'parent-branch';
+          rest = tokens.slice(1).join(' ').trim();
+        } else {
+          scope = `branch:${tokens[1]}`;
+          rest = tokens.slice(2).join(' ').trim();
+        }
+      } else {
+        scope = tokens[0] ?? 'uncommitted';
+        rest = tokens.slice(1).join(' ').trim();
+      }
 
       // Extract optional epic ref: "epic <ref>" anywhere in the remainder
       let context: string | undefined;
@@ -298,14 +334,111 @@ export default function(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('plan', {
-    description: 'Structure a new project or large feature into epics and work items',
+    description: 'Structure a new project or large feature into epics and work items. ' +
+                 'Subcommands: list | show <epic> | revise [feedback]. ' +
+                 'Flags: --replace (overwrite existing), --from-epic <id> (extend one epic), --brownfield.',
+    getArgumentCompletions: (argumentPrefix: string) => completePlanArgs(process.cwd(), argumentPrefix),
     handler: async (args: string, ctx) => {
-      if (!args) {
-        args = await ctx.ui.input('Enter project or feature description:') || '';
-        if (!args) return;
+      const parsed = parsePlanArgs(args);
+
+      // ── Subcommand: list ─────────────────────────────────────────────────
+      if (parsed.subcommand === 'list') {
+        const epics = listExistingEpics(ctx.cwd);
+        if (epics.length === 0) {
+          ctx.ui.notify('No epics found in WorkItems/.', 'info');
+          return;
+        }
+        const lines = epics.map(e =>
+          `- **epic-${e.id}** — ${e.title} (${e.workItemCount} work item${e.workItemCount === 1 ? '' : 's'})`,
+        );
+        postToChat(`📋 **Existing epics**\n\n${lines.join('\n')}`, 'plan-list');
+        return;
       }
 
-      ctx.ui.notify('Project Planner starting...', 'info');
+      // ── Subcommand: show <epic> ──────────────────────────────────────────
+      if (parsed.subcommand === 'show') {
+        if (!parsed.target) {
+          ctx.ui.notify('Usage: /plan show <epic-id>', 'warning');
+          return;
+        }
+        try {
+          const epicLoader = new EpicLoader(ctx.cwd);
+          const epicPath = epicLoader.findEpic(parsed.target);
+          if (!epicPath) {
+            ctx.ui.notify(`Epic "${parsed.target}" not found.`, 'warning');
+            return;
+          }
+          const content = fs.readFileSync(epicPath, 'utf-8');
+          postToChat(content, 'plan-show');
+        } catch (err) {
+          ctx.ui.notify(`Failed to read epic: ${(err as Error).message}`, 'error');
+        }
+        return;
+      }
+
+      // ── Subcommand: revise [feedback] ────────────────────────────────────
+      // Picks up the last /plan request from .tdd-workflow/planning/_request.json
+      // and re-runs in append mode, instructing the planner to incorporate the
+      // user's revision feedback. Falls back to ctx.ui.input when no feedback
+      // is supplied inline.
+      let plannerRequest: string;
+      let mode: PlanMode = parsed.replace ? 'replace' : 'append';
+      if (parsed.subcommand === 'revise') {
+        const prior = readPriorRequest(ctx.cwd);
+        if (!prior) {
+          ctx.ui.notify(
+            'No prior /plan session found in .tdd-workflow/planning/_request.json. Run /plan first, then /plan revise.',
+            'warning',
+          );
+          return;
+        }
+        let feedback = parsed.rest;
+        if (!feedback) {
+          feedback = await ctx.ui.input('Describe the revision you want:') || '';
+          if (!feedback) return;
+        }
+        plannerRequest =
+          `${prior.request}\n\n` +
+          `## Revision request\n` +
+          `The user reviewed the previous plan and wants the following changes incorporated:\n\n` +
+          `> ${feedback}\n\n` +
+          `Update only what's needed. Reuse existing epic slugs to update epics in place; ` +
+          `propose new epics only when the revision genuinely adds scope.`;
+        mode = 'append';
+      } else {
+        // ── Default subcommand: new planning run ──────────────────────────
+        let requestText = parsed.rest;
+        if (!requestText) {
+          requestText = await ctx.ui.input('Enter project or feature description:') || '';
+          if (!requestText) return;
+        }
+        if (parsed.fromEpic) {
+          try {
+            const epicLoader = new EpicLoader(ctx.cwd);
+            const epicPath = epicLoader.findEpic(parsed.fromEpic);
+            if (epicPath) {
+              const epicContent = fs.readFileSync(epicPath, 'utf-8');
+              requestText =
+                `${requestText}\n\n## Extending existing epic\n` +
+                `Build on top of this epic — propose follow-on work items or a new epic ` +
+                `that complements it:\n\n${epicContent}`;
+            } else {
+              ctx.ui.notify(`Epic "${parsed.fromEpic}" not found — proceeding without it.`, 'warning');
+            }
+          } catch (err) {
+            ctx.ui.notify(`Failed to load --from-epic: ${(err as Error).message}`, 'warning');
+          }
+        }
+        if (parsed.brownfield) {
+          requestText =
+            `${requestText}\n\n## Brownfield context\n` +
+            `This is an existing codebase. Explore the repository thoroughly before proposing epics. ` +
+            `Prefer epics that integrate with existing modules over greenfield rewrites.`;
+        }
+        plannerRequest = requestText;
+      }
+
+      ctx.ui.notify(`Project Planner starting (${mode} mode)…`, 'info');
       ctx.ui.setStatus('plan', '📐 Planning project structure...');
 
       try {
@@ -322,39 +455,55 @@ export default function(pi: ExtensionAPI) {
             'warning'
           );
         }
-        const result = await planProject(args, modelRouter, ctx.cwd, {
-          // Clarifying questions: post to chat and wait for the user to reply inline.
-          input: async (prompt: string) => {
-            postToChat(`❓ **${prompt}**\n\n_Type your answer in the chat…_`, 'plan-question');
-            return await waitForChatInput();
+        const result = await planProject(
+          plannerRequest,
+          modelRouter,
+          ctx.cwd,
+          {
+            // Clarifying questions: post to chat and wait for the user to reply inline.
+            input: async (prompt: string) => {
+              postToChat(`❓ **${prompt}**\n\n_Type your answer in the chat…_`, 'plan-question');
+              return await waitForChatInput();
+            },
+            notify: (message: string, type?: 'info' | 'warning' | 'error') => ctx.ui.notify(message, type || 'info'),
+            // Plan review: post the plan markdown to chat and ask for approval or feedback.
+            editor: async (_label: string, initialText: string) => {
+              postToChat(initialText, 'plan-review');
+              postToChat(
+                '---\n✅ Type **`approve`** to create the WorkItems, or describe what you\'d like changed.\n' +
+                '_Tip: if you want changes, type the feedback here, then run `/plan revise` — your original request is already saved._',
+                'plan-review-prompt'
+              );
+              const response = await waitForChatInput();
+              if (!response) return null; // cancelled / timed out
+              const trimmed = response.trim().toLowerCase();
+              if (trimmed === 'approve' || trimmed === 'yes' || trimmed === 'y') {
+                return initialText; // approved as-is — project-planner will write files
+              }
+              // Persist the feedback so /plan revise can pick it up without retyping.
+              try {
+                const planningDir = path.join(ctx.cwd, '.tdd-workflow', 'planning');
+                fs.mkdirSync(planningDir, { recursive: true });
+                fs.writeFileSync(
+                  path.join(planningDir, '_pending_feedback.txt'),
+                  response,
+                  'utf-8',
+                );
+              } catch { /* non-fatal */ }
+              postToChat(
+                `📝 Got it. Run \`/plan revise\` to apply this feedback (your original request is saved):\n\n> ${response}`,
+                'plan-feedback'
+              );
+              return null;
+            },
+            // confirm is reached only if editor returned non-null; auto-approve so we
+            // don't show a second dialog after the chat-based review above.
+            confirm: async (_message: string) => true,
+            chatMessage: (content: string) => postToChat(content),
           },
-          notify: (message: string, type?: 'info' | 'warning' | 'error') => ctx.ui.notify(message, type || 'info'),
-          // Plan review: post the plan markdown to chat and ask for approval or feedback.
-          editor: async (_label: string, initialText: string) => {
-            postToChat(initialText, 'plan-review');
-            postToChat(
-              '---\n✅ Type **`approve`** to create the WorkItems, or describe what you\'d like changed.',
-              'plan-review-prompt'
-            );
-            const response = await waitForChatInput();
-            if (!response) return null; // cancelled / timed out
-            const trimmed = response.trim().toLowerCase();
-            if (trimmed === 'approve' || trimmed === 'yes' || trimmed === 'y') {
-              return initialText; // approved as-is — project-planner will write files
-            }
-            // User provided feedback — post a hint and cancel this planning round.
-            postToChat(
-              `📝 Got it. Run \`/plan ${args}\` again and the planner will incorporate your feedback:\n\n> ${response}`,
-              'plan-feedback'
-            );
-            return null;
-          },
-          // confirm is reached only if editor returned non-null; auto-approve so we
-          // don't show a second dialog after the chat-based review above.
-          confirm: async (_message: string) => true,
-          chatMessage: (content: string) => postToChat(content),
-        });
-        
+          { mode },
+        );
+
         ctx.ui.setStatus('plan', undefined);
         ctx.ui.notify(result.summary, 'info');
 
@@ -512,6 +661,17 @@ export default function(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand('tdd:nudge', {
+    description: 'Send an immediate nudge to a silent implementer agent without waiting for the 5-minute idle timer.',
+    handler: async (_args: string, ctx) => {
+      if (!executor) {
+        ctx.ui.notify('No TDD workflow is currently running.', 'warning');
+        return;
+      }
+      executor.nudge();
+    },
+  });
+
   pi.registerCommand('tdd:resume', {
     description: 'Resume a previously paused TDD workflow. Picks up paused tasks with their WIP branch + feedback intact.',
     handler: async (_args: string, ctx) => {
@@ -625,6 +785,7 @@ export default function(pi: ExtensionAPI) {
 
   pi.registerCommand('research', {
     description: 'Launch a Deep Research Agent. Flags: --bg (background), --shallow (single-pass), --time N (minutes, default 30), --resume [folder] (continue previous session)',
+    getArgumentCompletions: (argumentPrefix: string) => completeResearchArgs(process.cwd(), argumentPrefix),
     handler: async (args: string, ctx) => {
       // Parse flags from args
       let isBackground = false;
@@ -731,53 +892,38 @@ export default function(pi: ExtensionAPI) {
       // alongside the model ID so we can build the right ModelProfile later.
       interface SetupModelEntry {
         displayName: string;
-        provider: 'local' | 'openrouter' | 'openai' | 'custom';
+        provider: 'local' | 'openrouter' | 'openai';
         ggufFilename?: string;   // local models
         modelId?: string;        // cloud models
         apiKeyEnvVar?: string;   // cloud models
+        baseURL?: string;        // set when not on the default provider URL (e.g. vLLM, secondary llama.cpp)
         contextLength?: number;
         maxOutputTokens?: number;
         reasoning?: boolean;
       }
 
-      // ── 1. Resolve llamaUrl ────────────────────────────────────────────
+      // ── 1. Resolve primary llamaUrl (written to config as the default base URL) ──
       const existingConfig = isGlobal ? loadGlobalConfig() : loadConfig(ctx.cwd);
       let llamaUrl = process.env['LLAMA_CPP_URL'] || existingConfig?.llamaCppUrl || 'http://localhost:8080/v1';
 
       const piProviders = readPiLlamaCppProviders();
       if (piProviders.length === 1) {
         llamaUrl = piProviders[0]!.baseUrl;
-        ctx.ui.notify(`Using Pi llama.cpp provider: ${piProviders[0]!.name} (${llamaUrl})`, 'info');
       } else if (piProviders.length > 1) {
-        const providerList = piProviders.map((p, i) => `${i + 1}. ${p.name}  ${p.baseUrl}`).join('\n');
-        ctx.ui.notify(`Pi llama.cpp providers:\n${providerList}`, 'info');
-        const sel = await ctx.ui.input(`Select provider (1-${piProviders.length}) or paste a custom URL:`);
-        const trimmed = sel?.trim() ?? '';
-        if (trimmed.startsWith('http')) {
-          llamaUrl = trimmed;
-        } else {
-          const idx = parseInt(trimmed, 10) - 1;
-          if (idx >= 0 && idx < piProviders.length) llamaUrl = piProviders[idx]!.baseUrl;
-        }
+        // Use the first provider as the primary (config default); all are probed below.
+        llamaUrl = piProviders[0]!.baseUrl;
       } else if (!process.env['LLAMA_CPP_URL'] && !existingConfig?.llamaCppUrl) {
         const urlInput = await ctx.ui.input(`llama.cpp API URL [${llamaUrl}]:`);
         llamaUrl = urlInput?.trim() || llamaUrl;
       }
 
-      // ── 2. Discover all available local models ────────────────────────
-      // Always fetch the full list — never limit to what was previously
-      // configured, so newly loaded models always appear.
-      let discovered = readPiCachedModels(llamaUrl);
-      if (discovered.length > 0) {
-        ctx.ui.notify(`Found ${discovered.length} cached models from Pi for ${llamaUrl}`, 'info');
-      } else {
-        ctx.ui.setStatus('setup', '🔍 Discovering models...');
-        discovered = await discoverModels(llamaUrl);
-        ctx.ui.setStatus('setup', undefined);
-      }
+      // ── 2. Discover models from ALL Pi llama.cpp providers ───────────
+      // Each provider's models are tagged with their source baseUrl so the
+      // router can reach the right server even when multiple servers are configured.
+      const serversToProbe = piProviders.length > 0
+        ? piProviders
+        : [{ name: 'local', baseUrl: llamaUrl }];
 
-      // Mark any model already in the config so the user can see at a glance
-      // which ones are new vs already assigned.
       const configuredFilenames = new Set(
         Object.values(existingConfig?.models ?? {})
           .filter(p => p.provider === 'local')
@@ -785,31 +931,48 @@ export default function(pi: ExtensionAPI) {
           .filter(Boolean)
       );
 
+      const allDiscovered: Array<{ id: string; serverUrl: string; serverName: string }> = [];
+      ctx.ui.setStatus('setup', '🔍 Discovering models...');
+      for (const srv of serversToProbe) {
+        const cached = readPiCachedModels(srv.baseUrl);
+        const ids = cached.length > 0 ? cached : await discoverModels(srv.baseUrl);
+        for (const id of ids) allDiscovered.push({ id, serverUrl: srv.baseUrl, serverName: srv.name });
+      }
+      ctx.ui.setStatus('setup', undefined);
+
       let localEntries: SetupModelEntry[] = [];
-      if (discovered.length === 0) {
-        ctx.ui.notify('No models found at that URL. Enter model IDs manually.', 'warning');
+      if (allDiscovered.length === 0) {
+        ctx.ui.notify('No models found. Enter model IDs manually.', 'warning');
         const manual = await ctx.ui.input('Model IDs (comma-separated), or leave empty to cancel:');
         if (!manual?.trim()) return;
         localEntries = manual.split(',').map(s => s.trim()).filter(Boolean)
           .map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
       } else {
-        const listText = discovered.map((id, i) => {
-          const marker = configuredFilenames.has(id) ? ' *' : '';
-          return `${i + 1}. ${id}${marker}`;
+        const multiServer = serversToProbe.length > 1;
+        const listText = allDiscovered.map((m, i) => {
+          const marker = configuredFilenames.has(m.id) ? ' *' : '';
+          const tag = multiServer ? `  [${m.serverName}]` : '';
+          return `${i + 1}. ${m.id}${tag}${marker}`;
         }).join('\n');
         const note = configuredFilenames.size > 0 ? '  (* = already configured)' : '';
         ctx.ui.notify(`Available models:${note}\n${listText}`, 'info');
 
         const sel = await ctx.ui.input('Select models to include (e.g. "1,3") or Enter for all:');
-        const selectedIds = sel?.trim()
+        const selected = sel?.trim()
           ? sel.split(',').map(s => parseInt(s.trim(), 10) - 1)
-              .filter(i => i >= 0 && i < discovered.length).map(i => discovered[i]!)
-          : discovered;
-        if (selectedIds.length === 0) {
+              .filter(i => i >= 0 && i < allDiscovered.length).map(i => allDiscovered[i]!)
+          : allDiscovered;
+        if (selected.length === 0) {
           ctx.ui.notify('No valid selections. Setup cancelled.', 'warning');
           return;
         }
-        localEntries = selectedIds.map(id => ({ displayName: id, provider: 'local' as const, ggufFilename: id }));
+        localEntries = selected.map(m => ({
+          displayName: multiServer ? `${m.id}  [${m.serverName}]` : m.id,
+          provider: 'local' as const,
+          ggufFilename: m.id,
+          // Only set baseURL when the model lives on a non-primary server
+          baseURL: m.serverUrl !== llamaUrl ? m.serverUrl : undefined,
+        }));
       }
 
       // ── 3. Discover cloud models from Pi's configured providers ──────
@@ -825,16 +988,19 @@ export default function(pi: ExtensionAPI) {
           const apiKeyEnvVar = cp.baseUrl.includes('openrouter') ? 'OPENROUTER_API_KEY'
             : cp.baseUrl.includes('openai.com') ? 'OPENAI_API_KEY'
             : undefined;
-          const provider: 'openrouter' | 'openai' | 'custom' =
-            cp.baseUrl.includes('openrouter') ? 'openrouter'
-            : cp.baseUrl.includes('openai.com') ? 'openai'
-            : 'custom';
+          const provider: 'openrouter' | 'openai' =
+            cp.baseUrl.includes('openrouter') ? 'openrouter' : 'openai';
+          // Endpoints at non-standard URLs (vLLM, self-hosted OpenAI-compatible)
+          // need baseURL stored on the profile so the router calls the right server.
+          const isWellKnown = cp.baseUrl.includes('openrouter') || cp.baseUrl.includes('openai.com');
+          const entryBaseURL = isWellKnown ? undefined : cp.baseUrl;
           for (const m of fetched) {
             cloudEntries.push({
               displayName: `${m.id}  (${Math.round(m.contextLength / 1000)}k ctx)  [${cp.name}]`,
               provider,
               modelId: m.id,
               apiKeyEnvVar,
+              baseURL: entryBaseURL,
               contextLength: m.contextLength,
               maxOutputTokens: m.maxOutputTokens,
               reasoning: m.reasoning,
@@ -869,7 +1035,11 @@ export default function(pi: ExtensionAPI) {
       }
       const listText = listLines.join('\n');
 
-      const piModelInfo = readPiCachedModelInfo(llamaUrl);
+      // Merge cached model info from all probed servers so thinking/context data
+      // is available regardless of which server a model lives on.
+      const piModelInfo = new Map(serversToProbe.flatMap(srv =>
+        [...readPiCachedModelInfo(srv.baseUrl).entries()]
+      ));
 
       const models: Record<string, ModelProfile> = {};
       const routing: Partial<Record<TaskType, string>> = {};
@@ -909,6 +1079,7 @@ export default function(pi: ExtensionAPI) {
               name: chosenId,
               ggufFilename: chosenId,
               provider: 'local',
+              ...(entry.baseURL ? { baseURL: entry.baseURL } : {}),
               contextWindow: cached?.contextWindow ?? 128_000,
               maxOutputTokens: cached?.maxTokens ?? 32_768,
               architecture: arch,
@@ -930,6 +1101,7 @@ export default function(pi: ExtensionAPI) {
               modelId,
               provider: entry.provider,
               ...(entry.apiKeyEnvVar ? { apiKeyEnvVar: entry.apiKeyEnvVar } : {}),
+              ...(entry.baseURL ? { baseURL: entry.baseURL } : {}),
               contextWindow: entry.contextLength ?? 128_000,
               maxOutputTokens: entry.maxOutputTokens ?? 32_768,
               architecture: arch,
@@ -940,6 +1112,27 @@ export default function(pi: ExtensionAPI) {
         }
 
         routing[type] = key;
+
+        // sessionRefreshAfter is implement-specific — ask whenever the implement
+        // role is assigned (even if the model was already configured for another role).
+        if (type === 'implement') {
+          const profile = models[key]!;
+          const isLocal = profile.provider === 'local';
+          const defaultRefresh = profile.sessionRefreshAfter ?? (isLocal ? 2 : 4);
+          const refreshInput = await ctx.ui.input(
+            `Session refresh interval for "${profile.name}":\n` +
+            `  A new session is started every N reviewer rounds to reset the context window.\n` +
+            `  Lower = more resets (better for small local context windows).\n` +
+            `  Higher = fewer resets (better for frontier models with large context windows).\n` +
+            `  0 or blank = never reset.\n\n` +
+            `Refresh every N rounds [${defaultRefresh}]:`
+          );
+          const parsed = parseInt(refreshInput?.trim() || '', 10);
+          const refreshAfter = !refreshInput?.trim() ? defaultRefresh
+            : (isNaN(parsed) || parsed <= 0) ? Number.MAX_SAFE_INTEGER
+            : parsed;
+          models[key]!.sessionRefreshAfter = refreshAfter === Number.MAX_SAFE_INTEGER ? undefined : refreshAfter;
+        }
       }
 
       // ── 5. Save location ──────────────────────────────────────────────

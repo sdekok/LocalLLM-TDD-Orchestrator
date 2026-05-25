@@ -7,7 +7,7 @@ vi.mock('../../src/utils/url-validator.js', () => ({
   validateExternalUrl: vi.fn(),
 }));
 
-vi.mock('youtube-transcript/dist/youtube-transcript.esm.js', () => ({
+vi.mock('youtube-transcript', () => ({
   YoutubeTranscript: {
     fetchTranscript: vi.fn().mockResolvedValue([
       { text: 'Hello' },

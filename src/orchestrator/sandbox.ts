@@ -336,7 +336,7 @@ export class Sandbox {
       }
 
       // Resolve runtime-file conflicts automatically by keeping the base branch version.
-      const RUNTIME_PATHS = ['.tdd-workflow/state.json', '.tdd-workflow/logs'];
+      const RUNTIME_PATHS = ['.tdd-workflow/state.json', '.tdd-workflow/logs', '.pi-lens'];
       let autoResolved = 0;
       for (const f of RUNTIME_PATHS) {
         try {

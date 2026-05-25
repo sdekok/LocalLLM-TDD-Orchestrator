@@ -422,9 +422,15 @@ export async function runLensAnalysis(projectDir: string): Promise<string> {
 async function runLensGate(projectDir: string): Promise<GateResult> {
   const logger = getLogger();
   try {
-    // Use JS bridge to avoid tsc strictly checking pi-lens source inside node_modules
+    // Use a variable so esbuild cannot inline this module — it must remain a
+    // runtime dynamic import so the pre-built lens-bridge.js (with pi-lens
+    // clients bundled inside) is loaded from the same directory as this file.
+    // A literal './lens-bridge.js' would be inlined by esbuild, losing the
+    // pre-bundled pi-lens clients and breaking the module resolution.
     // @ts-ignore
-    const { getLensClients } = await import('./lens-bridge.js');
+    const bridgePath = './lens-bridge.js';
+    // @ts-ignore
+    const { getLensClients } = await import(bridgePath);
     const { TypeScriptClient, AstGrepClient } = await getLensClients();
 
     const tsClient = new TypeScriptClient();
@@ -493,6 +499,14 @@ async function runLensGate(projectDir: string): Promise<GateResult> {
  * Helper to get source files for analysis
  */
 async function getSourceFiles(projectDir: string): Promise<string[]> {
+  // Build / generated output directories — feeding these to the TS LSP crashes
+  // because they contain bundled JS without matching tsconfig sources.
+  const SKIP_DIRS = new Set([
+    'node_modules', '.git', 'dist', 'lib', 'coverage', 'tmp',
+    'build', 'out', 'storybook-static',
+    '.next', '.nuxt', '.svelte-kit', '.turbo', '.cache', '.parcel-cache',
+    '.vite', '.vercel', '.netlify', '.output',
+  ]);
   const walk = (dir: string): string[] => {
     let results: string[] = [];
     const list = fs.readdirSync(dir);
@@ -500,7 +514,7 @@ async function getSourceFiles(projectDir: string): Promise<string[]> {
       const fullPath = path.join(dir, file);
       const stat = fs.statSync(fullPath);
       if (stat && stat.isDirectory()) {
-        if (['node_modules', '.git', 'dist', 'lib', 'coverage', 'tmp'].includes(file)) continue;
+        if (SKIP_DIRS.has(file)) continue;
         results = results.concat(walk(fullPath));
       } else {
         if (file.endsWith('.ts') || file.endsWith('.js') || file.endsWith('.tsx') || file.endsWith('.jsx')) {
