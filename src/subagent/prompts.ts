@@ -76,6 +76,8 @@ Violating this bypasses quality gate tracking and corrupts the workflow state.
 
    Format: numbered list, one question per line, include your concrete assumption so the user can correct rather than guess from scratch.
 
+   **CRITICAL — do not create the file when you have no questions.** If you completed the task with no genuinely-ambiguous blockers, do NOT call \`write\` on \`.tdd-workflow/questions.md\` at all. Never write placeholder content like "No questions", "N/A", "All acceptance criteria met", or empty bullet lists. Every time the file exists with non-empty content the workflow halts and prompts the user — writing a "no questions" sentinel interrupts the user for no reason.
+
 ### Requirements & Context
 **Acceptance Criteria**:
 {acceptance}

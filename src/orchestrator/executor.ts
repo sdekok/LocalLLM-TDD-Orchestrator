@@ -200,6 +200,41 @@ function summarizeFeedbackHistory(
     .join('\n\n');
 }
 
+/**
+ * Detect "I have no questions" placeholder content the implementer sometimes
+ * writes to `.tdd-workflow/questions.md` despite the prompt telling it not to.
+ * Returns true when the file should be treated as if it were empty.
+ *
+ * Examples that should be filtered:
+ *   "(No questions — all acceptance criteria met.)"
+ *   "No questions."
+ *   "N/A"
+ *   "None"
+ *   bullet lists with no real questions ("- (none)" / "1. n/a")
+ */
+export function isNoQuestionsPlaceholder(text: string): boolean {
+  // Strip markdown bullets, numbering, surrounding punctuation/whitespace.
+  const stripped = text
+    .replace(/^[\s\-*•#>]+/gm, '')  // leading bullets/markers per line
+    .replace(/^\d+[.)]\s*/gm, '')   // ordered list markers
+    .replace(/[()[\]*_`]/g, '')     // surrounding punctuation
+    .trim();
+  if (!stripped) return true;
+  // Collapse whitespace and strip trailing punctuation for matching.
+  const normalised = stripped.replace(/\s+/g, ' ').replace(/[.!?…—-]+$/g, '').toLowerCase();
+  const sentinels = [
+    /^no questions?\b/,
+    /^no remaining questions?\b/,
+    /^none\b/,
+    /^n\/?a\b/,
+    /^nothing( to ask)?\b/,
+    /^all (acceptance )?criteria (met|satisfied)\b/,
+    /^no blockers\b/,
+    /^no ambiguities\b/,
+  ];
+  return sentinels.some(re => re.test(normalised));
+}
+
 export class WorkflowExecutor {
   private state: StateManager;
   private modelRouter: ModelRouter;
@@ -545,6 +580,16 @@ export class WorkflowExecutor {
       questions = fs.readFileSync(questionsPath, 'utf-8').trim();
       if (!questions) return null;
     } catch {
+      return null;
+    }
+
+    // Implementers sometimes write the file with a "no questions" sentinel
+    // ("(No questions — all acceptance criteria met.)", "N/A", an empty bullet
+    // list, etc.). The prompt now forbids this, but treat it as a no-op here
+    // too so an obedience lapse doesn't halt the workflow.
+    if (isNoQuestionsPlaceholder(questions)) {
+      getLogger().info(`[${label}] questions.md held a "no questions" placeholder — ignoring and deleting`);
+      try { fs.unlinkSync(questionsPath); } catch { /* non-fatal */ }
       return null;
     }
 
