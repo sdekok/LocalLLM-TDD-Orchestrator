@@ -17,7 +17,7 @@ function toolResult(content: any) {
   return { type: 'tool_result', content };
 }
 
-const BIG = 'x'.repeat(40_000); // ~10_000 tokens by char/4 heuristic
+const BIG = 'x'.repeat(40_000); // ~12_100 tokens at 3.3 chars/token
 
 describe('pruneContextMessages', () => {
   it('is a no-op when under budget', () => {
@@ -46,11 +46,15 @@ describe('pruneContextMessages', () => {
     expect(stats.stubbedBlocks).toBeGreaterThanOrEqual(1);
     // Old tool_result (index 2) should be stubbed
     expect(out[2].content[0].content).toMatch(/elided by context pruner/);
-    // Recent tool_result (index 6) — within last 4 messages — should be untouched
-    expect(out[6].content[0].content).toBe(BIG);
+    // Recent tool_result (index 6) — within last 4 messages — is NOT stubbed,
+    // but because it is oversized it is head+tail truncated, not kept verbatim.
+    expect(out[6].content[0].content).not.toBe(BIG);
+    expect(out[6].content[0].content).toMatch(/elided by context pruner/);
+    expect(out[6].content[0].content.length).toBeLessThan(BIG.length);
+    expect(stats.truncatedBlocks).toBeGreaterThanOrEqual(1);
   });
 
-  it('preserves the last keepRecentMessages verbatim', () => {
+  it('preserves recent text verbatim but truncates oversized recent tool_results', () => {
     const messages = [
       user([toolResult(BIG)]),
       assistant(text('a')),
@@ -60,11 +64,52 @@ describe('pruneContextMessages', () => {
       assistant(text('c')),
     ];
     const { messages: out } = pruneContextMessages(messages, 100, 2);
-    // Last 2 messages preserved
+    // Recent text is preserved verbatim
     expect(out[5].content[0].text).toBe('c');
-    expect(out[4].content[0].content).toBe(BIG);
+    // Recent oversized tool_result is truncated (capped), not verbatim
+    expect(out[4].content[0].content).not.toBe(BIG);
+    expect(out[4].content[0].content).toMatch(/elided/);
     // Older messages should have stubs
     expect(out[0].content[0].content).toMatch(/elided/);
+  });
+
+  it('truncates an oversized tool_result even when total is under budget', () => {
+    // Total is well under budget, but a single result dwarfs maxSingleResultTokens.
+    const messages = [
+      user('start'),
+      assistant(toolUse('bash', { cmd: 'npm test' })),
+      user([toolResult(BIG)]),
+      assistant(text('done')),
+    ];
+    // Budget huge so no stubbing; cap single results at 2000 tokens explicitly.
+    const { messages: out, stats } = pruneContextMessages(messages, 1_000_000, 2, 2_000);
+    expect(stats.stubbedBlocks).toBe(0);
+    expect(stats.truncatedBlocks).toBe(1);
+    expect(out[2].content[0].content).not.toBe(BIG);
+    expect(out[2].content[0].content).toMatch(/elided/);
+    // Roughly capped near the requested size (2000 tok ≈ 6600 chars + marker).
+    expect(out[2].content[0].content.length).toBeLessThan(8_000);
+  });
+
+  it('truncates oversized tool_result with array content', () => {
+    const messages = [
+      user('start'),
+      assistant(toolUse('read', { path: 'big.ts' })),
+      user([toolResult([{ type: 'text', text: BIG }])]),
+      assistant(text('done')),
+    ];
+    const { messages: out, stats } = pruneContextMessages(messages, 1_000_000, 2, 2_000);
+    expect(stats.truncatedBlocks).toBe(1);
+    expect(out[2].content[0].content[0].text).not.toBe(BIG);
+    expect(out[2].content[0].content[0].text).toMatch(/elided/);
+  });
+
+  it('does not mutate the input when truncating an oversized result', () => {
+    const big = toolResult(BIG);
+    const orig = user([big]);
+    const messages = [orig, assistant(text('a')), user('b'), assistant(text('c')), user('d')];
+    pruneContextMessages(messages, 1_000_000, 4, 2_000);
+    expect(orig.content[0].content).toBe(BIG);
   });
 
   it('does not mutate the input messages', () => {
@@ -88,9 +133,11 @@ describe('pruneContextMessages', () => {
       assistant(text('e')), // kept
     ];
     const { stats } = pruneContextMessages(messages, 11_000, 2);
-    // Should have stubbed at least 2 of the 3 old tool_results (each ~10k tok)
-    expect(stats.stubbedBlocks).toBeGreaterThanOrEqual(2);
+    // The 3 old oversized results get reduced via a mix of truncation (Pass 0)
+    // and full stubbing (Pass 1) until the total is back under budget.
+    expect(stats.stubbedBlocks + stats.truncatedBlocks).toBeGreaterThanOrEqual(2);
     expect(stats.totalAfter).toBeLessThanOrEqual(stats.totalBefore);
+    expect(stats.totalAfter).toBeLessThanOrEqual(11_000);
   });
 
   it('also stubs tool_use input if still over after tool_result pass', () => {

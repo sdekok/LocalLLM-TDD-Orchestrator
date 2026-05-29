@@ -355,12 +355,27 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     logger.info('[SUBAGENT FACTORY] Registered thinking-filter extension');
   }
 
-  // Context pruner: defaults to 70% of the model's context window. Set
-  // `contextBudgetTokens: 0` on a model profile to opt out.
-  const budgetTokens = profile.contextBudgetTokens ?? Math.floor(profile.contextWindow * 0.7);
+  // Context pruner budget. The pruner only sees the conversation history, but
+  // the actual request the provider receives is:
+  //
+  //   system prompt + tool schemas + history + reserved output
+  //
+  // so the budget for history must subtract everything else from the window,
+  // or the implementer overflows even while the pruner believes it is under
+  // budget. We reserve the system prompt (estimated from its length), a flat
+  // allowance for the tool JSON schemas, and the model's max output, then apply
+  // an 0.85 headroom factor for residual token-estimate error.
+  //
+  // Set `contextBudgetTokens` explicitly on a profile to override this, or 0 to
+  // opt out of pruning entirely.
+  const sysPromptTokens = Math.ceil(populatedPrompt.length / CHARS_PER_TOKEN);
+  const TOOL_SCHEMA_RESERVE = 4_000;
+  const reserve = profile.maxOutputTokens + sysPromptTokens + TOOL_SCHEMA_RESERVE;
+  const budgetTokens = profile.contextBudgetTokens
+    ?? Math.max(8_000, Math.floor((profile.contextWindow - reserve) * 0.85));
   if (budgetTokens > 0) {
     extensionFactories.push(createContextPruner(options.taskType, budgetTokens));
-    logger.info(`[SUBAGENT FACTORY] Registered context-pruner extension (budget=${budgetTokens} tok, window=${profile.contextWindow})`);
+    logger.info(`[SUBAGENT FACTORY] Registered context-pruner extension (budget=${budgetTokens} tok, window=${profile.contextWindow}, reserve=${reserve} [out=${profile.maxOutputTokens}, sys≈${sysPromptTokens}, schemas=${TOOL_SCHEMA_RESERVE}])`);
   } else {
     logger.info(`[SUBAGENT FACTORY] Context pruner disabled (contextBudgetTokens=0)`);
   }
@@ -501,40 +516,49 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
 
 const TOOL_RESULT_STUB = '[tool result elided by context pruner — re-run the tool if you need it]';
 
+// Tokens-per-character heuristic. English prose is ~4 chars/token, but the
+// implementer's history is dominated by source code, JSON, and test logs,
+// which tokenize closer to 3.3 chars/token. Using 4 systematically UNDERcounts
+// that content, so the pruner believed it was under budget while the real
+// request overflowed the window. 3.3 is the conservative middle.
+export const CHARS_PER_TOKEN = 3.3;
+
 export interface PruneStats {
   totalBefore: number;
   totalAfter: number;
   stubbedBlocks: number;
+  /** Oversized tool_results that were head+tail truncated (incl. protected ones). */
+  truncatedBlocks: number;
 }
 
 function estimateBlockTokens(block: any): number {
   if (!block || typeof block !== 'object') return 0;
   if (block.type === 'text' && typeof block.text === 'string') {
-    return Math.ceil(block.text.length / 4);
+    return Math.ceil(block.text.length / CHARS_PER_TOKEN);
   }
   if (block.type === 'thinking' && typeof block.thinking === 'string') {
-    return Math.ceil(block.thinking.length / 4);
+    return Math.ceil(block.thinking.length / CHARS_PER_TOKEN);
   }
   if (block.type === 'tool_use') {
     const inputStr = block.input ? JSON.stringify(block.input) : '';
-    return Math.ceil((inputStr.length + (typeof block.name === 'string' ? block.name.length : 0)) / 4);
+    return Math.ceil((inputStr.length + (typeof block.name === 'string' ? block.name.length : 0)) / CHARS_PER_TOKEN);
   }
   if (block.type === 'tool_result') {
-    if (typeof block.content === 'string') return Math.ceil(block.content.length / 4);
+    if (typeof block.content === 'string') return Math.ceil(block.content.length / CHARS_PER_TOKEN);
     if (Array.isArray(block.content)) {
       return block.content.reduce((sum: number, c: any) => {
-        if (typeof c === 'string') return sum + Math.ceil(c.length / 4);
-        if (c?.type === 'text' && typeof c.text === 'string') return sum + Math.ceil(c.text.length / 4);
-        return sum + Math.ceil(JSON.stringify(c).length / 4);
+        if (typeof c === 'string') return sum + Math.ceil(c.length / CHARS_PER_TOKEN);
+        if (c?.type === 'text' && typeof c.text === 'string') return sum + Math.ceil(c.text.length / CHARS_PER_TOKEN);
+        return sum + Math.ceil(JSON.stringify(c).length / CHARS_PER_TOKEN);
       }, 0);
     }
   }
-  return Math.ceil(JSON.stringify(block).length / 4);
+  return Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN);
 }
 
 function estimateMessageTokens(msg: any): number {
   if (!msg) return 0;
-  if (typeof msg.content === 'string') return Math.ceil(msg.content.length / 4);
+  if (typeof msg.content === 'string') return Math.ceil(msg.content.length / CHARS_PER_TOKEN);
   if (Array.isArray(msg.content)) {
     return msg.content.reduce((sum: number, b: any) => sum + estimateBlockTokens(b), 0);
   }
@@ -542,10 +566,73 @@ function estimateMessageTokens(msg: any): number {
 }
 
 /**
- * Walk oldest→newest stubbing tool_result content (then tool_use input as a
- * second pass) until the total estimated tokens drop under `budgetTokens`.
- * The last `keepRecentMessages` messages are preserved verbatim so the model
- * always has fresh ground truth (latest user turn, latest tool roundtrip).
+ * Head+tail truncate a string to roughly `maxTokens`, keeping the start and end
+ * (where the signal usually is) and dropping the middle. Returns the original
+ * string unchanged if it already fits.
+ */
+function truncateText(s: string, maxTokens: number): string {
+  const maxChars = Math.floor(maxTokens * CHARS_PER_TOKEN);
+  if (s.length <= maxChars) return s;
+  const keep = Math.floor(maxChars / 2);
+  const omittedTokens = Math.ceil((s.length - keep * 2) / CHARS_PER_TOKEN);
+  const marker = `\n…[${omittedTokens} tokens elided by context pruner — re-run the tool for full output]…\n`;
+  return s.slice(0, keep) + marker + s.slice(s.length - keep);
+}
+
+/**
+ * Cap a single tool_result block to `maxTokens` via head+tail truncation,
+ * mutating the (already-cloned) block in place. Returns true if it truncated.
+ * Handles both string content and the array-of-text-blocks shape; the text
+ * budget is distributed proportionally across text blocks.
+ */
+function truncateToolResultBlock(block: any, maxTokens: number): boolean {
+  if (!block || block.type !== 'tool_result') return false;
+  if (estimateBlockTokens(block) <= maxTokens) return false;
+
+  if (typeof block.content === 'string') {
+    block.content = truncateText(block.content, maxTokens);
+    return true;
+  }
+  if (Array.isArray(block.content)) {
+    const totalTextTokens = block.content.reduce(
+      (sum: number, c: any) =>
+        c?.type === 'text' && typeof c.text === 'string'
+          ? sum + Math.ceil(c.text.length / CHARS_PER_TOKEN)
+          : sum,
+      0,
+    );
+    if (totalTextTokens <= maxTokens) return false;
+    let truncated = false;
+    // Rebuild the array with fresh objects so we never mutate the caller's
+    // (shallow-cloned) inner text blocks.
+    block.content = block.content.map((c: any) => {
+      if (c?.type !== 'text' || typeof c.text !== 'string') return c;
+      const blockTokens = Math.ceil(c.text.length / CHARS_PER_TOKEN);
+      const share = Math.max(1, Math.floor(maxTokens * (blockTokens / totalTextTokens)));
+      const newText = truncateText(c.text, share);
+      if (newText === c.text) return c;
+      truncated = true;
+      return { ...c, text: newText };
+    });
+    return truncated;
+  }
+  return false;
+}
+
+/**
+ * Bring the conversation history under `budgetTokens`:
+ *
+ *  - Pass 0 caps any single oversized tool_result — INCLUDING ones inside the
+ *    protected recent window — to `maxSingleResultTokens` via head+tail
+ *    truncation. This is the guard against a fresh giant test/build dump or
+ *    file read overflowing the window on its own, which full-message stubbing
+ *    can't catch because the recent window is otherwise preserved verbatim.
+ *  - Pass 1 walks oldest→newest stubbing whole tool_result payloads.
+ *  - Pass 2 stubs tool_use input if still over.
+ *
+ * The last `keepRecentMessages` messages keep their structure (latest user
+ * turn, latest tool roundtrip) so the model still has fresh ground truth; only
+ * their oversized tool_results are capped.
  *
  * Returns a new array; the input is not mutated.
  */
@@ -553,20 +640,34 @@ export function pruneContextMessages(
   messages: any[],
   budgetTokens: number,
   keepRecentMessages = 4,
+  maxSingleResultTokens = Math.max(4_000, Math.floor(budgetTokens / 4)),
 ): { messages: any[]; stats: PruneStats } {
   let totalBefore = 0;
   for (const m of messages) totalBefore += estimateMessageTokens(m);
 
-  if (totalBefore <= budgetTokens || messages.length <= keepRecentMessages) {
-    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0 } };
+  const protectStart = Math.max(0, messages.length - keepRecentMessages);
+
+  // Is any tool_result (anywhere) oversized enough to need single-result
+  // truncation? This can fire even when the total is under budget.
+  let hasOversized = false;
+  for (let i = 0; i < messages.length && !hasOversized; i++) {
+    const msg = messages[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type === 'tool_result' && estimateBlockTokens(block) > maxSingleResultTokens) {
+        hasOversized = true;
+        break;
+      }
+    }
   }
 
-  const protectStart = Math.max(0, messages.length - keepRecentMessages);
-  let stubbedBlocks = 0;
-  let current = totalBefore;
+  if ((totalBefore <= budgetTokens && !hasOversized) || messages.length <= keepRecentMessages) {
+    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0, truncatedBlocks: 0 } };
+  }
 
-  // Quick scan: if nothing in the prunable range is a tool_use/tool_result,
-  // pruning can't help — return the original array unchanged for identity.
+  // Quick scan: if nothing in the prunable range is a tool_use/tool_result and
+  // there is no oversized result anywhere, pruning can't help — return the
+  // original array unchanged for identity.
   let hasPrunable = false;
   for (let i = 0; i < protectStart && !hasPrunable; i++) {
     const msg = messages[i];
@@ -578,15 +679,34 @@ export function pruneContextMessages(
       }
     }
   }
-  if (!hasPrunable) {
-    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0 } };
+  if (!hasPrunable && !hasOversized) {
+    return { messages, stats: { totalBefore, totalAfter: totalBefore, stubbedBlocks: 0, truncatedBlocks: 0 } };
   }
+
+  let stubbedBlocks = 0;
+  let truncatedBlocks = 0;
+  let current = totalBefore;
 
   // Clone shallowly so the caller's array is untouched.
   const result = messages.map(m => {
     if (!m || !Array.isArray(m.content)) return m;
     return { ...m, content: m.content.map((b: any) => ({ ...b })) };
   });
+
+  // Pass 0: cap any single oversized tool_result (protected window included).
+  for (let i = 0; i < result.length; i++) {
+    const msg = result[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type === 'tool_result' && block.content !== TOOL_RESULT_STUB) {
+        const before = estimateBlockTokens(block);
+        if (truncateToolResultBlock(block, maxSingleResultTokens)) {
+          current -= (before - estimateBlockTokens(block));
+          truncatedBlocks++;
+        }
+      }
+    }
+  }
 
   // Pass 1: stub tool_result content (biggest payloads — bash/read output).
   for (let i = 0; i < protectStart && current > budgetTokens; i++) {
@@ -621,7 +741,7 @@ export function pruneContextMessages(
     }
   }
 
-  return { messages: result, stats: { totalBefore, totalAfter: current, stubbedBlocks } };
+  return { messages: result, stats: { totalBefore, totalAfter: current, stubbedBlocks, truncatedBlocks } };
 }
 
 /** Wraps pruneContextMessages as a Pi SDK extension factory. */
@@ -631,9 +751,9 @@ function createContextPruner(taskType: TaskType, budgetTokens: number): Extensio
     let lastLogTokens = 0;
     pi.on('context', (event) => {
       const { messages: pruned, stats } = pruneContextMessages(event.messages, budgetTokens);
-      if (stats.stubbedBlocks > 0) {
+      if (stats.stubbedBlocks > 0 || stats.truncatedBlocks > 0) {
         log.warn(
-          `[CONTEXT PRUNER ${taskType}] stubbed ${stats.stubbedBlocks} block(s); ` +
+          `[CONTEXT PRUNER ${taskType}] stubbed ${stats.stubbedBlocks}, truncated ${stats.truncatedBlocks} block(s); ` +
           `~${stats.totalBefore} → ${stats.totalAfter} tok (budget ${budgetTokens})`,
         );
         lastLogTokens = stats.totalAfter;
