@@ -244,6 +244,84 @@ export function getCoverageTestCommand(projectDir: string): string {
 }
 
 /**
+ * True if `projectDir` is, or sits within, an Nx workspace. We walk up a few
+ * levels because the orchestrator's projectDir can be a sub-project rather than
+ * the monorepo root. Used to prefer `nx affected` commands so the build/lint
+ * gates cover the CONSUMERS of a changed lib, not just the edited project.
+ */
+export function isNxWorkspace(projectDir: string): boolean {
+  let dir = projectDir;
+  for (let i = 0; i < 6 && dir !== path.dirname(dir); i++) {
+    if (fs.existsSync(path.join(dir, 'nx.json'))) return true;
+    dir = path.dirname(dir);
+  }
+  return false;
+}
+
+function readTddConfig(projectDir: string): Record<string, unknown> {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    return (pkg.tddConfig as Record<string, unknown>) ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolve the BUILD command for the build quality gate — the authoritative
+ * type-check. A real build runs the production tsconfig(s) with strict flags
+ * AND the bundler, catching type-only re-export (MISSING_EXPORT), declaration
+ * emit, and consumer breakage that a bare `tsc --noEmit` on a loose root config
+ * cannot see.
+ *
+ * Precedence: explicit `tddConfig.buildCommand` → Nx affected build →
+ * package.json `build` script → null (caller falls back to `tsc --noEmit`).
+ */
+export function getBuildCommand(projectDir: string): string | null {
+  const cfg = readTddConfig(projectDir);
+  if (typeof cfg['buildCommand'] === 'string' && (cfg['buildCommand'] as string).trim()) {
+    return (cfg['buildCommand'] as string).trim();
+  }
+  if (isNxWorkspace(projectDir)) return 'npx nx affected -t build';
+  const pm = detectPackageManager(projectDir);
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    if (pkg.scripts?.build) return `${pm} run build`;
+  } catch { /* ignore */ }
+  return null;
+}
+
+/**
+ * Resolve the LINT command for the lint quality gate. Lint is the only gate
+ * that catches dependency-hygiene (undeclared deps) and broken-config failures.
+ *
+ * Precedence: `tddConfig.lintCommand` → Nx affected lint → package.json `lint`
+ * script → eslint directly (flat-config-aware) → null (no lint gate).
+ *
+ * Note: `--ext` is a no-op under flat config (`eslint.config.*`), which selects
+ * files itself; we only pass it for legacy `.eslintrc*` configs.
+ */
+export function getLintCommand(projectDir: string): string | null {
+  const cfg = readTddConfig(projectDir);
+  if (typeof cfg['lintCommand'] === 'string' && (cfg['lintCommand'] as string).trim()) {
+    return (cfg['lintCommand'] as string).trim();
+  }
+  if (isNxWorkspace(projectDir)) return 'npx nx affected -t lint';
+  const pm = detectPackageManager(projectDir);
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    if (pkg.scripts?.lint) return `${pm} run lint`;
+  } catch { /* ignore */ }
+  const flat = ['eslint.config.js', 'eslint.config.mjs', 'eslint.config.cjs', 'eslint.config.ts']
+    .some(f => fs.existsSync(path.join(projectDir, f)));
+  const legacy = ['.eslintrc', '.eslintrc.js', '.eslintrc.cjs', '.eslintrc.json', '.eslintrc.yml', '.eslintrc.yaml']
+    .some(f => fs.existsSync(path.join(projectDir, f)));
+  if (flat) return 'npx eslint . --max-warnings 0';
+  if (legacy) return 'npx eslint . --ext .ts,.js --max-warnings 0';
+  return null;
+}
+
+/**
  * Factory to detect and create the appropriate runner
  */
 export function getTestRunner(projectDir: string): TestRunner | null {

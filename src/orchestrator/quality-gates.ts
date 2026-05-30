@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
 import { execFileAsync, DEFAULT_MAX_BUFFER } from '../utils/exec.js';
-import { getTestRunner, type TestMetrics, type CoverageMetrics, type TestResult } from './test-runner.js';
+import { getTestRunner, getBuildCommand, getLintCommand, type TestMetrics, type CoverageMetrics, type TestResult } from './test-runner.js';
 
 export interface GateResult {
   gate: string;
@@ -78,6 +78,36 @@ export function extractErrorSignatures(gateName: string, output: string): Set<st
           if (sig.includes(' > ') || /\.(test|spec)\.[cm]?[jt]sx?\b/.test(sig)) {
             out.add(sig);
           }
+        }
+      }
+      return out;
+    }
+    case 'build': {
+      // Build output is heterogeneous: tsc diagnostics, bundler errors
+      // (rollup/rolldown MISSING_EXPORT), esbuild errors, and Nx task wrappers.
+      // Fingerprint the structured forms (dropping line/col + ANSI + durations)
+      // so a shifted line or a slower run isn't seen as a new error.
+      const stripAnsi = (s: string) => s.replace(/\[[0-9;]*m/g, '');
+      const out = new Set<string>();
+      for (const raw of lines) {
+        const l = stripAnsi(raw);
+        // tsc: "src/foo.ts(12,34): error TS2345: ..."
+        const ts = l.match(/^(.+\.[cm]?[jt]sx?)\((\d+),(\d+)\): (?:error|warning) (TS\d+): (.+)$/);
+        if (ts) { out.add(`${ts[1]}:${ts[4]}:${ts[5]}`); continue; }
+        // rollup / rolldown: '"X" is not exported by "Y"' (the type-only re-export trap)
+        const exp = l.match(/["']([^"']+)["']\s+is not exported by\s+["']([^"']+)["']/i);
+        if (exp) { out.add(`missing-export:${exp[2]}:${exp[1]}`); continue; }
+        // esbuild: "src/x.ts:10:5: ERROR: message"
+        const esb = l.match(/^(.+?):\d+:\d+: (?:ERROR|error):?\s*(.+)$/);
+        if (esb) { out.add(`${esb[1]}:${esb[2]}`); continue; }
+      }
+      // Fallback: if no structured signature matched but the output clearly
+      // errored, fingerprint error/fail lines (minus trailing durations) so a
+      // genuine failure isn't mistaken for "no errors".
+      if (out.size === 0) {
+        for (const raw of lines) {
+          const l = stripAnsi(raw).replace(/\s+\d+(?:\.\d+)?\s*m?s\s*$/, '').trim();
+          if (l && /error|fail|cannot find|not exported|MISSING_EXPORT/i.test(l)) out.add(l);
         }
       }
       return out;
@@ -218,11 +248,22 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   let testMetrics: TestMetrics | undefined;
   let coverageMetrics: CoverageMetrics | undefined;
 
-  // Gate 1: TypeScript compilation (BLOCKING)
-  // If Lens passed, we still run full TSC for final safety until Lens is fully proven
-  const tsconfigPath = path.join(projectDir, 'tsconfig.json');
-  if (fs.existsSync(tsconfigPath)) {
-    gates.push(await runGate('typescript', ['npx', 'tsc', '--noEmit'], projectDir, true, 60_000));
+  // Gate 1: Build / type-check (BLOCKING)
+  // A real build is the authoritative type-check: it runs the production
+  // tsconfig(s) with strict flags AND the bundler, catching type-only
+  // re-export failures (MISSING_EXPORT), declaration emit, and consumer
+  // breakage that `tsc --noEmit` against a loose root tsconfig misses. In an
+  // Nx workspace getBuildCommand resolves to `nx affected -t build` so the
+  // CONSUMERS of a changed lib are built too. We only fall back to a bare
+  // `tsc --noEmit` when no build command can be resolved.
+  const buildCommand = getBuildCommand(projectDir);
+  if (buildCommand) {
+    gates.push(await runGate('build', splitCommand(buildCommand), projectDir, true, 300_000));
+  } else {
+    const tsconfigPath = path.join(projectDir, 'tsconfig.json');
+    if (fs.existsSync(tsconfigPath)) {
+      gates.push(await runGate('typescript', ['npx', 'tsc', '--noEmit'], projectDir, true, 60_000));
+    }
   }
 
   // Gate 2: Tests pass (BLOCKING)
@@ -279,12 +320,14 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
     logger.warn('No test runner detected — skipping test gate');
   }
 
-  // Gate 3: Lint (NON-BLOCKING)
-  const eslintConfig = ['.eslintrc', '.eslintrc.js', '.eslintrc.json', '.eslintrc.yml', 'eslint.config.js', 'eslint.config.mjs'].some(
-    (f) => fs.existsSync(path.join(projectDir, f))
-  );
-  if (eslintConfig) {
-    gates.push(await runGate('lint', ['npx', 'eslint', '.', '--ext', '.ts,.js', '--max-warnings', '0'], projectDir, false, 30_000));
+  // Gate 3: Lint (BLOCKING — but scoped to NEW errors via the baseline diff in
+  // the executor, so a project's pre-existing lint debt never traps the loop).
+  // Lint is the only gate that catches dependency-hygiene (undeclared deps) and
+  // broken-config failures. getLintCommand resolves an Nx/script/eslint command
+  // and is flat-config-aware (omits the dead `--ext` flag under eslint.config.*).
+  const lintCommand = getLintCommand(projectDir);
+  if (lintCommand) {
+    gates.push(await runGate('lint', splitCommand(lintCommand), projectDir, true, 120_000));
   }
 
   // Gate 4: File safety (BLOCKING)
@@ -321,6 +364,18 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   }
 
   return { gates, allBlockingPassed, testMetrics, coverageMetrics, reportPath };
+}
+
+/**
+ * Split a resolved command string (e.g. "npx nx affected -t build") into the
+ * [program, ...args] tuple runGate expects. We deliberately split on whitespace
+ * rather than going through a shell so execFile keeps its no-shell injection
+ * safety — the resolved commands never need shell features (pipes, globs, etc.).
+ */
+export function splitCommand(cmd: string): [string, ...string[]] {
+  const parts = cmd.trim().split(/\s+/).filter(Boolean);
+  const [program, ...args] = parts;
+  return [program ?? '', ...args];
 }
 
 /**

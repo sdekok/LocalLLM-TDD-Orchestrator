@@ -18,10 +18,17 @@ vi.mock('../../src/utils/logger.js', () => ({
   })
 }));
 
-// Mock modules used in runQualityGates
-vi.mock('../../src/orchestrator/test-runner.js', () => ({
-  getTestRunner: () => null
-}));
+// Mock modules used in runQualityGates. getTestRunner is stubbed to null (no
+// real test run); the build/lint command resolvers are pure file-reads, so we
+// keep their real implementations — in these tmp projects (no build/lint
+// script, no eslint config, not Nx) they resolve to null and add no gate.
+vi.mock('../../src/orchestrator/test-runner.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/orchestrator/test-runner.js')>();
+  return {
+    ...actual,
+    getTestRunner: () => null,
+  };
+});
 
 describe('Lens Analysis (runLensAnalysis)', () => {
   const projectDir = '/tmp/test-project';

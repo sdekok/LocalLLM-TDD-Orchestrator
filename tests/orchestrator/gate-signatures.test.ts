@@ -84,6 +84,40 @@ describe('extractErrorSignatures — tests (vitest)', () => {
   });
 });
 
+describe('extractErrorSignatures — build', () => {
+  it('fingerprints tsc errors, dropping line/col', () => {
+    const a = extractErrorSignatures('build', 'src/a.ts(12,5): error TS2345: Argument of type X.');
+    const b = extractErrorSignatures('build', 'src/a.ts(99,1): error TS2345: Argument of type X.');
+    expect([...a]).toEqual([...b]);
+    expect(a.has('src/a.ts:TS2345:Argument of type X.')).toBe(true);
+  });
+
+  it('fingerprints rollup/rolldown MISSING_EXPORT independent of line numbers', () => {
+    const out = extractErrorSignatures(
+      'build',
+      '[plugin rollup] "Foo" is not exported by "src/types.ts", imported by "src/app.ts".',
+    );
+    expect([...out].some(s => s.startsWith('missing-export:'))).toBe(true);
+  });
+
+  it('fingerprints esbuild errors, dropping position', () => {
+    const a = extractErrorSignatures('build', 'src/x.ts:10:5: ERROR: Could not resolve "./missing"');
+    const b = extractErrorSignatures('build', 'src/x.ts:80:2: ERROR: Could not resolve "./missing"');
+    expect([...a]).toEqual([...b]);
+  });
+
+  it('falls back to error lines (minus durations) when nothing structured matches', () => {
+    const a = extractErrorSignatures('build', 'Build failed in 1200ms');
+    const b = extractErrorSignatures('build', 'Build failed in 30ms');
+    expect([...a]).toEqual([...b]);
+    expect(a.size).toBe(1);
+  });
+
+  it('returns an empty set when the build output has no errors', () => {
+    expect(extractErrorSignatures('build', 'Done in 88ms\n  dist/index.js 2mb').size).toBe(0);
+  });
+});
+
 describe('extractErrorSignatures — lint (eslint)', () => {
   const sample = [
     'src/auth.ts:12:5  error  Unexpected var  no-var',
