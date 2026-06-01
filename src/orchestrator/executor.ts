@@ -79,6 +79,20 @@ const IDLE_NUDGE_MS               =  5 * 60 * 1000;
  */
 const SESSION_REFRESH_AFTER = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
+
+/**
+ * Thrown when the implementer model produces no response at all (no provider
+ * output) — i.e. the endpoint is unreachable or the configured model id doesn't
+ * resolve to a live model. This is a connectivity/config problem, NOT a task
+ * failure, so the workflow halts cleanly without marking the task failed or
+ * nudging into the void.
+ */
+export class ModelUnreachableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ModelUnreachableError';
+  }
+}
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
 const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
@@ -263,6 +277,19 @@ export class WorkflowExecutor {
   private pauseRequested = false;
   private stopRequested = false;
   /**
+   * Set when a subagent model produced no response (ModelUnreachableError).
+   * Carries the human-readable reason for the connectivity-halt chat message.
+   */
+  private modelUnreachableReason: string | null = null;
+
+  /**
+   * UI notifier passed to subagent sessions so model-resolution warnings
+   * (e.g. fallback to Pi's default model) reach the user's chat, not just logs.
+   */
+  private notifyUi = (message: string, _level?: 'info' | 'warning' | 'error'): void => {
+    this.chatMessage?.(message, 'tdd-orchestrator');
+  };
+  /**
    * The currently-running implementer session (if any), exposed so that
    * stop/pause can dispose it from outside the task loop. Assigned/cleared
    * at session lifetime boundaries inside processQueue.
@@ -382,7 +409,7 @@ export class WorkflowExecutor {
     session: any,
     label: string,
     messageType: string,
-  ): { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } {
+  ): { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } {
     const chatMessage = this.chatMessage;
     const logger = getLogger();
     const CHUNK_SIZE = 800;
@@ -390,6 +417,11 @@ export class WorkflowExecutor {
     let turnText = '';
     let disposed = false;
     let lastEventTime = Date.now();
+    // True once the model has produced ANY output this turn (thinking, text, or a
+    // tool call). Reset per turn via resetTurnText(). Used to distinguish "model
+    // is working but not DONE" from "model never responded" (unreachable endpoint
+    // / unresolved model) so the latter fails fast instead of nudging.
+    let modelActivitySeen = false;
 
     // Per-turn thinking-loop detection. The cross-attempt similarity detector
     // catches loops between attempts; this catches loops WITHIN a single thinking
@@ -462,6 +494,7 @@ export class WorkflowExecutor {
       lastEventTime = Date.now();
 
       if (event.type === 'message_update') {
+        modelActivitySeen = true;
         const ae = event.assistantMessageEvent;
         if (ae?.type === 'thinking_start') {
           thinkingBuffer = '';
@@ -495,6 +528,7 @@ export class WorkflowExecutor {
       } else if (event.type === 'message_end'
                  && event.message?.role === 'assistant'
                  && !turnText) {
+        modelActivitySeen = true;
         // Fallback for non-streaming / non-reasoning sessions that never
         // emit text_end but do publish the final content array.
         const text = event.message.content?.find((c: any) => c.type === 'text')?.text;
@@ -507,6 +541,7 @@ export class WorkflowExecutor {
         }
         resetTurnProgress();
       } else if (event.type === 'tool_execution_start') {
+        modelActivitySeen = true;
         // Tool calls are progress — clear loop state.
         resetTurnProgress();
         const toolName: string = event.toolName;
@@ -544,10 +579,11 @@ export class WorkflowExecutor {
 
     return {
       getTurnText: () => turnText,
-      resetTurnText: () => { turnText = ''; },
+      resetTurnText: () => { turnText = ''; modelActivitySeen = false; },
       getLastEventTime: () => lastEventTime,
       hasThinkingLoop: () => thinkingLoopDetected,
       clearThinkingLoop: () => { resetTurnProgress(); },
+      sawModelActivity: () => modelActivitySeen,
       dispose: () => { disposed = true; },
     };
   }
@@ -875,6 +911,7 @@ export class WorkflowExecutor {
     // could otherwise linger and immediately halt the new workflow.
     this.pauseRequested = false;
     this.stopRequested = false;
+    this.modelUnreachableReason = null;
 
     // If a previous workflow left the repo on a tdd-workflow/* branch, switch to the
     // correct base before we do anything. If a feature branch was created for this
@@ -959,6 +996,10 @@ export class WorkflowExecutor {
       const slug = workflowSlug(this.state.getState().original_request);
       const branchName = `tdd-workflow/${slug}/${task.id.substring(0, 12)}`;
       let approved = false;
+      // Set when the implementer model produces no response (ModelUnreachableError).
+      // Gates the pass/attempt loops so we don't re-enter and recreate the session,
+      // and triggers a clean connectivity-halt (task left pending, not failed).
+      let haltSession = false;
       // Seed with any feedback preserved from a prior run (resume mode).
       let feedback = task.feedback || '';
       // In resume mode, preserve the existing task branch for the ENTIRE task
@@ -992,7 +1033,7 @@ export class WorkflowExecutor {
       // whole lifetime of the session, with a per-turn text accumulator that we reset
       // before each prompt() call. This avoids the multi-subscribe bug where text
       // accumulated across turns and duplicated chat output.
-      let implementerHandle: { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } | null = null;
+      let implementerHandle: { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } | null = null;
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
@@ -1002,7 +1043,7 @@ export class WorkflowExecutor {
         const feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }> = [];
         // Two-pass outer loop: pass 0 = normal attempts, pass 1 = arbiter-granted extra rounds.
         let arbiterExtraRounds = 0;
-        for (let pass = 0; pass <= 1 && !approved; pass++) {
+        for (let pass = 0; pass <= 1 && !approved && !haltSession; pass++) {
           if (pass === 1 && arbiterExtraRounds === 0) break;
 
           // Reset the cross-attempt similarity baseline when entering pass 1.
@@ -1021,7 +1062,7 @@ export class WorkflowExecutor {
           const attemptStart = pass === 0 ? startAttempt : MAX_ATTEMPTS + 1;
           const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : MAX_ATTEMPTS + arbiterExtraRounds;
 
-          for (let attempt = attemptStart; attempt <= attemptEnd && !approved; attempt++) {
+          for (let attempt = attemptStart; attempt <= attemptEnd && !approved && !haltSession; attempt++) {
             const totalMax = attemptEnd; // used for chat messages
 
         logger.info(`Attempt ${attempt}/${totalMax}`);
@@ -1107,6 +1148,7 @@ export class WorkflowExecutor {
                 systemPrompt: IMPLEMENTER_PROMPT,
                 cwd: this.state.projectDir,
                 modelRouter: this.modelRouter,
+                notify: this.notifyUi,
                 taskMetadata: {
                   acceptance: task.acceptance,
                   security: task.security,
@@ -1353,12 +1395,28 @@ export class WorkflowExecutor {
               // Interrupt check after each prompt returns: pause + stop both
               // bail out of the nudge loop. Stop additionally throws (caught
               // by the outer try/catch which handles session disposal + rollback).
+              // These take priority over the no-response guard below — a user
+              // interrupt is intentional, not a connectivity failure.
               if (this.stopRequested) {
                 throw new Error('__STOP_REQUESTED__');
               }
               if (this.pauseRequested) break;
 
               if (/^DONE:/im.test(handle.getTurnText())) break;
+
+              // Fast-fail: a turn that produced NO model output at all — no text,
+              // no tool calls, no thinking — means the provider was never reached
+              // (or errored before emitting anything): the endpoint is down or the
+              // configured model id doesn't resolve. That's a connectivity/config
+              // problem, not a task to retry, so halt the whole session instead of
+              // nudging an empty void up to MAX_NUDGES times.
+              if (!handle.sawModelActivity() && !handle.getTurnText().trim()) {
+                throw new ModelUnreachableError(
+                  `Implementer model produced no response for task ${task.id} ` +
+                  `(no provider output on attempt ${attempt}, nudge ${nudge}). ` +
+                  `The model endpoint may be down, or the configured model id may not match what it serves.`,
+                );
+              }
 
               if (nudge < MAX_NUDGES) {
                 logger.info(`[${task.id}] Implementer did not signal DONE — nudging (${nudge + 1}/${MAX_NUDGES})`);
@@ -1596,6 +1654,7 @@ export class WorkflowExecutor {
               systemPrompt: REVIEWER_PROMPT,
               cwd: this.state.projectDir,
               modelRouter: this.modelRouter,
+              notify: this.notifyUi,
               tools: 'review'
             });
             const reviewerHandle = this.subscribeToSession(reviewerSession, `Reviewer ${task.id}`, 'tdd-reviewer');
@@ -1730,7 +1789,14 @@ export class WorkflowExecutor {
 
         } catch (err) {
           const isStopSignal = err instanceof Error && err.message === '__STOP_REQUESTED__';
-          if (isStopSignal) {
+          const isModelUnreachable = err instanceof ModelUnreachableError;
+          if (isModelUnreachable) {
+            logger.error(`[EXECUTOR] Implementer model unreachable — halting session: ${(err as Error).message}`);
+            this.modelUnreachableReason = (err as Error).message;
+            haltSession = true;
+            // Deliberately NOT a task failure: leave `feedback` unset so the
+            // post-loop handler resets the task to pending, not failed.
+          } else if (isStopSignal) {
             logger.info(`[EXECUTOR] Stop signal caught — disposing session and rolling back ${task.id}`);
           } else {
             logger.error(`Attempt ${attempt} error: ${err}`);
@@ -1752,14 +1818,14 @@ export class WorkflowExecutor {
           // If stop was requested, break out of the attempt loop — the outer
           // task-level handler (after the pass loop) resets the task to pending
           // and exits the workflow.
-          if (isStopSignal) break;
+          if (isStopSignal || isModelUnreachable) break;
         }
           } // end inner attempt for-loop
 
           // Between pass 0 and pass 1: run the arbiter to decide what happens next.
           // Skip when a pause/stop interrupt is pending — the user has told us to
           // halt the workflow, not spend more budget calling another agent.
-          if (pass === 0 && !approved && !this.stopRequested && !this.pauseRequested) {
+          if (pass === 0 && !approved && !haltSession && !this.stopRequested && !this.pauseRequested) {
             // Quiesce the implementer first. session.prompt() can resolve while
             // the underlying agent is still streaming (we've observed implementer
             // events firing minutes after its last prompt supposedly returned),
@@ -1841,6 +1907,29 @@ export class WorkflowExecutor {
           this.events.emit('taskCompleted', { id: task.id, task: completedTask });
         }
         approved = true; // ensure correct path below for resuming tasks
+      }
+
+      // Model-unreachable halt takes priority: this is a "could not connect to
+      // the model" situation, NOT a failed run. Roll back, leave the task
+      // PENDING (not failed), tell the user it's an endpoint/config problem, and
+      // stop the whole TDD session.
+      if (haltSession) {
+        this.state.updateSubtask(task.id, {
+          status: 'pending',
+          attempts: 0,
+          phase: undefined,
+          feedback: undefined,
+        });
+        this.chatMessage?.(
+          `🔌 **Could not reach the implementer model — TDD session stopped.**\n` +
+          `${this.modelUnreachableReason ?? ''}\n` +
+          `Task \`${task.id}\` was rolled back to \`${originalBranch}\` and left **pending** (not failed). ` +
+          `Check that the model endpoint is up and the configured model id matches what it serves, then re-run.`,
+          'tdd-orchestrator',
+        );
+        this.events.emit('taskStopped', { id: task.id });
+        this.postChecklistUpdate();
+        break;
       }
 
       // User interrupt handling takes priority over approved/failed bookkeeping.
@@ -2067,6 +2156,7 @@ export class WorkflowExecutor {
       systemPrompt: REVIEWER_PROMPT,
       cwd: this.state.projectDir,
       modelRouter: this.modelRouter,
+      notify: this.notifyUi,
       tools: 'review',
     });
     const reviewerHandle = this.subscribeToSession(reviewerSession, 'Review', 'tdd-reviewer');
@@ -2167,6 +2257,7 @@ export class WorkflowExecutor {
       systemPrompt: ARBITER_PROMPT,
       cwd: this.state.projectDir,
       modelRouter: this.modelRouter,
+      notify: this.notifyUi,
       tools: 'none',
     });
     const arbiterHandle = this.subscribeToSession(arbiterSession, `Arbiter ${task.id}`, 'tdd-arbiter');
@@ -2330,6 +2421,7 @@ export class WorkflowExecutor {
       systemPrompt: REVIEWER_PROMPT,
       cwd: this.state.projectDir,
       modelRouter: this.modelRouter,
+      notify: this.notifyUi,
       tools: 'review',
     });
     const reviewerHandle = this.subscribeToSession(reviewerSession, 'Final Review', 'tdd-reviewer');

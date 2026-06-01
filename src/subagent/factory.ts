@@ -180,6 +180,12 @@ export interface SubAgentOptions {
     notify: (message: string, type?: 'info' | 'warning' | 'error') => void;
   };
   customTools?: ToolDefinition[];
+  /**
+   * Optional UI notifier. Surfaces model-resolution warnings — notably when the
+   * configured model can't be found and the session falls back to Pi's default
+   * (or to no model at all) — to the user's chat instead of only the log.
+   */
+  notify?: (message: string, level?: 'info' | 'warning' | 'error') => void;
 }
 
 /**
@@ -480,7 +486,16 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     } else {
       const availableIds = allModels.map((m) => `${m.provider}/${m.id}`).slice(0, 10).join(', ');
       logger.warn(`[SUBAGENT FACTORY] Target model '${targetModelId}' not found in registry after extension binding. Available (first 10): ${availableIds}`);
-      logger.warn(`[SUBAGENT FACTORY] Using Pi's fallback model: ${session.model?.provider}/${session.model?.id}`);
+      const fallbackId = session.model ? `${session.model.provider}/${session.model.id}` : 'undefined/undefined';
+      logger.warn(`[SUBAGENT FACTORY] Using Pi's fallback model: ${fallbackId}`);
+      options.notify?.(
+        `⚠️ **${options.taskType}**: configured model \`${targetModelId}\` was not found in the model registry — ` +
+        `fell back to \`${fallbackId}\`. ` +
+        (session.model
+          ? 'Responses may come from the wrong model.'
+          : 'No usable model is set, so requests will produce no output. Check that the endpoint is up and the model id matches what it serves.'),
+        'warning',
+      );
     }
   } else {
     // Passthrough mode (no models.config.json) — use whatever Pi selected

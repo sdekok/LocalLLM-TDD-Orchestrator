@@ -85,18 +85,34 @@ function makeModelRouter() {
  * Returns the session mock and a helper to fire session events.
  */
 function makeMockSession() {
-  let listener: ((event: any) => void) | null = null;
+  // Support multiple concurrent subscribers like a real session — the executor
+  // keeps the implementer handle subscribed across attempts while the reviewer
+  // subscribes/unsubscribes on the same (sometimes shared) session. A single
+  // listener would be clobbered by the reviewer, so the implementer's events
+  // would vanish on retries.
+  const listeners: Array<(event: any) => void> = [];
   const session = {
     subscribe: vi.fn((fn: (event: any) => void) => {
-      listener = fn;
-      return () => { listener = null; };
+      listeners.push(fn);
+      return () => {
+        const i = listeners.indexOf(fn);
+        if (i >= 0) listeners.splice(i, 1);
+      };
     }),
-    prompt: vi.fn().mockResolvedValue(undefined),
+    // Emit one benign activity event per turn before resolving. A real session
+    // always streams at least one event when the model responds; without this
+    // the executor's "model produced no response" fast-fail (ModelUnreachableError)
+    // would correctly treat a silent mock as an unreachable endpoint and halt.
+    // tool_execution_start sets modelActivitySeen without touching turnText or
+    // chatMessage, so it preserves every existing assertion.
+    prompt: vi.fn(async () => {
+      for (const l of [...listeners]) l({ type: 'tool_execution_start', toolName: 'read', args: { path: 'x.ts' } });
+    }),
     dispose: vi.fn(),
     messages: [],
   };
   const fire = (event: any) => {
-    if (listener) listener(event);
+    for (const l of [...listeners]) l(event);
   };
   return { session, fire };
 }
@@ -550,6 +566,49 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(state.getSubtask('WI-2')?.status).toBe('pending');
   });
 
+  it('halts the session (task left pending, NOT failed) when the implementer model returns no response', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+
+    state.initWorkflow('epic-x');
+    state.setSubtasks([
+      { id: 'WI-1', description: 'Task one' },
+      { id: 'WI-2', description: 'Task two' },
+    ]);
+
+    // Implementer session whose prompt() resolves with NO stream events — i.e.
+    // the model was never reached / produced no output (unreachable endpoint or
+    // unresolved model id). Overrides the helper's default activity emission.
+    const { session } = makeMockSession();
+    session.prompt = vi.fn().mockResolvedValue(undefined);
+    (createSubAgentSession as any).mockResolvedValue(session);
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task one', subtasks: [] });
+
+    const failed: string[] = [];
+    const stopped: string[] = [];
+    executor.events.on('taskFailed', (e: any) => failed.push(e.id));
+    executor.events.on('taskStopped', (e: any) => stopped.push(e.id));
+
+    await (executor as any).processQueue();
+
+    // Connectivity halt: task left PENDING (not failed), session stopped, and the
+    // second task never started.
+    expect(state.getSubtask('WI-1')?.status).toBe('pending');
+    expect(failed).not.toContain('WI-1');
+    expect(stopped).toContain('WI-1');
+    expect(state.getSubtask('WI-2')?.status).toBe('pending');
+    const halt = chatMessage.mock.calls.find(
+      (c: any[]) => typeof c[0] === 'string' && c[0].includes('Could not reach the implementer model'),
+    );
+    expect(halt).toBeDefined();
+  });
+
   it('processQueue posts failure chatMessage with resume instructions', async () => {
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;
@@ -640,7 +699,7 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
 
     const reviewText = 'APPROVED: true\nFEEDBACK: Great';
     let reviewerPromptArg = '';
-    const { session: implSession } = makeMockSession();
+    const { session: implSession, fire: fireImpl } = makeMockSession();
     const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
     let callCount = 0;
     (createSubAgentSession as any).mockImplementation(async () => {
@@ -653,6 +712,9 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
           const tddDir = path.join(projectDir, '.tdd-workflow');
           fs.mkdirSync(tddDir, { recursive: true });
           fs.writeFileSync(path.join(tddDir, 'implementation-notes.md'), 'Chose approach X because Y. Trade-off: Z.');
+          // A real implementer that writes a file streams a tool event — emit one
+          // so the executor's no-response fast-fail doesn't treat this as unreachable.
+          fireImpl({ type: 'tool_execution_start', toolName: 'write', args: { path: 'implementation-notes.md' } });
         });
         return implSession;
       }
