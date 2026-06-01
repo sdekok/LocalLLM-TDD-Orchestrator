@@ -79,6 +79,7 @@ const IDLE_NUDGE_MS               =  5 * 60 * 1000;
  */
 const SESSION_REFRESH_AFTER = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
+const MAX_ARBITER_ROUNDS = 3;                  // Max arbiter consultations per task — each can grant another "continue N"
 
 /**
  * Thrown when the implementer model produces no response at all (no provider
@@ -1041,10 +1042,16 @@ export class WorkflowExecutor {
         const iterationHistory: IterationRecord[] = [];
         // Per-round feedback log shown to the implementer on retries (newest first).
         const feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }> = [];
-        // Two-pass outer loop: pass 0 = normal attempts, pass 1 = arbiter-granted extra rounds.
+        // Outer loop: pass 0 = normal attempts; passes 1..MAX_ARBITER_ROUNDS each
+        // run a batch of arbiter-granted "continue" rounds, re-consulting the
+        // arbiter after each batch. This lets genuine-but-slow progress keep going
+        // past a single grant, while MAX_ARBITER_ROUNDS caps the total consults so
+        // a stuck task can't loop forever.
         let arbiterExtraRounds = 0;
-        for (let pass = 0; pass <= 1 && !approved && !haltSession; pass++) {
-          if (pass === 1 && arbiterExtraRounds === 0) break;
+        let arbiterRounds = 0;             // arbiter consultations used so far
+        let attemptCeiling = MAX_ATTEMPTS; // highest attempt number reached (cumulative numbering across passes)
+        for (let pass = 0; pass <= MAX_ARBITER_ROUNDS && !approved && !haltSession; pass++) {
+          if (pass > 0 && arbiterExtraRounds === 0) break;
 
           // Reset the cross-attempt similarity baseline when entering pass 1.
           // The user (or arbiter) just granted extra rounds — they're explicitly
@@ -1059,8 +1066,10 @@ export class WorkflowExecutor {
             lastAttemptBlockedByPreexisting = false;
           }
 
-          const attemptStart = pass === 0 ? startAttempt : MAX_ATTEMPTS + 1;
-          const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : MAX_ATTEMPTS + arbiterExtraRounds;
+          const attemptStart = pass === 0 ? startAttempt : attemptCeiling + 1;
+          const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : attemptCeiling + arbiterExtraRounds;
+          arbiterExtraRounds = 0;        // consumed for this pass; the next arbiter consult must re-grant
+          attemptCeiling = attemptEnd;   // advance the numbering ceiling for the next pass
 
           for (let attempt = attemptStart; attempt <= attemptEnd && !approved && !haltSession; attempt++) {
             const totalMax = attemptEnd; // used for chat messages
@@ -1830,10 +1839,13 @@ export class WorkflowExecutor {
         }
           } // end inner attempt for-loop
 
-          // Between pass 0 and pass 1: run the arbiter to decide what happens next.
-          // Skip when a pause/stop interrupt is pending — the user has told us to
-          // halt the workflow, not spend more budget calling another agent.
-          if (pass === 0 && !approved && !haltSession && !this.stopRequested && !this.pauseRequested) {
+          // After each pass's attempts, consult the arbiter to decide what happens
+          // next (continue with more rounds, approve, or escalate) — up to
+          // MAX_ARBITER_ROUNDS times, so it can keep granting "continue" while real
+          // progress is being made. Skip when a pause/stop interrupt is pending —
+          // the user has told us to halt, not spend more budget on another agent.
+          if (!approved && !haltSession && !this.stopRequested && !this.pauseRequested && arbiterRounds < MAX_ARBITER_ROUNDS) {
+            arbiterRounds++;
             // Quiesce the implementer first. session.prompt() can resolve while
             // the underlying agent is still streaming (we've observed implementer
             // events firing minutes after its last prompt supposedly returned),

@@ -1168,6 +1168,55 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(state.getSubtask('WI-1')?.status).toBe('completed');
   });
 
+  it('arbiter can be consulted multiple times — keeps granting continue while progress is made', async () => {
+    const chatMessage = vi.fn();
+    (executor as any).chatMessage = chatMessage;
+
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+
+    state.initWorkflow('epic-arbiter-multi');
+    state.setSubtasks([{ id: 'WI-1', description: 'Fix the thing' }]);
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    const { session: implSession } = makeMockSession();
+    let arbiterCalls = 0;
+    let reviewCallCount = 0;
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      if (opts.taskType === 'implement') return implSession;
+      if (opts.taskType === 'arbitrate') {
+        // Always say "continue 1" — the OLD two-pass loop consulted the arbiter
+        // only once and then failed the task after the single extra round; the
+        // multi-round loop re-consults and lets a slow-but-real fix land.
+        arbiterCalls++;
+        const { session: arb, fire: fireArb } = makeMockSession();
+        arb.prompt = vi.fn().mockImplementation(async () => {
+          fireArb({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DECISION: continue\nROUNDS: 1\nRATIONALE: progress is being made.' } });
+        });
+        return arb;
+      }
+      // reviewer: reject through pass 0 (5 attempts) + the first extra round (6th);
+      // approve on the 7th — which is only reachable if the arbiter is consulted twice.
+      reviewCallCount++;
+      const approveThisOne = reviewCallCount >= 7;
+      const { session: rev, fire: fireRev } = makeMockSession();
+      rev.prompt = vi.fn().mockImplementation(async () => {
+        const verdict = approveThisOne ? 'APPROVED: true\nFEEDBACK: Good now' : 'APPROVED: false\nFEEDBACK: Still issues';
+        fireRev({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: verdict } });
+      });
+      return rev;
+    });
+
+    await (executor as any).processQueue();
+
+    expect(arbiterCalls).toBeGreaterThanOrEqual(2); // consulted more than once
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+  });
+
   it('arbiter escalates to user who stops: task is marked failed', async () => {
     const chatMessage = vi.fn();
     const waitForInput = vi.fn().mockResolvedValue('stop');
