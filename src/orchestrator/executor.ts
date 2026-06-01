@@ -1502,10 +1502,18 @@ export class WorkflowExecutor {
             // into its own section, not the diff fence.)
             currentCommitLog = commitLog;
 
-            if (lastAttemptDiff && currentDiff && !lastAttemptBlockedByPreexisting) {
+            // Only treat high cross-attempt similarity as a loop when the PREVIOUS
+            // attempt's gates PASSED — i.e. a reviewer-rejection loop on working
+            // code. When the prior attempt FAILED its gates, the implementer is
+            // iterating on a fix, where a near-identical full-branch diff is
+            // expected (most of the diff is the same feature; only the fix
+            // differs). Bailing here would skip THIS attempt's quality gates and
+            // reviewer and leave lastQualityGatesPassed stale, so the arbiter then
+            // judges a stale state. Let the gates evaluate the fix instead.
+            if (lastAttemptDiff && currentDiff && !lastAttemptBlockedByPreexisting && lastQualityGatesPassed) {
               const similarity = outputSimilarity(lastAttemptDiff, currentDiff);
               if (similarity > SIMILARITY_THRESHOLD) {
-                logger.warn(`Loop detected: attempt ${attempt} output is ${(similarity * 100).toFixed(0)}% similar to previous attempt. Bailing early.`);
+                logger.warn(`Loop detected: attempt ${attempt} output is ${(similarity * 100).toFixed(0)}% similar to previous attempt (gates were passing — reviewer-rejection loop). Bailing early.`);
                 feedback = `Agent is producing nearly identical output across attempts (${(similarity * 100).toFixed(0)}% similarity). Manual intervention required.`;
                 this.events.emit('taskProgress', {
                   id: task.id,
