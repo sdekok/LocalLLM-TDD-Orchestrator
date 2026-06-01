@@ -10,6 +10,16 @@ const LOG_LEVELS: Record<LogLevel, number> = {
   error: 3,
 };
 
+// In the standalone MCP server, mirroring warn/error to stderr is correct — stderr
+// is the conventional log channel (stdout carries JSON-RPC). But inside the Pi TUI,
+// raw stderr writes bypass Pi's renderer and corrupt the display (they land in the
+// input line). The Pi extension entry calls setLoggerStderrMirror(false); warnings
+// still reach the log files and the plugin's chatMessage/notify paths.
+let stderrMirrorEnabled = true;
+export function setLoggerStderrMirror(enabled: boolean): void {
+  stderrMirrorEnabled = enabled;
+}
+
 export class Logger {
   private logStream: fs.WriteStream | null = null;
   private liveStream: fs.WriteStream | null = null;
@@ -32,8 +42,9 @@ export class Logger {
     const timestamp = new Date().toISOString();
     const line = `[${level.toUpperCase().padEnd(5)} ${timestamp}] ${msg}\n`;
     this.logStream?.write(line);
-    // stderr is safe for MCP servers — stdout is the JSON-RPC transport
-    if (LOG_LEVELS[level] >= LOG_LEVELS.warn) {
+    // stderr is safe for MCP servers — stdout is the JSON-RPC transport — but is
+    // disabled in the Pi TUI (see setLoggerStderrMirror) where it corrupts the UI.
+    if (stderrMirrorEnabled && LOG_LEVELS[level] >= LOG_LEVELS.warn) {
       process.stderr.write(`[tdd-workflow] ${msg}\n`);
     }
   }

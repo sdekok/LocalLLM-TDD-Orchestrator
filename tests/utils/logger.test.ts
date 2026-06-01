@@ -1,8 +1,8 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { Logger, _resetLogger } from '../../src/utils/logger.js';
+import { Logger, _resetLogger, setLoggerStderrMirror } from '../../src/utils/logger.js';
 
 describe('Logger', () => {
   let tmpDir: string;
@@ -65,6 +65,35 @@ describe('Logger', () => {
     const content = fs.readFileSync(path.join(tmpDir, structuredLog), 'utf-8');
     expect(content).not.toContain('should not appear');
     expect(content).toContain('should appear');
+    logger = null; // already closed
+  });
+
+  it('does not mirror to stderr when disabled (Pi TUI mode), but still logs to file', async () => {
+    tmpDir = path.join(os.tmpdir(), `logger-test-${Date.now()}-d`);
+    logger = new Logger(tmpDir, 'debug');
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: any) => { writes.push(String(chunk)); return true; }) as any);
+    try {
+      setLoggerStderrMirror(false);
+      logger.warn('hidden warn');
+      logger.error('hidden error');
+      expect(writes.join('')).not.toContain('hidden');
+
+      setLoggerStderrMirror(true);
+      logger.warn('shown warn');
+      expect(writes.join('')).toContain('shown warn');
+    } finally {
+      spy.mockRestore();
+      setLoggerStderrMirror(true); // restore module default for other tests
+    }
+
+    await logger.closeAsync();
+    const files = fs.readdirSync(tmpDir);
+    const structuredLog = files.find(f => f.startsWith('workflow-'))!;
+    const content = fs.readFileSync(path.join(tmpDir, structuredLog), 'utf-8');
+    // The log file always records everything regardless of the stderr mirror.
+    expect(content).toContain('hidden warn');
+    expect(content).toContain('hidden error');
     logger = null; // already closed
   });
 });

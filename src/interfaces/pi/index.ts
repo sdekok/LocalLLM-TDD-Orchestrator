@@ -24,7 +24,7 @@ import { getTestRunner } from '../../orchestrator/test-runner.js';
 import { planProject, type PlanMode } from '../../agents/project-planner.js';
 import { EpicLoader } from '../../orchestrator/epic-loader.js';
 import { performDeepResearch, findResearchDirs, loadResearchState } from '../../agents/researcher.js';
-import { getLogger } from '../../utils/logger.js';
+import { getLogger, setLoggerStderrMirror } from '../../utils/logger.js';
 import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo, readPiCloudProviders } from './pi-models.js';
 import { completeTddArgs, completeReviewArgs, completeResearchArgs, completePlanArgs } from './autocomplete.js';
 import { parsePlanArgs, listExistingEpics, readPriorRequest } from './plan-helpers.js';
@@ -61,6 +61,11 @@ function guessArchitecture(modelId: string): 'moe' | 'dense' | 'unknown' {
 }
 
 export default function(pi: ExtensionAPI) {
+  // Running inside the Pi TUI: never mirror logs to stderr — raw stderr writes
+  // bypass Pi's renderer and end up in the input box. Logs go to files; anything
+  // the user should see is posted via chatMessage/ctx.ui.notify.
+  setLoggerStderrMirror(false);
+
   let executor: WorkflowExecutor | null = null;
   let stateManager: StateManager | null = null;
 
