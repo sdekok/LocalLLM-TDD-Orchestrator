@@ -1,6 +1,27 @@
 import { describe, it, expect } from 'vitest';
-import { outputSimilarity } from '../../src/orchestrator/executor.js';
+import { outputSimilarity, reviewerVerdictComplete } from '../../src/orchestrator/executor.js';
 import * as path from 'path';
+
+describe('reviewerVerdictComplete — triggers format self-correction', () => {
+  it('approved verdict is complete without feedback', () => {
+    expect(reviewerVerdictComplete('APPROVED: true\nSCORES: test_coverage=5')).toBe(true);
+  });
+  it('rejected with feedback is complete', () => {
+    expect(reviewerVerdictComplete('APPROVED: false\nSCORES: x\nFEEDBACK: fix the type error on line 12')).toBe(true);
+  });
+  it('rejected with NO feedback is incomplete', () => {
+    expect(reviewerVerdictComplete('APPROVED: false\nSCORES: x')).toBe(false);
+  });
+  it('rejected with a typo header (FEEDFIX) is incomplete', () => {
+    expect(reviewerVerdictComplete('APPROVED: false\nSCORES: x\nFEEDFIX:\n1. do the thing')).toBe(false);
+  });
+  it('rejected with empty feedback is incomplete', () => {
+    expect(reviewerVerdictComplete('APPROVED: false\nFEEDBACK:   \n')).toBe(false);
+  });
+  it('no structured verdict at all is incomplete', () => {
+    expect(reviewerVerdictComplete('Let me read the files first. Now I will form my verdict.')).toBe(false);
+  });
+});
 
 describe('outputSimilarity — loop detection', () => {
   it('returns 1.0 for identical strings', () => {

@@ -161,6 +161,23 @@ export function outputSimilarity(a: string, b: string): number {
 }
 
 /**
+ * A reviewer verdict is "complete" only when it states `APPROVED: true|false`
+ * AND — for a rejection — includes a non-empty `FEEDBACK:` section. A rejection
+ * with no usable FEEDBACK (missing, empty, or a typo'd header like `FEEDFIX:`)
+ * leaves the implementer nothing actionable, so we re-prompt the reviewer to
+ * emit the structured format instead of dumping its raw analysis/thinking.
+ * An approval needs no feedback.
+ */
+export function reviewerVerdictComplete(text: string): boolean {
+  if (!/APPROVED:\s*(true|false)/i.test(text)) return false;
+  if (/APPROVED:\s*false/i.test(text)) {
+    const m = text.match(/FEEDBACK:\s*([\s\S]*?)\s*$/i);
+    return !!(m && m[1] && m[1].trim().length > 0);
+  }
+  return true;
+}
+
+/**
  * Write (or overwrite) a per-task feedback history file with full round details.
  * Used as a reference; the inline fixer prompt uses summarizeFeedbackHistory instead.
  */
@@ -1721,19 +1738,23 @@ export class WorkflowExecutor {
               // send a follow-up asking it to emit only the structured lines.
               // Use a generous timeout — thinking models need several minutes even for short replies.
               const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-              if (!reviewText.includes('APPROVED:')) {
-                logger.warn(`[${task.id}] Reviewer missing structured verdict — sending format reminder`);
+              // Re-prompt when the verdict is incomplete: missing APPROVED:, OR a
+              // rejection with no usable FEEDBACK: (e.g. a typo'd header like
+              // FEEDFIX:). Otherwise the implementer gets the reviewer's raw
+              // thinking instead of actionable feedback.
+              if (!reviewerVerdictComplete(reviewText)) {
+                logger.warn(`[${task.id}] Reviewer verdict incomplete (missing APPROVED: or FEEDBACK:) — sending format reminder`);
                 const savedReviewText = reviewText;
                 reviewerHandle.resetTurnText();
                 try {
                   await withTimeout(
                     reviewerSession.prompt(
                       'STOP all tool calls. Do NOT read any more files.\n\n' +
-                      'Your review is complete but is missing the required structured verdict. ' +
-                      'Output ONLY these three lines right now — nothing else:\n\n' +
+                      'Your review is complete but the structured verdict is missing or malformed. ' +
+                      'Output ONLY these three lines right now, with these EXACT labels — nothing else:\n\n' +
                       'APPROVED: true/false\n' +
                       'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-                      'FEEDBACK: <your feedback based on what you have already read>'
+                      'FEEDBACK: <if APPROVED is false, the concrete changes needed — based on what you already read>'
                     ),
                     FORMAT_RETRY_TIMEOUT_MS,
                     'format-retry-timeout',
@@ -1742,8 +1763,8 @@ export class WorkflowExecutor {
                 } catch {
                   reviewText = savedReviewText; // retry failed — restore original
                 }
-                if (!reviewText.includes('APPROVED:')) {
-                  reviewText = savedReviewText; // retry still unstructured — restore
+                if (!reviewerVerdictComplete(reviewText)) {
+                  reviewText = savedReviewText; // retry still malformed — restore
                 }
               }
             } finally {
@@ -2191,26 +2212,26 @@ export class WorkflowExecutor {
       reviewText = reviewerHandle.getTurnText();
 
       const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000;
-      if (!reviewText.includes('APPROVED:')) {
-        logger.warn('[EXECUTOR] Standalone reviewer missing structured verdict — sending format reminder');
+      if (!reviewerVerdictComplete(reviewText)) {
+        logger.warn('[EXECUTOR] Standalone reviewer verdict incomplete (missing APPROVED: or FEEDBACK:) — sending format reminder');
         const saved = reviewText;
         reviewerHandle.resetTurnText();
         try {
           await withTimeout(
             reviewerSession.prompt(
               'STOP all tool calls. Do NOT read any more files.\n\n' +
-              'Your review is complete but is missing the required structured verdict. ' +
-              'Output ONLY these three lines right now — nothing else:\n\n' +
+              'Your review is complete but the structured verdict is missing or malformed. ' +
+              'Output ONLY these three lines right now, with these EXACT labels — nothing else:\n\n' +
               'APPROVED: true/false\n' +
               'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-              'FEEDBACK: <your feedback based on what you have already read>'
+              'FEEDBACK: <if APPROVED is false, the concrete changes needed — based on what you already read>'
             ),
             FORMAT_RETRY_TIMEOUT_MS,
             'format-retry-timeout',
           );
           reviewText = reviewerHandle.getTurnText();
         } catch { reviewText = saved; }
-        if (!reviewText.includes('APPROVED:')) reviewText = saved;
+        if (!reviewerVerdictComplete(reviewText)) reviewText = saved;
       }
     } finally {
       reviewerHandle.dispose();
