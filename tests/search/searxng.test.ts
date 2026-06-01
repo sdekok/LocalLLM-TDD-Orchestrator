@@ -1,5 +1,8 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { stripHTML, hasExternalDependencies, shouldSearch, SearchClient } from '../../src/search/searxng.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { stripHTML, hasExternalDependencies, shouldSearch, SearchClient, getSearxngUrl } from '../../src/search/searxng.js';
 
 // Mock the URL validator so we control which URLs are allowed/blocked
 // without real DNS lookups in unit tests.
@@ -12,6 +15,57 @@ vi.mock('../../src/utils/logger.js', () => ({
 }));
 
 import { validateExternalUrl } from '../../src/utils/url-validator.js';
+
+// ─── getSearxngUrl ─────────────────────────────────────────────────
+
+describe('getSearxngUrl', () => {
+  let dir: string;
+  const savedEnv = process.env['SEARXNG_URL'];
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'searxng-cfg-'));
+    delete process.env['SEARXNG_URL'];
+  });
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (savedEnv === undefined) delete process.env['SEARXNG_URL'];
+    else process.env['SEARXNG_URL'] = savedEnv;
+  });
+
+  const writeMcp = (obj: unknown) => fs.writeFileSync(path.join(dir, 'mcp.json'), JSON.stringify(obj));
+
+  it('reads the searxng MCP server env from mcp.json (single source of truth)', () => {
+    writeMcp({ mcpServers: { searxng: { command: 'mcp-searxng', env: { SEARXNG_URL: 'https://s.example' } } } });
+    expect(getSearxngUrl(dir)).toBe('https://s.example');
+  });
+
+  it('finds SEARXNG_URL on any MCP server when none is named "searxng"', () => {
+    writeMcp({ mcpServers: { websearch: { command: 'x', env: { SEARXNG_URL: 'https://other.example' } } } });
+    expect(getSearxngUrl(dir)).toBe('https://other.example');
+  });
+
+  it('prefers the MCP config over the process env var', () => {
+    writeMcp({ mcpServers: { searxng: { env: { SEARXNG_URL: 'https://mcp.example' } } } });
+    process.env['SEARXNG_URL'] = 'https://env.example';
+    expect(getSearxngUrl(dir)).toBe('https://mcp.example');
+  });
+
+  it('falls back to the process env var when mcp.json has no searxng config', () => {
+    writeMcp({ mcpServers: { 'context-mode': { command: 'node' } } });
+    process.env['SEARXNG_URL'] = 'https://env.example';
+    expect(getSearxngUrl(dir)).toBe('https://env.example');
+  });
+
+  it('returns undefined when neither mcp.json nor env configures SearXNG', () => {
+    expect(getSearxngUrl(dir)).toBeUndefined();
+  });
+
+  it('does not throw when mcp.json is missing or invalid', () => {
+    expect(getSearxngUrl(dir)).toBeUndefined();
+    fs.writeFileSync(path.join(dir, 'mcp.json'), '{ not json');
+    expect(getSearxngUrl(dir)).toBeUndefined();
+  });
+});
 
 // ─── stripHTML ────────────────────────────────────────────────────
 

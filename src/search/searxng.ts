@@ -1,5 +1,38 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
 import { validateExternalUrl } from '../utils/url-validator.js';
+
+/**
+ * Resolve the SearXNG base URL from a single source of truth so SearXNG is
+ * configured ONCE — alongside the Pi MCP server — rather than duplicated as a
+ * separate `SEARXNG_URL` env var the plugin's process must also carry.
+ *
+ * Precedence:
+ *   1. The `searxng` MCP server's configured `env.SEARXNG_URL` in the agent's
+ *      `mcp.json` (and, failing an exact name match, any MCP server that sets
+ *      `SEARXNG_URL`). MCP `env` is scoped to that subprocess, so the plugin
+ *      otherwise can't see it — reading mcp.json bridges that gap.
+ *   2. The `SEARXNG_URL` process env var (direct configuration / back-compat).
+ *
+ * Returns undefined when SearXNG isn't configured anywhere.
+ */
+export function getSearxngUrl(agentDir = path.join(os.homedir(), '.pi', 'agent')): string | undefined {
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(agentDir, 'mcp.json'), 'utf-8')) as {
+      mcpServers?: Record<string, { env?: Record<string, string> }>;
+    };
+    const servers = raw.mcpServers ?? {};
+    const fromMcp =
+      servers['searxng']?.env?.['SEARXNG_URL'] ??
+      Object.values(servers).map((s) => s.env?.['SEARXNG_URL']).find(Boolean);
+    if (fromMcp) return fromMcp;
+  } catch {
+    /* mcp.json missing or unparseable — fall through to env */
+  }
+  return process.env['SEARXNG_URL'] || undefined;
+}
 
 export interface SearchResult {
   title: string;

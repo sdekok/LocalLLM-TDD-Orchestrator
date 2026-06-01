@@ -16,7 +16,7 @@ import {
   type ModelRouterConfig,
   type TaskType,
 } from '../../llm/model-router.js';
-import { SearchClient } from '../../search/searxng.js';
+import { SearchClient, getSearxngUrl } from '../../search/searxng.js';
 import { analyzeProject, isAnalysisStale } from '../../analysis/runner.js';
 import { runQualityGates } from '../../orchestrator/quality-gates.js';
 import type { CoverageMetrics } from '../../orchestrator/quality-gates.js';
@@ -154,7 +154,8 @@ export default function(pi: ExtensionAPI) {
           );
         }
 
-        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+        const searxngUrl = getSearxngUrl();
+        const searchClient = searxngUrl ? new SearchClient(searxngUrl) : null;
 
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
@@ -587,7 +588,8 @@ export default function(pi: ExtensionAPI) {
             'warning'
           );
         }
-        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+        const searxngUrl = getSearxngUrl();
+        const searchClient = searxngUrl ? new SearchClient(searxngUrl) : null;
 
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
@@ -690,7 +692,8 @@ export default function(pi: ExtensionAPI) {
       // Lazily construct executor with the same wiring as /tdd if it isn't already.
       if (!executor) {
         const modelRouter = new ModelRouter(null, ctx.cwd);
-        const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+        const searxngUrl = getSearxngUrl();
+        const searchClient = searxngUrl ? new SearchClient(searxngUrl) : null;
         executor = new WorkflowExecutor(stateManager, modelRouter, {
           searchClient,
           chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
@@ -856,7 +859,8 @@ export default function(pi: ExtensionAPI) {
           'warning'
         );
       }
-      const searchClient = process.env.SEARXNG_URL ? new SearchClient(process.env.SEARXNG_URL) : null;
+      const searxngUrl = getSearxngUrl();
+      const searchClient = searxngUrl ? new SearchClient(searxngUrl) : null;
 
       await performDeepResearch(topic, ctx.cwd, modelRouter, searchClient, {
         background: isBackground,

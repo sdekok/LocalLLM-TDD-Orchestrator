@@ -16,6 +16,7 @@ import * as path from 'path';
 import { createRequire } from 'module';
 import { ModelRouter, type TaskType, type ModelProfile } from '../llm/model-router.js';
 import { getLogger } from '../utils/logger.js';
+import { getSearxngUrl } from '../search/searxng.js';
 import { getAskUserForClarificationParams, type AskUserForClarificationArgs } from './tools.js';
 import { ensureModelInPiProvider } from '../interfaces/pi/pi-models.js';
 
@@ -213,7 +214,11 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   const extHay = extensionPaths.join('|').toLowerCase();
   const hasContextMode = extHay.includes('context-mode') || extHay.includes('pi-mcp-adapter');
   const hasLens = extHay.includes('pi-lens');
-  const hasWebSearch = !!process.env['SEARXNG_URL'];
+  // Detect SearXNG from the MCP config (single source of truth) so sub-agents
+  // get the searxng_web_search/web_url_read tools allowlisted whenever the
+  // searxng MCP server is configured — not only when a separate SEARXNG_URL
+  // env var happens to be set in the plugin's process.
+  const hasWebSearch = !!getSearxngUrl(PI_AGENT_DIR);
 
   const toolsGuidance = hasContextMode
     ? `## Context Mode (MANDATORY)

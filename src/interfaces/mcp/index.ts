@@ -10,7 +10,7 @@ import {
 import { StateManager } from '../../orchestrator/state.js';
 import { WorkflowExecutor } from '../../orchestrator/executor.js';
 import { LLMClient } from '../../llm/client.js';
-import { SearchClient } from '../../search/searxng.js';
+import { SearchClient, getSearxngUrl } from '../../search/searxng.js';
 import { analyzeProject, loadCachedAnalysis, isAnalysisStale } from '../../analysis/runner.js';
 import { formatMultiAnalysisForPrompt } from '../../analysis/types.js';
 import { getLogger } from '../../utils/logger.js';
@@ -62,7 +62,7 @@ async function getOrCreate(projectDir: string) {
   if (!executors.has(projectDir)) {
     const state = new StateManager(projectDir);
     const llm = new LLMClient();
-    const searchClient = new SearchClient(undefined);
+    const searchClient = new SearchClient(getSearxngUrl());
     const executor = new WorkflowExecutor(state, llm.router, {
       searchClient,
     });
