@@ -11,6 +11,22 @@ export interface GateResult {
   blocking: boolean;
 }
 
+/**
+ * Wall-clock budget for a single test or coverage run. Large suites blow the
+ * old 120s budget, so default to 5 minutes. Override per project via
+ * package.json `tddConfig.testTimeoutMs` (milliseconds).
+ */
+const TEST_RUN_TIMEOUT_MS = 300_000;
+
+function getTestTimeoutMs(projectDir: string): number {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    const v = pkg.tddConfig?.testTimeoutMs;
+    if (typeof v === 'number' && v > 0) return v;
+  } catch { /* fall back to default */ }
+  return TEST_RUN_TIMEOUT_MS;
+}
+
 // Test and Coverage metrics are now imported from test-runner.ts
 export type { TestMetrics, CoverageMetrics };
 
@@ -235,7 +251,7 @@ export async function collectCoverageSnapshot(projectDir: string): Promise<Cover
     if (!hasCoverageTools) return undefined;
   } catch { return undefined; }
   try {
-    const result = await runner.runCoverage(projectDir, 120_000);
+    const result = await runner.runCoverage(projectDir, getTestTimeoutMs(projectDir));
     return result.coverage;
   } catch {
     return undefined;
@@ -282,7 +298,7 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
     // --coverage here causes false failures: coverage instrumentation adds
     // ~20-40% overhead (integration tests can tip over the timeout) and can
     // produce different pass/fail results than a plain test run.
-    const testResult = await runner.runTests(projectDir, 120_000);
+    const testResult = await runner.runTests(projectDir, getTestTimeoutMs(projectDir));
 
     gates.push({
       gate: 'tests',
@@ -299,7 +315,7 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
     const needsCoverageRun = options.collectCoverage || !!pkg.tddConfig?.coverageThresholds;
     if (needsCoverageRun) {
       try {
-        const coverageResult = await runner.runCoverage(projectDir, 120_000);
+        const coverageResult = await runner.runCoverage(projectDir, getTestTimeoutMs(projectDir));
         coverageMetrics = coverageResult.coverage;
       } catch (err) {
         logger.warn(`Coverage run failed (non-fatal): ${(err as Error).message}`);
