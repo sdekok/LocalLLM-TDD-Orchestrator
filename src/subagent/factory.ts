@@ -218,7 +218,17 @@ export async function createSubAgentSession(options: SubAgentOptions): Promise<A
   // get the searxng_web_search/web_url_read tools allowlisted whenever the
   // searxng MCP server is configured — not only when a separate SEARXNG_URL
   // env var happens to be set in the plugin's process.
-  const hasWebSearch = !!getSearxngUrl(PI_AGENT_DIR);
+  const searxngUrl = getSearxngUrl(PI_AGENT_DIR);
+  const hasWebSearch = !!searxngUrl;
+  // Bridge the URL into this process's env BEFORE the session spawns its MCP
+  // servers: the searxng MCP server (mcp-searxng) is a child process that reads
+  // SEARXNG_URL from its own environment. If the spawner doesn't propagate the
+  // per-server `env` block from mcp.json, the server starts up "SEARXNG_URL not
+  // configured" and search fails at runtime even though the tool is allowlisted.
+  // Setting it here lets the child inherit it. Don't override an explicit value.
+  if (searxngUrl && !process.env['SEARXNG_URL']) {
+    process.env['SEARXNG_URL'] = searxngUrl;
+  }
 
   const toolsGuidance = hasContextMode
     ? `## Context Mode (MANDATORY)
