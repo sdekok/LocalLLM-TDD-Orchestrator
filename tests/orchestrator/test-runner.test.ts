@@ -4,15 +4,28 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 vi.mock('fs');
-vi.mock('child_process', () => ({
-  exec: vi.fn((cmd, opts, callback) => {
-    if (cmd.includes('--coverage')) {
-      callback(null, { stdout: 'Tests 10 passed (10)\nStatements : 85.5%', stderr: '' });
-    } else {
-      callback(null, { stdout: 'Tests 5 passed (5)', stderr: '' });
-    }
-  })
-}));
+// execWithTimeout now uses child_process.spawn (own process group, killable on
+// timeout). Mock spawn to return a fake child that streams output then closes 0.
+vi.mock('child_process', () => {
+  const { EventEmitter } = require('events');
+  return {
+    spawn: vi.fn((cmd: string) => {
+      const child: any = new EventEmitter();
+      child.pid = 4242;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      queueMicrotask(() => {
+        const out = String(cmd).includes('--coverage')
+          ? 'Tests 10 passed (10)\nStatements : 85.5%'
+          : 'Tests 5 passed (5)';
+        child.stdout.emit('data', Buffer.from(out));
+        child.emit('close', 0);
+      });
+      return child;
+    }),
+  };
+});
 
 describe('VitestRunner', () => {
   let runner: VitestRunner;
@@ -42,11 +55,18 @@ describe('VitestRunner', () => {
   });
 
   it('runCoverage does not use --reporter=json-summary (crashes vitest v4)', async () => {
-    const { exec } = await import('child_process');
+    const { spawn } = await import('child_process');
+    const { EventEmitter } = await import('events');
     let capturedCmd = '';
-    (exec as any).mockImplementation((cmd: string, _opts: any, callback: any) => {
+    (spawn as any).mockImplementation((cmd: string) => {
       capturedCmd = cmd;
-      callback(null, { stdout: '', stderr: '' });
+      const child: any = new EventEmitter();
+      child.pid = 4242;
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = vi.fn();
+      queueMicrotask(() => { child.stdout.emit('data', Buffer.from('')); child.emit('close', 0); });
+      return child;
     });
     await runner.runCoverage('/mock/project', 5000);
     expect(capturedCmd).not.toContain('json-summary');

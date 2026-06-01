@@ -1,10 +1,7 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getLogger } from '../utils/logger.js';
-
-const execAsync = promisify(exec);
 
 export interface TestMetrics {
   total: number;
@@ -54,25 +51,67 @@ export abstract class BaseTestRunner implements TestRunner {
 
   protected async execWithTimeout(command: string, cwd: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; passed: boolean; timedOut?: boolean }> {
     const logger = getLogger();
-    try {
-      const { stdout, stderr } = await execAsync(command, { cwd, timeout: timeoutMs });
-      return { stdout, stderr, passed: true };
-    } catch (err: any) {
-      // When `exec` hits the timeout it SIGTERMs the child and returns partial
-      // output. We flag it so upstream can annotate the gate output with a
-      // truncation warning instead of silently treating "0 tests found" as a
-      // genuine regression.
-      const timedOut = err.killed === true || err.signal === 'SIGTERM';
-      if (timedOut) {
-        logger.warn(`[TestRunner] Command timed out after ${timeoutMs / 1000}s: ${command}`);
-      }
-      return {
-        stdout: err.stdout || '',
-        stderr: err.stderr || err.message || '',
-        passed: false,
-        timedOut,
+    const MAX_BUFFER = 10 * 1024 * 1024; // cap captured output at 10 MB
+
+    return await new Promise((resolve) => {
+      // Spawn in its OWN process group (detached + shell) so a timeout can kill
+      // the ENTIRE tree. `exec`'s timeout only SIGTERMs the immediate child (the
+      // shell/pnpm), orphaning the vitest/jest worker pool — which then pegs the
+      // CPU with "node processes galore" after we've already given up.
+      //
+      // CI=true forces a single run (no watch mode — the usual cause of a test
+      // command sitting at near-zero CPU until the timeout) and disables
+      // interactive prompts. stdin is /dev/null so anything waiting on a TTY or
+      // keypress gets EOF immediately instead of hanging.
+      const child = spawn(command, {
+        cwd,
+        shell: true,
+        detached: true,
+        env: { ...process.env, CI: 'true' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+      let settled = false;
+
+      child.stdout?.on('data', (d: Buffer) => { if (stdout.length < MAX_BUFFER) stdout += d.toString(); });
+      child.stderr?.on('data', (d: Buffer) => { if (stderr.length < MAX_BUFFER) stderr += d.toString(); });
+
+      const killGroup = (signal: NodeJS.Signals) => {
+        if (child.pid == null) return;
+        try {
+          process.kill(-child.pid, signal); // negative pid → the whole process group
+        } catch {
+          try { child.kill(signal); } catch { /* already gone */ }
+        }
       };
-    }
+
+      const timer = setTimeout(() => {
+        timedOut = true;
+        logger.warn(`[TestRunner] Command timed out after ${timeoutMs / 1000}s: ${command}`);
+        killGroup('SIGTERM');
+        // Escalate if a stubborn worker pool ignores SIGTERM.
+        const hardKill = setTimeout(() => killGroup('SIGKILL'), 5000);
+        hardKill.unref?.();
+      }, timeoutMs);
+      timer.unref?.();
+
+      const finish = (result: { stdout: string; stderr: string; passed: boolean; timedOut?: boolean }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(result);
+      };
+
+      child.on('error', (err: Error) => {
+        finish({ stdout, stderr: stderr || err.message, passed: false, timedOut });
+      });
+      child.on('close', (code: number | null) => {
+        finish({ stdout, stderr, passed: code === 0 && !timedOut, timedOut });
+      });
+    });
   }
 
   protected parseJSONCoverage(projectDir: string): CoverageMetrics | undefined {
