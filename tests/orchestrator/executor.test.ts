@@ -31,6 +31,67 @@ describe('extractActionItems — short checklist for the fixer', () => {
     const out = extractActionItems('Just a prose paragraph with no list structure at all.');
     expect(out).toContain('Just a prose paragraph');
   });
+
+  it('matches markdown-bolded numbered headers (**1. …**)', () => {
+    const fb = [
+      '**1. Event payload format mismatch — create vs update (BLOCKER)**',
+      '',
+      'The create handler emits a different shape...',
+      '',
+      '**2. Metadata spread corruption in test mock (HIGH)**',
+      'The mock spreads metadata incorrectly...',
+    ].join('\n');
+    const out = extractActionItems(fb);
+    expect(out).toContain('1. Event payload format mismatch — create vs update (BLOCKER)');
+    expect(out).toContain('2. Metadata spread corruption in test mock (HIGH)');
+    // The ** wrappers must be stripped, not carried into the checklist.
+    expect(out).not.toContain('**');
+  });
+
+  it('drops the trailing "Non-issues" section and keeps the real numbered issues', () => {
+    // Exact shape from the WI-5 regression: 5 bold-numbered blockers followed by
+    // a "Non-issues" bullet list. The fixer must receive the 5 issues, NOT the
+    // 3 non-issue bullets (the original bug surfaced only the non-issues).
+    const fb = [
+      '**1. Event payload format mismatch — create vs update (BLOCKER)**',
+      'Details...',
+      '**2. Metadata spread corruption in test mock (HIGH)**',
+      'Details...',
+      '**3. Race condition on concurrent writes (MEDIUM)**',
+      'Details...',
+      '**4. Missing test for assigneeId propagation (LOW)**',
+      'Details...',
+      '**5. Error handling via string prefix matching (LOW)**',
+      'Details...',
+      '',
+      '**Non-issues (already known or pre-existing):**',
+      '- `cast` widened to `any` — pre-existing pattern in create handler',
+      '- `@types/pg` missing — pre-existing across the project',
+      '- Pool leak fixed correctly with module-level singleton',
+    ].join('\n');
+    const out = extractActionItems(fb);
+    expect(out).toContain('1. Event payload format mismatch');
+    expect(out).toContain('5. Error handling via string prefix matching (LOW)');
+    // None of the non-issue bullets should leak into the checklist.
+    expect(out).not.toContain('cast');
+    expect(out).not.toContain('@types/pg');
+    expect(out).not.toContain('Pool leak');
+    expect(out.split('\n')).toHaveLength(5);
+  });
+
+  it('prefers numbered issues over interleaved bullet sub-points', () => {
+    const fb = [
+      '**1. Validation gap (HIGH)**',
+      '- sub-point a',
+      '- sub-point b',
+      '**2. Logging missing (LOW)**',
+    ].join('\n');
+    const out = extractActionItems(fb);
+    expect(out.split('\n')).toHaveLength(2);
+    expect(out).toContain('1. Validation gap (HIGH)');
+    expect(out).toContain('2. Logging missing (LOW)');
+    expect(out).not.toContain('sub-point');
+  });
 });
 
 describe('boundFeedbackForPrompt — protects the context window', () => {

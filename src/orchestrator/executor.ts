@@ -192,19 +192,36 @@ export function boundFeedbackForPrompt(text: string, maxChars = 6000): string {
  * Parses numbered items (`1.`/`1)`) and bullets (`-`,`*`,`•`), keeping each
  * item's title line. Falls back to a small bounded snippet when there's no list.
  */
-export function extractActionItems(feedback: string, maxItems = 12, maxLen = 160): string {
+export function extractActionItems(feedback: string, maxItems = 15, maxLen = 200): string {
   if (!feedback) return '';
-  const items: string[] = [];
-  for (const line of feedback.split('\n')) {
-    const m = line.match(/^\s*(?:\d+[.)]|[-*•])\s+(.+\S)/);
-    if (!m) continue;
-    const title = m[1]!.replace(/\*\*/g, '').trim();
-    if (!title) continue;
-    items.push(title.length > maxLen ? title.slice(0, maxLen) + '…' : title);
-    if (items.length >= maxItems) break;
+  const clean = (s: string) => s.replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
+  const numbered: string[] = [];
+  const bullets: string[] = [];
+  let skipping = false;
+  for (const raw of feedback.split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    // Once we reach a "Non-issues / already known / pre-existing / nits" section,
+    // stop collecting — those are explicitly NOT things to fix. (The bug this
+    // guards against: a reviewer's trailing non-issues bullet list getting sent
+    // as the checklist while the real bold-numbered blockers were dropped.)
+    const bare = line.replace(/^[*_#>\s]+/, '');
+    if (/^(non[-\s]?issues?|already[-\s]known|pre[-\s]?existing|nit(s|picks)?|out[-\s]of[-\s]scope)\b/i.test(bare)) {
+      skipping = true;
+    }
+    if (skipping) continue;
+    // Numbered item — tolerate markdown wrappers like **1. …**, ### 1) …, > 1. …
+    const num = line.match(/^[*_#>\s]*\d+[.)]\s+(.+\S)/);
+    if (num) { numbered.push(clean(num[1]!)); continue; }
+    // Bullet item (dash or • — not "*", which collides with **bold** emphasis).
+    const bul = line.match(/^[>\s]*[-•]\s+(.+\S)/);
+    if (bul) bullets.push(clean(bul[1]!));
   }
-  if (items.length === 0) return boundFeedbackForPrompt(feedback, 1200); // no list structure
-  return items.map((t, i) => `${i + 1}. ${t}`).join('\n');
+  // Prefer numbered items (the reviewer's main issues); bullets are usually
+  // sub-points. Fall back to a bounded snippet only if nothing parsed.
+  const chosen = (numbered.length ? numbered : bullets).slice(0, maxItems);
+  if (chosen.length === 0) return boundFeedbackForPrompt(feedback, 1500);
+  return chosen.map((t, i) => `${i + 1}. ${t.length > maxLen ? t.slice(0, maxLen) + '…' : t}`).join('\n');
 }
 
 export function reviewerVerdictComplete(text: string): boolean {
