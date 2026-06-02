@@ -703,7 +703,10 @@ export function pruneContextMessages(
     const msg = messages[i];
     if (!Array.isArray(msg?.content)) continue;
     for (const block of msg.content) {
-      if (block?.type === 'tool_result' || block?.type === 'tool_use') {
+      // tool_result/tool_use are stubbable (Pass 1/2); large text/thinking blocks
+      // are truncatable (Pass 3). Any of these means pruning can help.
+      if (block?.type === 'tool_result' || block?.type === 'tool_use'
+          || block?.type === 'text' || block?.type === 'thinking') {
         hasPrunable = true;
         break;
       }
@@ -768,6 +771,29 @@ export function pruneContextMessages(
         current -= (before - after);
         stubbedBlocks++;
       }
+    }
+  }
+
+  // Pass 3: still over budget after trimming tool I/O — the remaining bulk is
+  // accumulated assistant text / thinking, which Passes 1-2 can't touch. Head+tail
+  // truncate the oldest large text/thinking blocks (protected recent window left
+  // verbatim) until under budget. This is what stops a long reasoning-heavy run
+  // (many turns of thinking) from drifting past the model's window.
+  const TEXT_KEEP_TOKENS = 200;
+  for (let i = 0; i < protectStart && current > budgetTokens; i++) {
+    const msg = result[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (let j = 0; j < msg.content.length && current > budgetTokens; j++) {
+      const block = msg.content[j];
+      const field = block?.type === 'text' && typeof block.text === 'string' ? 'text'
+        : block?.type === 'thinking' && typeof block.thinking === 'string' ? 'thinking'
+        : null;
+      if (!field) continue;
+      const before = estimateBlockTokens(block);
+      if (before <= TEXT_KEEP_TOKENS) continue; // not worth truncating
+      block[field] = truncateText(block[field], TEXT_KEEP_TOKENS);
+      current -= (before - estimateBlockTokens(block));
+      truncatedBlocks++;
     }
   }
 

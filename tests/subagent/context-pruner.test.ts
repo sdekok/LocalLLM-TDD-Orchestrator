@@ -179,6 +179,36 @@ describe('pruneContextMessages', () => {
     expect(out[0].content[0].content).toMatch(/elided/);
   });
 
+  it('truncates oversized old assistant TEXT when still over budget (Pass 3)', () => {
+    const messages = [
+      assistant(text(BIG)),               // old, huge text → truncated
+      user('a'),
+      assistant(text(BIG)),               // old, huge text → truncated
+      user('b'),
+      user('keep recent'),                // protected
+      assistant(text('recent answer')),   // protected — verbatim
+    ];
+    const { messages: out, stats } = pruneContextMessages(messages, 5_000, 2);
+    expect(stats.truncatedBlocks).toBeGreaterThanOrEqual(1);
+    expect(out[0].content[0].text).not.toBe(BIG);
+    expect(out[0].content[0].text.length).toBeLessThan(BIG.length);
+    expect(out[5].content[0].text).toBe('recent answer'); // recent untouched
+    expect(stats.totalAfter).toBeLessThanOrEqual(stats.totalBefore);
+  });
+
+  it('also truncates oversized old thinking blocks when over budget (Pass 3)', () => {
+    const thinking = (t: string) => ({ type: 'thinking', thinking: t });
+    const messages = [
+      assistant(thinking(BIG)),            // old huge thinking → truncated
+      user('a'),
+      user('b'),
+      assistant(text('done')),             // protected
+    ];
+    const { messages: out, stats } = pruneContextMessages(messages, 3_000, 2);
+    expect(stats.truncatedBlocks).toBeGreaterThanOrEqual(1);
+    expect(out[0].content[0].thinking).not.toBe(BIG);
+  });
+
   it('does not prune when message count <= keepRecentMessages', () => {
     const messages = [
       user([toolResult(BIG)]),
