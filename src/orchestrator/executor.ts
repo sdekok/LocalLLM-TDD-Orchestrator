@@ -1532,54 +1532,15 @@ export class WorkflowExecutor {
             }
 
             // Capture the full WI-branch diff for loop detection and reviewer context.
-            // Three-dot syntax (`originalBranch...HEAD`) diffs from the merge-base —
-            // i.e. every commit the implementer made on this branch — regardless of
-            // how originalBranch has moved since. Also fetch the commit log so the
-            // reviewer can see the per-commit story, plus any uncommitted changes.
-            currentDiff = '';
-            changedFiles = [];
-            let commitLog = '';
-            let uncommittedDiff = '';
-            try {
-              const [diffResult, namesResult, logResult, uncommittedResult] = await Promise.all([
-                execFileAsync('git', ['diff', `${originalBranch}...HEAD`], {
-                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
-                }),
-                execFileAsync('git', ['diff', '--name-only', `${originalBranch}...HEAD`], {
-                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
-                }),
-                execFileAsync('git', ['log', `${originalBranch}..HEAD`, '--pretty=format:%h %s'], {
-                  cwd: this.state.projectDir, timeout: 5_000, maxBuffer: DEFAULT_MAX_BUFFER,
-                }),
-                execFileAsync('git', ['diff', 'HEAD'], {
-                  cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
-                }),
-              ]);
-              currentDiff = diffResult.stdout;
-              changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
-              commitLog = logResult.stdout.trim();
-              uncommittedDiff = uncommittedResult.stdout;
-
-              // Append uncommitted changes to the captured diff. The implementer is
-              // supposed to commit before DONE, but in failure modes (loop, timeout)
-              // there may still be unsaved work worth surfacing to the reviewer.
-              if (uncommittedDiff.trim()) {
-                currentDiff += `\n\n# === UNCOMMITTED CHANGES ===\n${uncommittedDiff}`;
-              }
-
-              if (!currentDiff.trim() && commitLog === '') {
-                logger.warn(`[${task.id}] Captured diff is empty — WI branch has no commits and no uncommitted changes vs ${originalBranch}`);
-              }
-            } catch (err) {
-              // Surface git failures instead of silently producing an empty diff,
-              // which previously caused the reviewer to receive a blank prompt.
-              logger.warn(`[${task.id}] Failed to capture branch diff vs ${originalBranch}: ${(err as Error).message}`);
+            {
+              const captured = await this.captureBranchDiff(originalBranch, task.id);
+              currentDiff = captured.diff;
+              changedFiles = captured.changedFiles;
+              // Stash the commit log on a closure-scoped var so the prompt builder
+              // below can pick it up. (Kept separate from currentDiff because the
+              // log goes into its own section, not the diff fence.)
+              currentCommitLog = captured.commitLog;
             }
-
-            // Stash the commit log on a closure-scoped var so the prompt builder below
-            // can pick it up. (Kept separate from currentDiff because the log goes
-            // into its own section, not the diff fence.)
-            currentCommitLog = commitLog;
 
             // Only treat high cross-attempt similarity as a loop when the PREVIOUS
             // attempt's gates PASSED — i.e. a reviewer-rejection loop on working
@@ -1737,6 +1698,27 @@ export class WorkflowExecutor {
 
           // Phase 4: Reviewing — runs for every task before merge
           {
+            // Resume safety net: when the workflow resumes directly into the
+            // reviewing phase (task.phase was 'reviewing'/'quality_gates' at
+            // restart), the implement block above — which checks out the task
+            // branch and captures the diff — is skipped. The resume path leaves
+            // the repo on the BASE branch (see ensureOnBaseBranch), so without
+            // this the reviewer inspects the base branch with an empty diff and
+            // reports "no implementation exists" even though the work is committed
+            // on the task branch. Ensure we're on the task branch and have a diff
+            // before the reviewer looks at the tree.
+            const reviewBranch = await this.sandbox.getCurrentBranch();
+            if (reviewBranch !== branchName) {
+              logger.warn(`[${task.id}] Reviewing on "${reviewBranch}", not task branch "${branchName}" (resumed past implement) — checking out task branch`);
+              await this.sandbox.safeCheckout(branchName);
+            }
+            if (!currentDiff.trim() && changedFiles.length === 0) {
+              const captured = await this.captureBranchDiff(originalBranch, task.id);
+              currentDiff = captured.diff;
+              changedFiles = captured.changedFiles;
+              currentCommitLog = captured.commitLog;
+            }
+
             this.state.updateSubtask(task.id, { phase: 'reviewing' });
             const subtask = task!;
             this.events.emit('taskProgress', {
@@ -2320,6 +2302,58 @@ export class WorkflowExecutor {
         'tdd-reviewer'
       );
     }
+  }
+
+  /**
+   * Capture the full work-item branch diff vs the base branch, plus the commit
+   * log and any uncommitted changes. Three-dot syntax (`base...HEAD`) diffs from
+   * the merge-base, so it shows every commit on the task branch regardless of how
+   * the base has moved. Used to give the reviewer/arbiter the evidence to review.
+   * Returns empty strings on git failure rather than throwing.
+   */
+  private async captureBranchDiff(
+    originalBranch: string,
+    taskId: string,
+  ): Promise<{ diff: string; changedFiles: string[]; commitLog: string }> {
+    const logger = getLogger();
+    let diff = '';
+    let changedFiles: string[] = [];
+    let commitLog = '';
+    try {
+      const [diffResult, namesResult, logResult, uncommittedResult] = await Promise.all([
+        execFileAsync('git', ['diff', `${originalBranch}...HEAD`], {
+          cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+        execFileAsync('git', ['diff', '--name-only', `${originalBranch}...HEAD`], {
+          cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+        execFileAsync('git', ['log', `${originalBranch}..HEAD`, '--pretty=format:%h %s'], {
+          cwd: this.state.projectDir, timeout: 5_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+        execFileAsync('git', ['diff', 'HEAD'], {
+          cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER,
+        }),
+      ]);
+      diff = diffResult.stdout;
+      changedFiles = namesResult.stdout.trim().split('\n').filter(Boolean);
+      commitLog = logResult.stdout.trim();
+
+      // Append uncommitted changes. The implementer is supposed to commit before
+      // DONE, but in failure modes (loop, timeout) there may still be unsaved work.
+      const uncommittedDiff = uncommittedResult.stdout;
+      if (uncommittedDiff.trim()) {
+        diff += `\n\n# === UNCOMMITTED CHANGES ===\n${uncommittedDiff}`;
+      }
+
+      if (!diff.trim() && commitLog === '') {
+        logger.warn(`[${taskId}] Captured diff is empty — WI branch has no commits and no uncommitted changes vs ${originalBranch}`);
+      }
+    } catch (err) {
+      // Surface git failures instead of silently producing an empty diff,
+      // which previously caused the reviewer to receive a blank prompt.
+      logger.warn(`[${taskId}] Failed to capture branch diff vs ${originalBranch}: ${(err as Error).message}`);
+    }
+    return { diff, changedFiles, commitLog };
   }
 
   /**

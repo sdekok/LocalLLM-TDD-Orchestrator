@@ -51,6 +51,8 @@ vi.mock('../../src/orchestrator/sandbox.js', () => {
   const sandboxInstance = {
     createBranch: vi.fn(async () => undefined),
     getCurrentBranch: vi.fn(async () => 'main'),
+    safeCheckout: vi.fn(async () => undefined),
+    ensureOnBaseBranch: vi.fn(async (b?: string) => b ?? 'main'),
     rollback: vi.fn(async () => undefined),
     mergeAndCleanup: vi.fn(async () => undefined),
     commit: vi.fn(async () => undefined),
@@ -683,6 +685,63 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
     expect(reviewerPromptArg).toContain('+added line');
     expect(reviewerPromptArg).toContain('Changed Files');
     expect(reviewerPromptArg).toContain('Diff');
+  });
+
+  it('checks out the task branch before reviewing (resume-into-review safety net)', async () => {
+    // Regression: when resuming directly into the reviewing phase, the implement
+    // block (which checks out the task branch + captures the diff) is skipped and
+    // the repo is left on the BASE branch. The reviewer then saw an empty tree and
+    // reported "no implementation exists" even though the work was committed on the
+    // task branch. The review phase must ensure the task branch is checked out and
+    // a diff is captured before the reviewer inspects the tree.
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { Sandbox } = await import('../../src/orchestrator/sandbox.js');
+    const sandbox = new (Sandbox as any)();
+    sandbox.safeCheckout.mockClear();
+    // The repo is sitting on the base branch (mirrors the resume path that calls
+    // ensureOnBaseBranch and switches off the task branch).
+    sandbox.getCurrentBranch.mockResolvedValue('feature/base');
+
+    state.initWorkflow('epic-resume-review');
+    state.setSubtasks([{ id: 'WI-1', description: 'Resume review task' }]);
+
+    (execFileAsync as any).mockImplementation(async (_cmd: string, args: string[]) => {
+      if (args.includes('--name-only')) return { stdout: 'src/handler.ts\n', stderr: '' };
+      return { stdout: 'diff --git a/src/handler.ts b/src/handler.ts\n+impl\n', stderr: '' };
+    });
+
+    const reviewText = 'APPROVED: true\nFEEDBACK: ok';
+    let reviewerPromptArg = '';
+    const { session: implSession } = makeMockSession();
+    const { session: reviewerSession, fire: fireReviewer } = makeMockSession();
+    let callCount = 0;
+    (createSubAgentSession as any).mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) return implSession;
+      reviewerSession.prompt = vi.fn().mockImplementation(async (prompt: string) => {
+        reviewerPromptArg = prompt;
+        fireReviewer({ type: 'message_end', message: { role: 'assistant', content: [{ type: 'text', text: reviewText }] } });
+      });
+      return reviewerSession;
+    });
+
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined });
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Resume review task', subtasks: [] });
+
+    await (executor as any).processQueue();
+
+    // The task branch was checked out before review…
+    const checkedOut = sandbox.safeCheckout.mock.calls.map((c: any[]) => c[0]);
+    expect(checkedOut.some((b: string) => b.startsWith('tdd-workflow/'))).toBe(true);
+    // …and the reviewer still received the diff (captured after the checkout).
+    expect(reviewerPromptArg).toContain('src/handler.ts');
+    expect(reviewerPromptArg).toContain('+impl');
+
+    // Restore the shared mock's default so later tests still see 'main'.
+    sandbox.getCurrentBranch.mockResolvedValue('main');
   });
 
   it('processQueue includes implementation-notes.md content in reviewer prompt when the file exists', async () => {
