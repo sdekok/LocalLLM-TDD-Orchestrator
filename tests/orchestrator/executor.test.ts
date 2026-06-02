@@ -1,6 +1,22 @@
 import { describe, it, expect } from 'vitest';
-import { outputSimilarity, reviewerVerdictComplete } from '../../src/orchestrator/executor.js';
+import { outputSimilarity, reviewerVerdictComplete, boundFeedbackForPrompt } from '../../src/orchestrator/executor.js';
 import * as path from 'path';
+
+describe('boundFeedbackForPrompt — protects the context window', () => {
+  it('returns short feedback unchanged', () => {
+    expect(boundFeedbackForPrompt('all good', 100)).toBe('all good');
+  });
+  it('truncates oversized feedback and notes the omission', () => {
+    const big = 'x'.repeat(50_000);
+    const out = boundFeedbackForPrompt(big, 6000);
+    expect(out.length).toBeLessThan(7000);
+    expect(out).toContain('truncated to protect the context window');
+  });
+  it('handles empty/undefined input', () => {
+    expect(boundFeedbackForPrompt('', 100)).toBe('');
+    expect(boundFeedbackForPrompt(undefined as any, 100)).toBe(undefined as any);
+  });
+});
 
 describe('reviewerVerdictComplete — triggers format self-correction', () => {
   it('approved verdict is complete without feedback', () => {

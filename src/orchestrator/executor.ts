@@ -168,6 +168,22 @@ export function outputSimilarity(a: string, b: string): number {
  * emit the structured format instead of dumping its raw analysis/thinking.
  * An approval needs no feedback.
  */
+/**
+ * Cap feedback/gate text before it's injected into a model prompt. A failing
+ * gate can dump the full test/build output (a single broken import can cascade
+ * into thousands of failing-test signatures), and that text is interpolated raw
+ * into both the implementer's fixer prompt and the arbiter prompt. Left
+ * unbounded it blows past the model's context window → the model returns empty
+ * output (no DONE / no verdict). The full text is always preserved on disk in
+ * .tdd-workflow (feedback history + gate reports), so truncating the prompt copy
+ * loses nothing actionable — the first N chars carry the actionable head.
+ */
+export function boundFeedbackForPrompt(text: string, maxChars = 6000): string {
+  if (!text || text.length <= maxChars) return text;
+  const omitted = text.length - maxChars;
+  return `${text.slice(0, maxChars)}\n… (${omitted.toLocaleString()} more chars truncated to protect the context window — full details in .tdd-workflow/logs)`;
+}
+
 export function reviewerVerdictComplete(text: string): boolean {
   if (!/APPROVED:\s*(true|false)/i.test(text)) return false;
   if (/APPROVED:\s*false/i.test(text)) {
@@ -1249,10 +1265,11 @@ export class WorkflowExecutor {
                 ? `\n### Current Implementation (git diff ${originalBranch})\n\`\`\`diff\n${inlineDiff}\n\`\`\`\n`
                 : `\n### Current Implementation\nBranch \`${branchName}\` — no committed changes yet.\n`;
 
-              // Include the latest feedback verbatim — most actionable.
+              // Include the latest feedback (bounded — a huge gate dump would
+              // otherwise blow the context window; full text is on disk).
               implementerPrompt +=
                 `\n### Latest Feedback — Round ${latestFeedback.round} (${latestLabel})\n` +
-                `${feedback}\n`;
+                `${boundFeedbackForPrompt(feedback)}\n`;
 
               // Include a size-bounded summary of all prior rounds so the model
               // knows what has already been tried.
@@ -1588,8 +1605,11 @@ export class WorkflowExecutor {
                 const baseline = baselineGateOutputs.get(g.gate);
                 if (baseline === undefined) {
                   // No baseline for this gate — it was green before, now red. Full regression.
+                  // Bound the raw gate output — a failing test/build can emit
+                  // hundreds of KB that would otherwise blow the implementer/arbiter
+                  // context window. Full output is in the gate report on disk.
                   regressionGates.push(g);
-                  regressionReports.push(`[${g.gate.toUpperCase()} BLOCKING]\n${g.output}`);
+                  regressionReports.push(`[${g.gate.toUpperCase()} BLOCKING]\n${boundFeedbackForPrompt(g.output, 4000)}`);
                   continue;
                 }
                 const { newErrors, baselineCount, currentCount } = diffGateFailures(g.gate, baseline, g.output);
@@ -1598,10 +1618,17 @@ export class WorkflowExecutor {
                   continue;
                 }
                 regressionGates.push(g);
+                // Cap the new-error list — a single broken import can cascade into
+                // thousands of failing-test signatures; the head is what's actionable.
+                const MAX_LISTED_ERRORS = 40;
+                const listed = newErrors.slice(0, MAX_LISTED_ERRORS).map(e => `  • ${e}`).join('\n');
+                const moreErrors = newErrors.length > MAX_LISTED_ERRORS
+                  ? `\n  … and ${newErrors.length - MAX_LISTED_ERRORS} more new error(s) — see the gate report in .tdd-workflow/logs`
+                  : '';
                 regressionReports.push(
                   `[${g.gate.toUpperCase()} BLOCKING] ${newErrors.length} new error(s) introduced ` +
                   `(baseline had ${baselineCount}, now ${currentCount}):\n` +
-                  newErrors.map(e => `  • ${e}`).join('\n')
+                  listed + moreErrors
                 );
               }
 
@@ -2289,7 +2316,7 @@ export class WorkflowExecutor {
     const arbiterPrompt =
       `## Task\n${task.description}\n\n` +
       `## Quality Gates\n${qualityGatesPassed ? '✅ Passed' : '❌ Failed — code has blocking quality issues'}\n\n` +
-      `## Reviewer\'s Final Feedback\n${feedback || '(no feedback recorded)'}` +
+      `## Reviewer\'s Final Feedback\n${feedback ? boundFeedbackForPrompt(feedback) : '(no feedback recorded)'}` +
       historySummary +
       diffSummary;
 
