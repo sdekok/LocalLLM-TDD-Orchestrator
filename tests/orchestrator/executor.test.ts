@@ -1,6 +1,37 @@
 import { describe, it, expect } from 'vitest';
-import { outputSimilarity, reviewerVerdictComplete, boundFeedbackForPrompt } from '../../src/orchestrator/executor.js';
+import { outputSimilarity, reviewerVerdictComplete, boundFeedbackForPrompt, extractActionItems } from '../../src/orchestrator/executor.js';
 import * as path from 'path';
+
+describe('extractActionItems — short checklist for the fixer', () => {
+  it('pulls numbered item titles, dropping the verbose body', () => {
+    const fb = [
+      '1. LSP type error on index.ts:120 — stateStore passed where required',
+      '',
+      'The module-scope variable is declared OAuthStateStore | undefined and ...long paragraph...',
+      '',
+      '2. Missing test for cross-user authorization on DELETE',
+      'Add a test that ...',
+    ].join('\n');
+    const out = extractActionItems(fb);
+    expect(out).toContain('1. LSP type error on index.ts:120');
+    expect(out).toContain('2. Missing test for cross-user authorization on DELETE');
+    expect(out).not.toContain('long paragraph');
+  });
+  it('handles bullet lists (e.g. gate error signatures)', () => {
+    const out = extractActionItems('[TESTS BLOCKING] 3 new error(s):\n  • a.test.ts > x failed\n  • b.test.ts > y failed');
+    expect(out).toContain('1. a.test.ts > x failed');
+    expect(out).toContain('2. b.test.ts > y failed');
+  });
+  it('caps the number of items', () => {
+    const many = Array.from({ length: 30 }, (_, i) => `${i + 1}. issue ${i + 1}`).join('\n');
+    const lines = extractActionItems(many, 12).split('\n');
+    expect(lines.length).toBe(12);
+  });
+  it('falls back to a bounded snippet when there is no list', () => {
+    const out = extractActionItems('Just a prose paragraph with no list structure at all.');
+    expect(out).toContain('Just a prose paragraph');
+  });
+});
 
 describe('boundFeedbackForPrompt — protects the context window', () => {
   it('returns short feedback unchanged', () => {

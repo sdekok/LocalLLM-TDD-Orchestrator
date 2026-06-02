@@ -184,6 +184,29 @@ export function boundFeedbackForPrompt(text: string, maxChars = 6000): string {
   return `${text.slice(0, maxChars)}\n… (${omitted.toLocaleString()} more chars truncated to protect the context window — full details in .tdd-workflow/logs)`;
 }
 
+/**
+ * Reduce verbose reviewer/gate feedback to a short, actionable checklist for the
+ * fixer/retry prompt. The full text is written to the on-disk feedback history
+ * (.tdd-workflow/logs/feedback-history-<taskId>.md), so the model only needs the
+ * LIST of what to address — not paragraphs of detail that bloat the context.
+ * Parses numbered items (`1.`/`1)`) and bullets (`-`,`*`,`•`), keeping each
+ * item's title line. Falls back to a small bounded snippet when there's no list.
+ */
+export function extractActionItems(feedback: string, maxItems = 12, maxLen = 160): string {
+  if (!feedback) return '';
+  const items: string[] = [];
+  for (const line of feedback.split('\n')) {
+    const m = line.match(/^\s*(?:\d+[.)]|[-*•])\s+(.+\S)/);
+    if (!m) continue;
+    const title = m[1]!.replace(/\*\*/g, '').trim();
+    if (!title) continue;
+    items.push(title.length > maxLen ? title.slice(0, maxLen) + '…' : title);
+    if (items.length >= maxItems) break;
+  }
+  if (items.length === 0) return boundFeedbackForPrompt(feedback, 1200); // no list structure
+  return items.map((t, i) => `${i + 1}. ${t}`).join('\n');
+}
+
 export function reviewerVerdictComplete(text: string): boolean {
   if (!/APPROVED:\s*(true|false)/i.test(text)) return false;
   if (/APPROVED:\s*false/i.test(text)) {
@@ -1265,11 +1288,12 @@ export class WorkflowExecutor {
                 ? `\n### Current Implementation (git diff ${originalBranch})\n\`\`\`diff\n${inlineDiff}\n\`\`\`\n`
                 : `\n### Current Implementation\nBranch \`${branchName}\` — no committed changes yet.\n`;
 
-              // Include the latest feedback (bounded — a huge gate dump would
-              // otherwise blow the context window; full text is on disk).
+              // Send a short checklist of what to address — the full detail is in
+              // the on-disk feedback history, so we don't flood the context window.
               implementerPrompt +=
-                `\n### Latest Feedback — Round ${latestFeedback.round} (${latestLabel})\n` +
-                `${boundFeedbackForPrompt(feedback)}\n`;
+                `\n### Issues to Address — Round ${latestFeedback.round} (${latestLabel})\n` +
+                `${extractActionItems(feedback)}\n` +
+                `\n_Full detail for each item: \`.tdd-workflow/logs/feedback-history-${task.id}.md\`._\n`;
 
               // Include a size-bounded summary of all prior rounds so the model
               // knows what has already been tried.
@@ -1293,23 +1317,18 @@ export class WorkflowExecutor {
                 `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — continuing implementer session with reviewer feedback`
               );
 
-              // Build structured history so the implementer can see which issues are
-              // new this round vs. raised (and presumably addressed) in prior rounds.
-              const historySection = feedbackHistory.length > 1
-                ? feedbackHistory
-                    .slice()
-                    .reverse() // newest first
-                    .map((h, i) => {
-                      const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
-                      const marker = i === 0 ? ' ← address this round' : ' (previously raised)';
-                      return `### Round ${h.round} — ${label}${marker}\n${h.text}`;
-                    })
-                    .join('\n\n---\n\n')
-                : feedback;
+              // Persist the full feedback to disk, then send only a short checklist
+              // of this round's items — dumping every round's full text here was a
+              // major context-bloat source (a test cascade → 100K+ tokens).
+              writeFeedbackHistory(task.id, feedbackHistory, this.state.projectDir);
+              const priorNote = feedbackHistory.length > 1
+                ? ` (${feedbackHistory.length - 1} earlier round(s) are recorded there too)`
+                : '';
 
               implementerPrompt =
                 `Your previous code is still on this branch — do not start from scratch.\n\n` +
-                `## Feedback\n\n${historySection}\n\n` +
+                `## Issues to Address This Round\n\n${extractActionItems(feedback)}\n\n` +
+                `_Full detail for each item: \`.tdd-workflow/logs/feedback-history-${task.id}.md\`${priorNote}._\n\n` +
                 `## How to apply this feedback\n\n` +
                 `For each issue raised in the latest round:\n` +
                 `1. Find the exact location in your code.\n` +
