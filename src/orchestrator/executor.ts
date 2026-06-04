@@ -1019,7 +1019,12 @@ export class WorkflowExecutor {
     const baselineGateOutputs = new Map<string, string>();
     let baselineCoverage: CoverageMetrics | undefined;
     try {
-      const baseline = await runQualityGates(this.state.projectDir, { collectCoverage: true });
+      // fullScope: build/lint run across the WHOLE workspace (nx run-many), not
+      // just the empty initial diff (nx affected). Otherwise the baseline records
+      // zero pre-existing build/lint failures, and the first task that makes a
+      // project "affected" surfaces that project's pre-existing warnings as if the
+      // task introduced them. A full-scope baseline captures the real prior state.
+      const baseline = await runQualityGates(this.state.projectDir, { collectCoverage: true, fullScope: true });
       baselineCoverage = baseline.coverageMetrics;
       const failing = baseline.gates.filter(g => g.blocking && !g.passed);
       for (const g of failing) baselineGateOutputs.set(g.gate, g.output);

@@ -59,6 +59,12 @@ describe('getBuildCommand', () => {
     expect(getBuildCommand(dir)).toBe('npx nx affected -t build');
   });
 
+  it('uses nx run-many build at full scope (baseline)', () => {
+    pkg({ name: 'x', scripts: { build: 'tsc' } });
+    write('nx.json', '{}');
+    expect(getBuildCommand(dir, true)).toBe('npx nx run-many -t build');
+  });
+
   it('falls back to the package.json build script with the detected PM', () => {
     pkg({ name: 'x', scripts: { build: 'tsc -p tsconfig.build.json' } });
     write('pnpm-lock.yaml', '');
@@ -81,6 +87,18 @@ describe('getLintCommand', () => {
     pkg({ name: 'x' });
     write('nx.json', '{}');
     expect(getLintCommand(dir)).toBe('npx nx affected -t lint');
+  });
+
+  it('uses nx run-many lint at full scope (baseline)', () => {
+    pkg({ name: 'x' });
+    write('nx.json', '{}');
+    expect(getLintCommand(dir, true)).toBe('npx nx run-many -t lint');
+  });
+
+  it('full scope still defers to an explicit tddConfig.lintCommand', () => {
+    pkg({ name: 'x', tddConfig: { lintCommand: 'biome check .' } });
+    write('nx.json', '{}');
+    expect(getLintCommand(dir, true)).toBe('biome check .');
   });
 
   it('omits the dead --ext flag under flat config (eslint.config.mjs)', () => {

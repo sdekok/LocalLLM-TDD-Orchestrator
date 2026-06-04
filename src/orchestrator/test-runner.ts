@@ -316,12 +316,17 @@ function readTddConfig(projectDir: string): Record<string, unknown> {
  * Precedence: explicit `tddConfig.buildCommand` → Nx affected build →
  * package.json `build` script → null (caller falls back to `tsc --noEmit`).
  */
-export function getBuildCommand(projectDir: string): string | null {
+export function getBuildCommand(projectDir: string, fullScope = false): string | null {
   const cfg = readTddConfig(projectDir);
   if (typeof cfg['buildCommand'] === 'string' && (cfg['buildCommand'] as string).trim()) {
     return (cfg['buildCommand'] as string).trim();
   }
-  if (isNxWorkspace(projectDir)) return 'npx nx affected -t build';
+  // fullScope (used for the baseline) builds EVERY project, not just those
+  // affected by the current diff. At baseline time HEAD == base, so `nx affected`
+  // would build nothing and record no pre-existing failures — making any later
+  // per-task affected failure look like a brand-new regression. `run-many`
+  // captures the complete pre-existing state so the comparison is meaningful.
+  if (isNxWorkspace(projectDir)) return fullScope ? 'npx nx run-many -t build' : 'npx nx affected -t build';
   const pm = detectPackageManager(projectDir);
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
@@ -340,12 +345,18 @@ export function getBuildCommand(projectDir: string): string | null {
  * Note: `--ext` is a no-op under flat config (`eslint.config.*`), which selects
  * files itself; we only pass it for legacy `.eslintrc*` configs.
  */
-export function getLintCommand(projectDir: string): string | null {
+export function getLintCommand(projectDir: string, fullScope = false): string | null {
   const cfg = readTddConfig(projectDir);
   if (typeof cfg['lintCommand'] === 'string' && (cfg['lintCommand'] as string).trim()) {
     return (cfg['lintCommand'] as string).trim();
   }
-  if (isNxWorkspace(projectDir)) return 'npx nx affected -t lint';
+  // fullScope (used for the baseline) lints EVERY project. `nx affected` only
+  // lints projects touched by the current diff — but once a task edits a single
+  // file in a project, affected pulls in the WHOLE project, surfacing pre-existing
+  // warnings in untouched files. If the baseline used `affected` (nothing changed
+  // yet → nothing linted), those pre-existing warnings would be misreported as new
+  // regressions. `run-many` records the full pre-existing lint debt as the baseline.
+  if (isNxWorkspace(projectDir)) return fullScope ? 'npx nx run-many -t lint' : 'npx nx affected -t lint';
   const pm = detectPackageManager(projectDir);
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));

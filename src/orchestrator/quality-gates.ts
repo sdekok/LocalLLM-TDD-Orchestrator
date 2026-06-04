@@ -231,6 +231,16 @@ export interface RunQualityGatesOptions {
    * the final review.
    */
   collectCoverage?: boolean;
+  /**
+   * When true, resolve build/lint to their FULL-workspace form (`nx run-many`)
+   * instead of the diff-scoped `nx affected`. Use this ONLY for the baseline run
+   * at workflow start: `nx affected` against an empty diff lints/builds nothing,
+   * so it records no pre-existing failures and any later per-task `affected`
+   * failure (which pulls in whole affected projects) looks like a new regression.
+   * A full-scope baseline captures the complete pre-existing state so the
+   * signature comparison can correctly mask pre-existing issues.
+   */
+  fullScope?: boolean;
 }
 
 /**
@@ -272,7 +282,7 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   // Nx workspace getBuildCommand resolves to `nx affected -t build` so the
   // CONSUMERS of a changed lib are built too. We only fall back to a bare
   // `tsc --noEmit` when no build command can be resolved.
-  const buildCommand = getBuildCommand(projectDir);
+  const buildCommand = getBuildCommand(projectDir, options.fullScope);
   if (buildCommand) {
     gates.push(await runGate('build', splitCommand(buildCommand), projectDir, true, 300_000));
   } else {
@@ -341,7 +351,7 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   // Lint is the only gate that catches dependency-hygiene (undeclared deps) and
   // broken-config failures. getLintCommand resolves an Nx/script/eslint command
   // and is flat-config-aware (omits the dead `--ext` flag under eslint.config.*).
-  const lintCommand = getLintCommand(projectDir);
+  const lintCommand = getLintCommand(projectDir, options.fullScope);
   if (lintCommand) {
     gates.push(await runGate('lint', splitCommand(lintCommand), projectDir, true, 120_000));
   }
