@@ -6,7 +6,7 @@ The TDD Agentic Workflow orchestrator is a native **Pi Extension** that automate
 
 1. **Plans** — Breaks your request into testable subtasks, researching best practices via web search.
 2. **Implements** — Spawns a headless Pi sub-agent that writes tests and code natively using `read`, `edit`, and `bash` tools.
-3. **Validates** — Runs deterministic quality gates on the sub-agent's work: Lens (structural + type), TypeScript compile, test suite, coverage (opt-in), lint, file-safety.
+3. **Validates** — Runs deterministic quality gates on the sub-agent's work: Lens (structural + type), build (authoritative type-check), test suite, coverage (opt-in), lint, file-safety.
 4. **Reviews** — Spawns a reviewer sub-agent to score the implementation on test coverage and code quality.
 5. **Merges or Retries** — If gates + review pass, code is merged. If not, the implementer gets feedback and tries again (up to 5 attempts per task; a neutral arbiter then decides approve/continue/escalate).
 
@@ -248,13 +248,19 @@ The orchestrator does **not** ask an AI if the code is good enough. It runs dete
 | Gate | Type | What It Checks |
 |---|---|---|
 | **Lens Analysis** | Blocking | Structural bugs (ast-grep) + deep type errors (LSP) |
-| **TypeScript** | Blocking | `npx tsc --noEmit` — any type errors fail the gate |
+| **Build** | Blocking | The authoritative type-check: the project build (Nx `nx affected -t build`, or the `build` script) runs the production tsconfig(s) **and** the bundler — catching type-only re-export failures, declaration-emit errors, and consumer breakage that a bare `tsc --noEmit` misses. Falls back to `npx tsc --noEmit` only when no build command can be resolved. |
 | **Tests** | Blocking | Auto-detects test framework; always runs the same command the implementer uses (`npm run test` / `npx vitest run`) — never with `--coverage`, which would add overhead and risk false failures |
 | **Coverage** | Blocking _(opt-in)_ | Runs separately from the tests gate, only when `tddConfig.coverageThresholds` is set in `package.json` |
-| **Lint** | Non-blocking | ESLint warnings are logged but don't block |
+| **Lint** | Blocking _(new errors only)_ | The lint command (Nx `nx affected -t lint`, the `lint` script, or ESLint directly) runs as a blocking gate, but only **newly introduced** errors fail a task — pre-existing lint debt recorded in the baseline is masked (see [Pre-existing Failures](#pre-existing-failures-baseline)) |
 | **File Safety** | Blocking | Ensures files were only written to expected directories |
 
 The tests gate and coverage gate are always **separate runs**. This keeps the tests gate consistent with what the implementer sees when it runs tests locally, preventing coverage-instrumentation overhead from causing false failures (especially in slower integration tests).
+
+### Pre-existing Failures (Baseline)
+
+Before any agent runs, the orchestrator captures a **baseline** of every blocking gate. Only failures the implementer *introduces* count as regressions; anything already broken is reported once and then ignored, so a project's existing debt never traps the loop.
+
+The baseline runs at **full workspace scope**: per-task gates use fast `nx affected` (only the projects the diff touched), but the baseline uses `nx run-many` (every project). Otherwise `nx affected` against the empty initial diff would lint/build nothing, record no pre-existing debt, and then the first task to touch a project would surface that whole project's pre-existing warnings as if it had introduced them. A full-scope baseline records the real prior state so per-task `affected` failures are correctly recognised as pre-existing.
 
 ### Coverage Collection
 

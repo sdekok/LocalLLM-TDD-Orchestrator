@@ -17,7 +17,7 @@ Pi says "/tdd implement JWT auth"
    ┌─────────────┐     ┌───────────────────┐
    │ Implementer  │ ──▶ │  Quality Gates     │
    │ (Sub-Agent)  │     │  lens (Type/AST)   │
-   └──────┬──────┘     │  tsc → tests       │
+   └──────┬──────┘     │  build → tests     │
           │             │  → lint            │
           │             │  + test metrics     │
           │             │  + coverage         │
@@ -157,8 +157,9 @@ The easiest way to create or update either file is via `/setup` in Pi. You can a
 The implementer and reviewer are separate agents that communicate through structured artifacts, not shared memory:
 
 1. **Implementation notes** — at the end of its session the implementer writes `.tdd-workflow/implementation-notes.md` explaining design decisions, trade-offs, and any pre-existing issues it left alone intentionally.
-2. **Git diff** — the executor captures `git diff HEAD` after the implementer finishes and injects it (plus a changed-file list) directly into the reviewer's prompt.
+2. **Git diff** — after the implementer finishes, the executor captures the full work-item branch diff against its base (`git diff <base>...HEAD`, plus any uncommitted changes), and injects it — with a changed-file list and the per-commit log — directly into the reviewer's prompt. On resume the executor first checks out the work-item branch, so the reviewer always inspects the committed work rather than the base branch.
 3. **Scoped review** — the reviewer is instructed to treat the diff as its primary source of truth and only read additional files when the diff alone is insufficient to evaluate a type or test path.
+4. **Concise fix checklist** — when the reviewer rejects, the full feedback is written to `.tdd-workflow/logs/feedback-history-<task>.md` and the implementer is sent a short numbered checklist of just the action items (extracted from the reviewer's numbered issues, excluding any "non-issues" the reviewer noted). This keeps each retry prompt small and focused while the full detail stays on disk for the agent to read when needed.
 
 This means the reviewer always knows exactly what changed and why — it doesn't need to discover changes by exploring the filesystem.
 
@@ -180,6 +181,12 @@ Timeouts are enforced independently per agent via `Promise.race`. When a task ex
 - **Escalate** — posts the situation to Pi chat and waits for you to reply with `approve`, `continue 1–3`, or `stop`
 
 When a task ultimately fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+
+## Pre-existing Failures (Baseline)
+
+Before any agent runs, the orchestrator captures a **baseline** of every blocking gate so that issues which were already broken don't get blamed on — or block — the implementer. Only failures the implementer *introduces* are treated as regressions; pre-existing ones are reported once and then ignored.
+
+The baseline runs at **full workspace scope**. In an Nx monorepo the per-task gates use `nx affected` (fast — only the projects touched by the diff), but the baseline uses `nx run-many` (every project). This matters because `nx affected` against the initial empty diff would build/lint *nothing* and record no pre-existing debt — then the first task to touch a project would make that whole project "affected" and surface its pre-existing lint warnings as if the task had introduced them. Capturing the baseline across the whole workspace records the real prior state, so per-task `affected` failures are correctly recognised as pre-existing and masked.
 
 ## Pausing and Stopping a Workflow
 
@@ -256,10 +263,10 @@ TDD [Attempt 1]: Create JWT token generation
 Attempt: 1
 
 Quality Gates:
-  ✅ typescript (blocking)
+  ✅ build (blocking)
   ✅ tests (blocking)
   ✅ coverage (blocking)
-  ⚠️ lint
+  ✅ lint (blocking)
 
 Tests: 47/47 passed
 Coverage: 87.3% lines, 72.1% branches, 91.0% functions
