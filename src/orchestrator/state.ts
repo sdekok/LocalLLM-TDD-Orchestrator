@@ -60,6 +60,7 @@ export class StateManager {
     const excludePath = path.join(projectDir, '.git', 'info', 'exclude');
     const entries = [
       '.tdd-workflow/state.json',
+      '.tdd-workflow/lessons.json',
       '.tdd-workflow/logs/',
       '.pi-lens/',
     ];

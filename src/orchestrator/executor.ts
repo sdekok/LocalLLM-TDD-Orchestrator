@@ -17,10 +17,12 @@ import { execFileAsync, DEFAULT_MAX_BUFFER, sanitizeBranchName } from '../utils/
 import { getTestCommand, getCoverageTestCommand, detectPackageManager } from './test-runner.js';
 import {
   outputSimilarity,
+  boundFeedbackForPrompt,
   writeFeedbackHistory,
   isNoQuestionsPlaceholder,
   type FeedbackRound,
 } from './feedback.js';
+import { LessonStore, LESSON_EXTRACTOR_PROMPT, parseLessonCandidates, type LessonCandidate } from './lessons.js';
 import { withTimeout } from './timeout.js';
 import {
   buildInitialTaskPrompt,
@@ -113,6 +115,7 @@ const IDLE_NUDGE_MS               =  5 * 60 * 1000;
  */
 const SESSION_REFRESH_AFTER = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
+const LESSON_EXTRACTION_TIMEOUT_MS = 5 * 60 * 1000; // Budget for the post-task lesson-extraction call
 const MAX_ARBITER_ROUNDS = 3;                  // Max arbiter consultations per task — each can grant another "continue N"
 
 /**
@@ -924,6 +927,17 @@ export class WorkflowExecutor {
       // Per-task token/time accounting (wall clock starts now).
       const taskUsage = new UsageTracker();
       this.usageTrackers = [workflowUsage, taskUsage];
+
+      // Recurring-lesson injection: pick the lessons most relevant to this task
+      // so the implementer avoids the mistakes reviewers keep flagging.
+      let lessonsSection = '';
+      try {
+        const lessonStore = LessonStore.load(this.state.projectDir);
+        const taskText = `${task.description} ${task.devNotes ?? ''} ${(task.acceptance ?? []).join(' ')}`;
+        lessonsSection = LessonStore.renderForPrompt(lessonStore.selectForPrompt(taskText));
+      } catch (err) {
+        logger.warn(`[${task.id}] Could not load lessons: ${err}`);
+      }
       let approved = false;
       // Set when the implementer model produces no response (ModelUnreachableError).
       // Gates the pass/attempt loops so we don't re-enter and recreate the session,
@@ -1158,8 +1172,8 @@ export class WorkflowExecutor {
               writeFeedbackHistory(task.id, feedbackHistory, this.state.projectDir);
               implementerPrompt = buildRetryFeedbackPrompt(task.id, feedback, feedbackHistory.length);
             } else {
-              // First turn: full task description + metadata.
-              implementerPrompt = buildInitialTaskPrompt(task, technicalDescription);
+              // First turn: full task description + metadata + recurring lessons.
+              implementerPrompt = buildInitialTaskPrompt(task, technicalDescription, lessonsSection);
             }
 
             // Run the implementer, then nudge it to keep going if it didn't signal DONE.
@@ -1693,6 +1707,14 @@ export class WorkflowExecutor {
           this.activeImplementerHandle = null;
           logger.info('[EXECUTOR] Implementer session disposed after task completion.');
           await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+        }
+
+        // Self-learning: distill this task's feedback rounds into reusable
+        // lessons for future tasks. Only runs when there was actual feedback
+        // (clean first-pass approvals teach nothing). Fail-soft and skipped on
+        // interrupts/connectivity halts — never blocks workflow bookkeeping.
+        if (feedbackHistory.length > 0 && !haltSession && !this.stopRequested && !this.pauseRequested) {
+          await this.extractLessonsFromTask(task.id, feedbackHistory);
         }
       } // end if (task.phase !== 'merging')
 
@@ -2279,6 +2301,117 @@ export class WorkflowExecutor {
       );
       this.events.emit('workflowReviewWarning', { subtasks, reviewerFeedback });
     }
+  }
+
+  /**
+   * Run one lesson-extraction LLM call over a bounded feedback text and return
+   * parsed candidates. Fail-soft: any error returns [].
+   */
+  private async runLessonExtraction(feedbackText: string): Promise<LessonCandidate[]> {
+    const logger = getLogger();
+    let session: AgentSession | null = null;
+    let handle: { getTurnText(): string; dispose(): void } | null = null;
+    try {
+      session = await createSubAgentSession({
+        taskType: 'arbitrate',
+        systemPrompt: LESSON_EXTRACTOR_PROMPT,
+        cwd: this.state.projectDir,
+        modelRouter: this.modelRouter,
+        notify: this.notifyUi,
+        tools: 'none',
+      });
+      handle = this.subscribeToSession(session, 'Lesson Extractor', 'tdd-orchestrator');
+      await withTimeout(
+        this.promptUntilIdle(session, feedbackText),
+        LESSON_EXTRACTION_TIMEOUT_MS,
+        `Lesson extraction timed out after ${LESSON_EXTRACTION_TIMEOUT_MS / 60000} minutes`,
+      );
+      return parseLessonCandidates(handle.getTurnText());
+    } catch (err) {
+      logger.warn(`[Lessons] Extraction failed: ${err}`);
+      return [];
+    } finally {
+      try { handle?.dispose(); } catch { /* best-effort */ }
+      try { session?.dispose(); } catch { /* best-effort */ }
+      await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
+    }
+  }
+
+  /** Distill one finished task's feedback rounds into the lesson store. */
+  private async extractLessonsFromTask(taskId: string, feedbackHistory: FeedbackRound[]): Promise<void> {
+    const logger = getLogger();
+    try {
+      const input = boundFeedbackForPrompt(
+        feedbackHistory
+          .map(h => `## Round ${h.round} (${h.type === 'gates' ? 'Quality Gates' : 'Code Review'})\n${h.text.slice(0, 2000)}`)
+          .join('\n\n'),
+        12_000,
+      );
+      const candidates = await this.runLessonExtraction(input);
+      if (candidates.length === 0) return;
+
+      const store = LessonStore.load(this.state.projectDir);
+      const { added, reinforced } = store.mergeCandidates(candidates, taskId);
+      store.save();
+      logger.info(`[Lessons] ${taskId}: ${candidates.length} candidate(s) → ${added} new, ${reinforced} reinforced (${store.count()} total)`);
+      if (added > 0 || reinforced > 0) {
+        this.chatMessage?.(
+          `🧠 **[${taskId}]** Learned from this task's feedback: ${added} new lesson(s), ${reinforced} reinforced. ` +
+          `Lessons seen in 2+ tasks are injected into future implementer prompts (\`/tdd:lessons\` to view).`,
+          'tdd-orchestrator',
+        );
+      }
+    } catch (err) {
+      logger.warn(`[Lessons] extractLessonsFromTask failed for ${taskId}: ${err}`);
+    }
+  }
+
+  /**
+   * Retroactively learn from all feedback-history files on disk
+   * (.tdd-workflow/logs/feedback-history-*.md). Idempotent w.r.t. occurrence
+   * counts: a lesson is only reinforced once per source task, so re-running
+   * does not inflate counts. Used by /tdd:lessons learn.
+   */
+  public async learnFromFeedbackHistories(maxFiles = 30): Promise<{ files: number; added: number; reinforced: number; total: number }> {
+    const logger = getLogger();
+    const logsDir = path.join(this.state.projectDir, '.tdd-workflow', 'logs');
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(logsDir).filter(f => /^feedback-history-.+\.md$/.test(f));
+    } catch {
+      return { files: 0, added: 0, reinforced: 0, total: 0 };
+    }
+    files.sort((a, b) =>
+      fs.statSync(path.join(logsDir, b)).mtimeMs - fs.statSync(path.join(logsDir, a)).mtimeMs);
+    files = files.slice(0, maxFiles);
+
+    const store = LessonStore.load(this.state.projectDir);
+    let added = 0;
+    let reinforced = 0;
+    let processed = 0;
+
+    for (const file of files) {
+      const taskId = file.replace(/^feedback-history-/, '').replace(/\.md$/, '');
+      let raw = '';
+      try {
+        raw = fs.readFileSync(path.join(logsDir, file), 'utf-8');
+      } catch { continue; }
+      if (!raw.trim()) continue;
+
+      const candidates = await this.runLessonExtraction(boundFeedbackForPrompt(raw, 12_000));
+      const result = store.mergeCandidates(candidates, taskId);
+      added += result.added;
+      reinforced += result.reinforced;
+      processed++;
+      logger.info(`[Lessons] learn ${taskId}: ${candidates.length} candidate(s), +${result.added} new, ${result.reinforced} reinforced`);
+      this.chatMessage?.(
+        `🧠 ${taskId}: ${candidates.length} candidate(s) → +${result.added} new, ${result.reinforced} reinforced`,
+        'tdd-orchestrator',
+      );
+    }
+
+    store.save();
+    return { files: processed, added, reinforced, total: store.count() };
   }
 
   public async refineTaskIntoSubtasks(taskId: string, attempt: number): Promise<string> {

@@ -30,8 +30,11 @@ function taskMetadataSections(task: Subtask): string {
   return out;
 }
 
-/** First turn of a fresh task: full description + metadata. */
-export function buildInitialTaskPrompt(task: Subtask, technicalDescription: string): string {
+/**
+ * First turn of a fresh task: full description + metadata, plus the
+ * auto-learned lessons section (recurring reviewer findings) when available.
+ */
+export function buildInitialTaskPrompt(task: Subtask, technicalDescription: string, lessonsSection = ''): string {
   let prompt = technicalDescription;
   if (task.acceptance && task.acceptance.length > 0) {
     prompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
@@ -44,6 +47,9 @@ export function buildInitialTaskPrompt(task: Subtask, technicalDescription: stri
   }
   if (task.devNotes) {
     prompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
+  }
+  if (lessonsSection) {
+    prompt += `\n\n${lessonsSection}`;
   }
   return prompt;
 }

@@ -76,6 +76,7 @@ Inside any project, use the slash commands:
   - `/tdd:stop` — abort the running agent immediately, roll back the current task, reset it to pending. Repo looks like the task never ran.
   - `/tdd:resume` — pick up from a paused workflow.
 - **Status**: `/tdd:status` — read-only snapshot of the current workflow: per-task progress, attempts, current phase, and the latest reviewer feedback.
+- **Lessons**: `/tdd:lessons` — list the auto-learned lessons; `/tdd:lessons learn` — retroactively extract lessons from existing feedback logs; `/tdd:lessons forget <id>` — remove one.
 - **Cleanup**: `/tdd:project-cleanup` — scan all quality gates, then run a TDD workflow to fix every pre-existing failure
 - **Run tests**: `/tdd:test` — run the project's test suite and report failures
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
@@ -182,6 +183,18 @@ Timeouts are enforced independently per agent via `Promise.race`. When a task ex
 - **Escalate** — posts the situation to Pi chat and waits for you to reply with `approve`, `continue 1–3`, or `stop`
 
 When a task ultimately fails, the workflow stops and posts a chat message with the branch name, state file location, and exact resume command. The failed branch is preserved for inspection — nothing is cleaned up automatically.
+
+## Self-Learning Lessons
+
+The orchestrator learns from its own review cycles. After any task that needed feedback rounds, an extraction step (using the `arbitrate` model) distills the reviewer/gate feedback into short, general, imperative rules — e.g. *"Wrap multi-statement Postgres transactions on one dedicated client"*. Lessons live in `.tdd-workflow/lessons.json` (project) merged with `~/.config/tdd-workflow/lessons.json` (global, project wins).
+
+- **Injection**: lessons observed in **2+ distinct tasks** (or marked `"confirmed": true`) are scored against the task description by tag match, occurrences, and recency; the top 10 are added to the implementer's first-turn prompt. One-off observations are stored but not injected — a single reviewer nit shouldn't become policy.
+- **Reinforcement**: re-occurrence in a *new* task bumps the lesson's count; the same task reporting it twice does not. Re-running extraction is idempotent.
+- **Retroactive learning**: `/tdd:lessons learn [N]` scans the newest N (default 30) `feedback-history-*.md` files in `.tdd-workflow/logs/` and merges what it finds.
+- **Curation**: `/tdd:lessons` lists everything (🟢 = currently injected); `/tdd:lessons forget <id>` removes a bad rule. Hand-edit the JSON to set `"confirmed": true` on rules that should always apply.
+- The store is capped at 100 lessons; the weakest (fewest occurrences, oldest) are pruned first and confirmed lessons always survive.
+
+The payoff metric is attempts-per-task: as the store converges on your models' habitual failure modes, first-attempt approvals should rise — the per-task usage summaries give you the before/after numbers.
 
 ## Pre-existing Failures (Baseline)
 

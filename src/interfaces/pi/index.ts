@@ -29,6 +29,7 @@ import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo, rea
 import { completeTddArgs, completeReviewArgs, completeResearchArgs, completePlanArgs } from './autocomplete.js';
 import { parsePlanArgs, listExistingEpics, readPriorRequest } from './plan-helpers.js';
 import { formatWorkflowStatus } from './status.js';
+import { LessonStore, INJECT_MIN_OCCURRENCES } from '../../orchestrator/lessons.js';
 
 // Gate output can be 10MB+ from large monorepo test runs. The planner only
 // needs enough to identify failing files/tests — not full stack traces.
@@ -728,6 +729,84 @@ export default function(pi: ExtensionAPI) {
         cancelChatInput();
         ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
       });
+    },
+  });
+
+  pi.registerCommand('tdd:lessons', {
+    description: 'Manage auto-learned lessons from reviewer feedback. Usage: /tdd:lessons [learn [N]] [forget <id>]',
+    handler: async (args: string, ctx) => {
+      const parts = args.trim().split(/\s+/).filter(Boolean);
+      const sub = parts[0]?.toLowerCase();
+
+      if (sub === 'forget') {
+        const id = parts[1];
+        if (!id) {
+          ctx.ui.notify('Usage: /tdd:lessons forget <lesson-id>', 'warning');
+          return;
+        }
+        const store = LessonStore.load(ctx.cwd);
+        if (store.forget(id)) {
+          store.save();
+          ctx.ui.notify(`Lesson "${id}" removed.`, 'info');
+        } else {
+          ctx.ui.notify(`No lesson with id "${id}". Run /tdd:lessons to list ids.`, 'warning');
+        }
+        return;
+      }
+
+      if (sub === 'learn') {
+        const maxFiles = parts[1] ? Math.max(1, parseInt(parts[1], 10) || 30) : 30;
+        // Lazily construct the executor with the same wiring as /tdd:resume.
+        if (!stateManager) stateManager = new StateManager(ctx.cwd);
+        if (!executor) {
+          const modelRouter = new ModelRouter(null, ctx.cwd);
+          const searxngUrl = getSearxngUrl();
+          executor = new WorkflowExecutor(stateManager, modelRouter, {
+            searchClient: searxngUrl ? new SearchClient(searxngUrl) : null,
+            chatMessage: (content, type) => postToChat(content, type ?? 'tdd-orchestrator'),
+            waitForInput: async (prompt: string) => {
+              postToChat(`💬 ${prompt}`, 'tdd-question');
+              return await waitForChatInput();
+            },
+          });
+        }
+        ctx.ui.notify(`Learning from up to ${maxFiles} feedback-history file(s)…`, 'info');
+        ctx.ui.setStatus('tdd-lessons', '🧠 Extracting lessons…');
+        try {
+          const result = await executor.learnFromFeedbackHistories(maxFiles);
+          ctx.ui.setStatus('tdd-lessons', undefined);
+          postToChat(
+            `🧠 **Lesson learning complete** — ${result.files} file(s) processed: ` +
+            `${result.added} new lesson(s), ${result.reinforced} reinforced, ${result.total} total in store.`,
+            'tdd-orchestrator',
+          );
+        } catch (err) {
+          ctx.ui.setStatus('tdd-lessons', undefined);
+          ctx.ui.notify(`Lesson learning failed: ${(err as Error).message}`, 'error');
+        }
+        return;
+      }
+
+      // Default: list lessons.
+      const store = LessonStore.load(ctx.cwd);
+      const lessons = store.all();
+      if (lessons.length === 0) {
+        postToChat(
+          'No lessons recorded yet. They accumulate automatically after tasks with feedback rounds, ' +
+          'or run `/tdd:lessons learn` to extract from existing feedback-history logs.',
+          'tdd-orchestrator',
+        );
+        return;
+      }
+      const lines = lessons.slice(0, 30).map(l => {
+        const active = l.confirmed || l.occurrences >= INJECT_MIN_OCCURRENCES ? '🟢' : '⚪';
+        return `${active} **${l.id}** (×${l.occurrences}, ${l.lastSeen}) — ${l.rule}`;
+      });
+      postToChat(
+        `## Lessons (${lessons.length} total — 🟢 = injected into implementer prompts)\n\n${lines.join('\n')}\n\n` +
+        `_\`/tdd:lessons learn\` to re-scan feedback logs · \`/tdd:lessons forget <id>\` to remove._`,
+        'tdd-orchestrator',
+      );
     },
   });
 

@@ -124,6 +124,16 @@ Read-only snapshot of the current workflow — safe to run at any time, includin
 - **Engine check**: warns if a task is marked `in_progress` but no executor is alive in this session (e.g. Pi was restarted mid-workflow) and tells you which resume command to use.
 - **Latest reviewer feedback**: shows the most recent feedback for the active (or first failed/paused) task, truncated to 600 chars with a pointer to the full history in `.tdd-workflow/logs/`.
 
+### `/tdd:lessons`
+
+Manages the self-learning lesson store (`.tdd-workflow/lessons.json`). Lessons are short imperative rules distilled from reviewer/gate feedback; rules seen in 2+ tasks are automatically injected into future implementer prompts so recurring mistakes stop costing review rounds.
+
+- `/tdd:lessons` — list all lessons with occurrence counts. 🟢 marks lessons currently being injected.
+- `/tdd:lessons learn [N]` — retroactively extract lessons from the newest N (default 30) feedback-history files in `.tdd-workflow/logs/`. Idempotent — re-running doesn't inflate occurrence counts.
+- `/tdd:lessons forget <id>` — delete a lesson that turned out to be wrong or noisy.
+
+Lessons are also extracted automatically at the end of every task that had feedback rounds (fail-soft — extraction problems never block the workflow). A global store at `~/.config/tdd-workflow/lessons.json` is merged in read-only; set `"confirmed": true` on a lesson to force-inject it regardless of occurrence count.
+
 ### `/tdd:project-cleanup`
 
 Audits every quality gate across the whole project **before any agent runs**, summarises the failing gates in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
