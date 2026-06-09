@@ -657,8 +657,14 @@ function truncateToolResultBlock(block: any, maxTokens: number): boolean {
  *    truncation. This is the guard against a fresh giant test/build dump or
  *    file read overflowing the window on its own, which full-message stubbing
  *    can't catch because the recent window is otherwise preserved verbatim.
- *  - Pass 1 walks oldest→newest stubbing whole tool_result payloads.
- *  - Pass 2 stubs tool_use input if still over.
+ *  - Pass 1 truncates old THINKING blocks. For reasoning models with preserved
+ *    thinking the history is dominated by stale reasoning, which has near-zero
+ *    forward value — reclaiming it first protects tool results the model may
+ *    still need (e.g. contents of files it is actively editing).
+ *  - Pass 2 walks oldest→newest stubbing whole tool_result payloads.
+ *  - Pass 3 stubs tool_use input if still over.
+ *  - Pass 4 truncates old visible TEXT blocks last — they carry plans and
+ *    DONE summaries, the most load-bearing prose in the history.
  *
  * The last `keepRecentMessages` messages keep their structure (latest user
  * turn, latest tool roundtrip) so the model still has fresh ground truth; only
@@ -741,7 +747,27 @@ export function pruneContextMessages(
     }
   }
 
-  // Pass 1: stub tool_result content (biggest payloads — bash/read output).
+  // Pass 1: truncate old THINKING blocks FIRST. With preserved-thinking
+  // reasoning models (e.g. Qwen), stale reasoning dominates the history and has
+  // near-zero forward value — Qwen's own multi-turn guidance is that prior-turn
+  // reasoning should not inform later turns. Reclaiming it before touching tool
+  // results keeps content the model may still need (files it is editing).
+  const TEXT_KEEP_TOKENS = 200;
+  for (let i = 0; i < protectStart && current > budgetTokens; i++) {
+    const msg = result[i];
+    if (!Array.isArray(msg?.content)) continue;
+    for (let j = 0; j < msg.content.length && current > budgetTokens; j++) {
+      const block = msg.content[j];
+      if (block?.type !== 'thinking' || typeof block.thinking !== 'string') continue;
+      const before = estimateBlockTokens(block);
+      if (before <= TEXT_KEEP_TOKENS) continue; // not worth truncating
+      block.thinking = truncateText(block.thinking, TEXT_KEEP_TOKENS);
+      current -= (before - estimateBlockTokens(block));
+      truncatedBlocks++;
+    }
+  }
+
+  // Pass 2: stub tool_result content (biggest non-thinking payloads — bash/read output).
   for (let i = 0; i < protectStart && current > budgetTokens; i++) {
     const msg = result[i];
     if (!Array.isArray(msg?.content)) continue;
@@ -757,7 +783,7 @@ export function pruneContextMessages(
     }
   }
 
-  // Pass 2: stub tool_use input if still over (rarely needed — tool args are
+  // Pass 3: stub tool_use input if still over (rarely needed — tool args are
   // usually small, but a giant `write` payload can blow past on its own).
   for (let i = 0; i < protectStart && current > budgetTokens; i++) {
     const msg = result[i];
@@ -774,24 +800,18 @@ export function pruneContextMessages(
     }
   }
 
-  // Pass 3: still over budget after trimming tool I/O — the remaining bulk is
-  // accumulated assistant text / thinking, which Passes 1-2 can't touch. Head+tail
-  // truncate the oldest large text/thinking blocks (protected recent window left
-  // verbatim) until under budget. This is what stops a long reasoning-heavy run
-  // (many turns of thinking) from drifting past the model's window.
-  const TEXT_KEEP_TOKENS = 200;
+  // Pass 4: still over budget — truncate old visible TEXT blocks last. They
+  // carry plans and DONE summaries, the most load-bearing prose in the history,
+  // so they are sacrificed only when everything else wasn't enough.
   for (let i = 0; i < protectStart && current > budgetTokens; i++) {
     const msg = result[i];
     if (!Array.isArray(msg?.content)) continue;
     for (let j = 0; j < msg.content.length && current > budgetTokens; j++) {
       const block = msg.content[j];
-      const field = block?.type === 'text' && typeof block.text === 'string' ? 'text'
-        : block?.type === 'thinking' && typeof block.thinking === 'string' ? 'thinking'
-        : null;
-      if (!field) continue;
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
       const before = estimateBlockTokens(block);
       if (before <= TEXT_KEEP_TOKENS) continue; // not worth truncating
-      block[field] = truncateText(block[field], TEXT_KEEP_TOKENS);
+      block.text = truncateText(block.text, TEXT_KEEP_TOKENS);
       current -= (before - estimateBlockTokens(block));
       truncatedBlocks++;
     }

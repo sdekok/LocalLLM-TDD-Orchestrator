@@ -136,6 +136,38 @@ const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, i
 const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
 
 
+export interface SessionRefreshParams {
+  attempt: number;
+  /** Number of feedback rounds accumulated so far (0 = nothing to fix yet). */
+  feedbackRounds: number;
+  /** Most recent observed prompt size in tokens (usage.input + cacheRead); 0 = provider reports no usage. */
+  lastPromptTokens: number;
+  /** Token threshold above which the session should be refreshed. */
+  refreshTokenThreshold: number;
+  /** Round-based fallback cadence, used only when the provider reports no usage. */
+  refreshAfterRounds: number;
+}
+
+/**
+ * Decide whether to replace the long-running implementer session with a fresh
+ * one. Token-denominated when real usage data is available: a session is
+ * refreshed when its actual prompt size crosses the threshold — one heavy
+ * thinking round can cross it while several light rounds may never need a
+ * reset. Falls back to the legacy round cadence only when the provider does
+ * not report token usage.
+ */
+export function shouldRefreshSession(p: SessionRefreshParams): { refresh: boolean; reason: 'tokens' | 'rounds' | null } {
+  if (p.attempt <= 1 || p.feedbackRounds === 0) return { refresh: false, reason: null };
+  if (p.lastPromptTokens > 0) {
+    return p.lastPromptTokens >= p.refreshTokenThreshold
+      ? { refresh: true, reason: 'tokens' }
+      : { refresh: false, reason: null };
+  }
+  return (p.attempt - 1) % p.refreshAfterRounds === 0
+    ? { refresh: true, reason: 'rounds' }
+    : { refresh: false, reason: null };
+}
+
 export class WorkflowExecutor {
   private state: StateManager;
   private modelRouter: ModelRouter;
@@ -303,7 +335,7 @@ export class WorkflowExecutor {
     session: any,
     label: string,
     messageType: string,
-  ): { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } {
+  ): { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; getLastPromptTokens(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } {
     const chatMessage = this.chatMessage;
     const logger = getLogger();
     const CHUNK_SIZE = 800;
@@ -311,6 +343,9 @@ export class WorkflowExecutor {
     let turnText = '';
     let disposed = false;
     let lastEventTime = Date.now();
+    // Actual prompt token count of the most recent provider request, from the
+    // assistant message's usage block. 0 until the provider reports usage.
+    let lastPromptTokens = 0;
     // True once the model has produced ANY output this turn (thinking, text, or a
     // tool call). Reset per turn via resetTurnText(). Used to distinguish "model
     // is working but not DONE" from "model never responded" (unreachable endpoint
@@ -394,7 +429,12 @@ export class WorkflowExecutor {
       // Token accounting: every assistant message carries a usage block.
       // Recorded independently of the text/tool handling below.
       if (event.type === 'message_end' && event.message?.role === 'assistant' && event.message.usage) {
-        for (const tracker of this.usageTrackers) tracker.record(usageRole, event.message.usage);
+        const usage = event.message.usage;
+        for (const tracker of this.usageTrackers) tracker.record(usageRole, usage);
+        // Actual prompt size of the latest request — input plus any cache-read
+        // tokens (both count toward the model's context occupancy). Drives the
+        // token-denominated session-refresh decision.
+        lastPromptTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
       }
 
       if (event.type === 'message_update') {
@@ -485,6 +525,7 @@ export class WorkflowExecutor {
       getTurnText: () => turnText,
       resetTurnText: () => { turnText = ''; modelActivitySeen = false; },
       getLastEventTime: () => lastEventTime,
+      getLastPromptTokens: () => lastPromptTokens,
       hasThinkingLoop: () => thinkingLoopDetected,
       clearThinkingLoop: () => { resetTurnProgress(); },
       sawModelActivity: () => modelActivitySeen,
@@ -965,9 +1006,16 @@ export class WorkflowExecutor {
       let lastAttemptBlockedByPreexisting = false;
       let lastQualityGatesPassed = false; // tracks whether the latest committed state passed QA
       const startAttempt = task.attempts || 1;
-      // Per-model session-refresh threshold (falls back to the module default).
-      const effectiveRefreshAfter =
-        this.modelRouter.selectModel('implement').sessionRefreshAfter ?? SESSION_REFRESH_AFTER;
+      // Session-refresh policy for the implementer model. Token-denominated
+      // when the provider reports usage: refresh once the session's actual
+      // prompt size crosses the threshold (default: half the model's window —
+      // by then the history is mostly stale rounds, the avoidable kind of
+      // context). The round cadence is only the fallback for providers that
+      // report no usage.
+      const implementerProfile = this.modelRouter.selectModel('implement');
+      const effectiveRefreshAfter = implementerProfile.sessionRefreshAfter ?? SESSION_REFRESH_AFTER;
+      const refreshTokenThreshold = implementerProfile.sessionRefreshTokens
+        ?? Math.floor(implementerProfile.contextWindow / 2);
       // Implementer session is kept alive across reviewer-rejection retries so the agent
       // can continue patching its own work in a multi-turn conversation.
       // It is nulled out (and disposed) only when a runtime error forces a rollback.
@@ -976,7 +1024,7 @@ export class WorkflowExecutor {
       // whole lifetime of the session, with a per-turn text accumulator that we reset
       // before each prompt() call. This avoids the multi-subscribe bug where text
       // accumulated across turns and duplicated chat output.
-      let implementerHandle: { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } | null = null;
+      let implementerHandle: { getTurnText(): string; resetTurnText(): void; getLastEventTime(): number; getLastPromptTokens(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; sawModelActivity(): boolean; dispose(): void } | null = null;
 
       // Fast-path: if resuming from a task that was already approved and just needs merging, skip all loops.
       if (task.phase !== 'merging') {
@@ -1064,21 +1112,27 @@ export class WorkflowExecutor {
                 : `Agent is building implementation (Read -> Test -> Code)...`
             });
 
-            // Session refresh: every SESSION_REFRESH_AFTER rounds, replace the long-running
-            // session with a fresh one. Local models are most affected — their context windows
-            // fill up fast and quality degrades after a few rounds of accumulated conversation.
-            // The fresh session gets a compact "fixer" first-turn prompt with the ticket,
+            // Session refresh: replace the long-running session with a fresh one
+            // when its context has grown mostly stale. Token-denominated when the
+            // provider reports usage (one heavy thinking round can fill what five
+            // light rounds wouldn't); round-cadence fallback otherwise. The fresh
+            // session gets a compact "fixer" first-turn prompt with the ticket,
             // latest feedback, and a path to the on-disk feedback history file.
             let sessionWasReset = false;
-            if (
-              implementerSession &&
-              attempt > 1 &&
-              (attempt - 1) % effectiveRefreshAfter === 0 &&
-              feedbackHistory.length > 0
-            ) {
-              logger.info(`[${task.id}] Refreshing implementer session at attempt ${attempt} to reset context window`);
+            const refreshCheck = shouldRefreshSession({
+              attempt,
+              feedbackRounds: feedbackHistory.length,
+              lastPromptTokens: implementerHandle?.getLastPromptTokens() ?? 0,
+              refreshTokenThreshold,
+              refreshAfterRounds: effectiveRefreshAfter,
+            });
+            if (implementerSession && refreshCheck.refresh) {
+              const why = refreshCheck.reason === 'tokens'
+                ? `context at ~${(implementerHandle?.getLastPromptTokens() ?? 0).toLocaleString()} tokens (threshold ${refreshTokenThreshold.toLocaleString()})`
+                : `${effectiveRefreshAfter} feedback round(s) elapsed (provider reports no token usage)`;
+              logger.info(`[${task.id}] Refreshing implementer session at attempt ${attempt} — ${why}`);
               this.chatMessage?.(
-                `🔄 **[${task.id}]** Session reset at attempt ${attempt} — fresh context window, history preserved on disk`,
+                `🔄 **[${task.id}]** Session reset at attempt ${attempt} — ${why}; history preserved on disk`,
                 'tdd-implementer',
               );
               try { implementerHandle?.dispose(); } catch { /* best-effort */ }

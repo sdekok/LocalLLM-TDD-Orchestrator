@@ -140,6 +140,8 @@ The easiest way to create or update either file is via `/setup` in Pi. You can a
 
 **Routing keys** are all optional except the ones you actually use. Any role that isn't explicitly routed falls back to the `plan` model. `/setup` configures `plan`, `project-plan`, `implement`, `review`, and `research` — you can add `arbitrate` manually if you want the deadlock-breaking arbiter on a different model than the planner.
 
+**`sessionRefreshTokens`** _(optional)_ controls when the implementer's long-running session is replaced with a fresh one: once the session's *actual* prompt size (input + cache-read tokens, as reported by the provider) crosses this threshold. Defaults to `contextWindow / 2`. Set it to the point where your model's long-context quality starts to degrade — often well below the advertised window. The legacy `sessionRefreshAfter` round cadence now applies only when the provider reports no token usage. Old thinking blocks are also the first thing the in-session context pruner reclaims, since stale reasoning has near-zero forward value for preserved-thinking models.
+
 **`enableThinking`** tells the orchestrator to activate Pi's reasoning mode (`setThinkingLevel('medium')`) and strip thinking blocks from multi-turn message history to keep quality high. Reasoning-token injection is handled at the llama.cpp / chat-template level — no plugin-side prompt mutations are needed.
 
 **Cloud providers** are also supported. API keys must be supplied via environment variables — never hardcoded:

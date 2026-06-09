@@ -196,6 +196,25 @@ describe('pruneContextMessages', () => {
     expect(stats.totalAfter).toBeLessThanOrEqual(stats.totalBefore);
   });
 
+  it('purges old thinking BEFORE stubbing tool results (reasoning-model ordering)', () => {
+    const thinking = (t: string) => ({ type: 'thinking', thinking: t });
+    // Tool result is sized BELOW the single-result cap (max(4000, budget/4) = 4000 tok)
+    // so Pass 0 leaves it alone; only the pass ordering decides its fate.
+    const MEDIUM = 'y'.repeat(9_900); // ≈ 3_000 tokens
+    const messages = [
+      assistant(thinking(BIG)),            // old huge thinking (~12.1k tok) — reclaimed first
+      user([toolResult(MEDIUM)]),          // old tool_result — should survive
+      user('a'),
+      assistant(text('done')),             // protected
+    ];
+    // Total ≈ 15.2k tok; truncating thinking alone reclaims ≈ 11.9k → under the 4k budget.
+    const { messages: out, stats } = pruneContextMessages(messages, 4_000, 2);
+    expect(out[0].content[0].thinking).not.toBe(BIG);          // thinking truncated
+    expect(out[1].content[0].content).toBe(MEDIUM);            // tool_result intact
+    expect(stats.stubbedBlocks).toBe(0);
+    expect(stats.truncatedBlocks).toBeGreaterThanOrEqual(1);
+  });
+
   it('also truncates oversized old thinking blocks when over budget (Pass 3)', () => {
     const thinking = (t: string) => ({ type: 'thinking', thinking: t });
     const messages = [

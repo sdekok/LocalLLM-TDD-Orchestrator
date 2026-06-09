@@ -27,11 +27,19 @@ export interface ModelProfile {
   enableThinking?: boolean;      // Whether to activate reasoning mode + thinking-block history filter
   /**
    * Refresh the implementer session every N reviewer-rejection rounds.
-   * Keeps context windows manageable; lower values suit local models with
-   * small windows, higher values (or omit) suit frontier models.
+   * FALLBACK ONLY: this round cadence applies just when the provider reports
+   * no token usage — otherwise the token-based threshold below governs.
    * Default: SESSION_REFRESH_AFTER (2). Set to a large number to disable.
    */
   sessionRefreshAfter?: number;
+  /**
+   * Refresh the implementer session once its actual prompt size (input +
+   * cache-read tokens, as reported by the provider) crosses this many tokens.
+   * Defaults to contextWindow / 2. Tune this to the point where the model's
+   * long-context quality starts degrading (often well below the advertised
+   * window), not to the window itself.
+   */
+  sessionRefreshTokens?: number;
   contextWindow: number;
   /**
    * Soft cap (in tokens) at which the in-session context pruner starts stubbing
