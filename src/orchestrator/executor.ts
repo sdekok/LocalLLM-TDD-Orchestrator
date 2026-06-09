@@ -1934,26 +1934,37 @@ export class WorkflowExecutor {
             }
 
             const arbiterDecision = await this.runArbiter(task, currentDiff, changedFiles, feedback, lastQualityGatesPassed, iterationHistory);
-            if (arbiterDecision.decision === 'approve') {
-              if (lastQualityGatesPassed) {
-                approved = true; // fall through to Phase 5 merge
-              } else {
-                // Can't approve if QA never passed — treat as escalation
-                this.chatMessage?.(`⚖️ **[${task.id}]** Arbiter wanted to approve but quality gates never passed — escalating to you.`, 'tdd-arbiter');
-                const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback,
-                  `${arbiterDecision.rationale} (QA never passed — approval blocked)`);
-                if (userDecision.action === 'approve' && lastQualityGatesPassed) {
-                  approved = true;
-                } else if (userDecision.action === 'continue') {
-                  arbiterExtraRounds = userDecision.rounds;
-                }
-                // else stop: leave approved=false, loop exits, task fails
-              }
+            if (arbiterDecision.decision === 'approve' && lastQualityGatesPassed) {
+              approved = true; // gates green + arbiter approves → fall through to Phase 5 merge
             } else if (arbiterDecision.decision === 'continue') {
               arbiterExtraRounds = arbiterDecision.rounds;
-            } else { // escalate
-              const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback, arbiterDecision.rationale);
-              if (userDecision.action === 'approve' && lastQualityGatesPassed) {
+            } else {
+              // Escalate to the user. This covers both an explicit `escalate`
+              // verdict AND the case where the arbiter wanted to approve but
+              // quality gates never passed — the arbiter is barred from approving
+              // failing gates (see ARBITER_PROMPT), but the *user* is the final
+              // authority and may override.
+              const rationale = arbiterDecision.decision === 'approve'
+                ? `${arbiterDecision.rationale} (arbiter wanted to approve, but quality gates never passed — only you can override)`
+                : arbiterDecision.rationale;
+              const userDecision = await this.handleArbiterEscalation(task, currentDiff, feedback, rationale);
+              if (userDecision.action === 'approve') {
+                // Honor an explicit user approve even when gates are red: they've
+                // seen the diff and the failing feedback and chosen to merge as-is.
+                // Failing-gate attempts don't auto-commit, so capture the current
+                // working tree first to guarantee there's something to merge.
+                if (!lastQualityGatesPassed) {
+                  this.chatMessage?.(
+                    `⚠️ **[${task.id}]** Approving with **failing quality gates** at your request — merging as-is. ` +
+                    `Build/tests/lint may be broken on \`${originalBranch}\` until fixed.`,
+                    'tdd-arbiter',
+                  );
+                  try {
+                    await this.sandbox.commit(`TDD [user-approved, failing gates]: ${task.description.substring(0, 50)}`);
+                  } catch (err) {
+                    getLogger().warn(`[${task.id}] commit before user-override approve failed (working tree may already be committed): ${err}`);
+                  }
+                }
                 approved = true;
               } else if (userDecision.action === 'continue') {
                 arbiterExtraRounds = userDecision.rounds;
