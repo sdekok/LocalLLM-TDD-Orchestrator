@@ -17,6 +17,8 @@ export interface CommitDetails {
   filesChanged?: string[];
   testMetrics?: { total: number; passed: number; failed: number; skipped: number };
   coverageMetrics?: { lines: number; branches: number; functions: number; statements: number };
+  /** One-line LLM token/time summary for this task so far (see UsageTracker). */
+  usageSummary?: string;
 }
 
 const EXEC_OPTS = { maxBuffer: DEFAULT_MAX_BUFFER };
@@ -149,6 +151,10 @@ export class Sandbox {
       if (details.coverageMetrics) {
         const c = details.coverageMetrics;
         lines.push(`Coverage: ${c.lines}% lines, ${c.branches}% branches, ${c.functions}% functions`);
+      }
+
+      if (details.usageSummary) {
+        lines.push(`LLM Usage: ${details.usageSummary}`);
       }
 
       if (details.reviewerScore !== undefined) {

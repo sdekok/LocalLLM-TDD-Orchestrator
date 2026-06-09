@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, diffGateFailures, collectCoverageSnapshot, type CoverageMetrics } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, type CoverageMetrics } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -15,6 +15,40 @@ import { IMPLEMENTER_PROMPT, REVIEWER_PROMPT, ARBITER_PROMPT } from '../subagent
 import { getLogger } from '../utils/logger.js';
 import { execFileAsync, DEFAULT_MAX_BUFFER, sanitizeBranchName } from '../utils/exec.js';
 import { getTestCommand, getCoverageTestCommand, detectPackageManager } from './test-runner.js';
+import {
+  outputSimilarity,
+  writeFeedbackHistory,
+  isNoQuestionsPlaceholder,
+  type FeedbackRound,
+} from './feedback.js';
+import { withTimeout } from './timeout.js';
+import {
+  buildInitialTaskPrompt,
+  buildRetryFeedbackPrompt,
+  buildFixerPrompt,
+  ANTI_LOOP_NUDGE_PROMPT,
+  CONTINUE_NUDGE_PROMPT,
+} from './implementer-prompts.js';
+import { parseReviewerVerdict, ensureStructuredVerdict, buildTaskReviewPrompt, type ReviewerSessionHandle } from './review-phase.js';
+import {
+  buildArbiterPrompt,
+  parseArbiterDecision,
+  buildEscalationMessage,
+  parseEscalationReply,
+  type IterationRecord,
+} from './arbiter-phase.js';
+import { evaluateGateFailures } from './gate-evaluation.js';
+import { UsageTracker } from './usage-tracker.js';
+
+// Re-exported for backwards compatibility — tests and external callers import these from here.
+export {
+  outputSimilarity,
+  boundFeedbackForPrompt,
+  extractActionItems,
+  reviewerVerdictComplete,
+  isNoQuestionsPlaceholder,
+} from './feedback.js';
+export { withTimeout } from './timeout.js';
 
 /**
  * Derive a short, stable, git-safe slug from an original workflow request.
@@ -98,230 +132,6 @@ const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, i
 /** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
 const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
 
-/** One record per implement→review cycle, used by the arbiter for loop detection. */
-interface IterationRecord {
-  attempt: number;
-  implementerSummary: string;
-  reviewerFeedback: string;
-}
-
-/**
- * Detect if two strings are suspiciously similar (agent is looping).
- * Uses a simple character-level comparison — fast and good enough for code output.
- */
-/**
- * Race a promise against a timeout, but always clear the timer when either side
- * settles so we don't leak a Node.js timer for up to an hour.
- * Plain `Promise.race([p, setTimeoutReject(ms)])` leaves the timer armed, which
- * matters for long timeouts (the process can't exit cleanly and the captured
- * closure stays in memory).
- */
-export async function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-export function outputSimilarity(a: string, b: string): number {
-  if (!a || !b) return 0;
-  if (a === b) return 1;
-
-  const shorter = a.length < b.length ? a : b;
-  const longer = a.length < b.length ? b : a;
-
-  if (longer.length === 0) return 1;
-
-  // Quick check: if lengths differ by >30%, they're probably different
-  if (shorter.length / longer.length < 0.7) return shorter.length / longer.length;
-
-  // Count matching characters in order (simple LCS approximation)
-  let matches = 0;
-  let j = 0;
-  for (let i = 0; i < shorter.length && j < longer.length; i++) {
-    if (shorter[i] === longer[j]) {
-      matches++;
-      j++;
-    } else {
-      // Try to find the character nearby
-      const lookAhead = longer.indexOf(shorter[i]!, j);
-      if (lookAhead !== -1 && lookAhead - j < 5) {
-        matches++;
-        j = lookAhead + 1;
-      }
-    }
-  }
-
-  return matches / longer.length;
-}
-
-/**
- * A reviewer verdict is "complete" only when it states `APPROVED: true|false`
- * AND — for a rejection — includes a non-empty `FEEDBACK:` section. A rejection
- * with no usable FEEDBACK (missing, empty, or a typo'd header like `FEEDFIX:`)
- * leaves the implementer nothing actionable, so we re-prompt the reviewer to
- * emit the structured format instead of dumping its raw analysis/thinking.
- * An approval needs no feedback.
- */
-/**
- * Cap feedback/gate text before it's injected into a model prompt. A failing
- * gate can dump the full test/build output (a single broken import can cascade
- * into thousands of failing-test signatures), and that text is interpolated raw
- * into both the implementer's fixer prompt and the arbiter prompt. Left
- * unbounded it blows past the model's context window → the model returns empty
- * output (no DONE / no verdict). The full text is always preserved on disk in
- * .tdd-workflow (feedback history + gate reports), so truncating the prompt copy
- * loses nothing actionable — the first N chars carry the actionable head.
- */
-export function boundFeedbackForPrompt(text: string, maxChars = 6000): string {
-  if (!text || text.length <= maxChars) return text;
-  const omitted = text.length - maxChars;
-  return `${text.slice(0, maxChars)}\n… (${omitted.toLocaleString()} more chars truncated to protect the context window — full details in .tdd-workflow/logs)`;
-}
-
-/**
- * Reduce verbose reviewer/gate feedback to a short, actionable checklist for the
- * fixer/retry prompt. The full text is written to the on-disk feedback history
- * (.tdd-workflow/logs/feedback-history-<taskId>.md), so the model only needs the
- * LIST of what to address — not paragraphs of detail that bloat the context.
- * Parses numbered items (`1.`/`1)`) and bullets (`-`,`*`,`•`), keeping each
- * item's title line. Falls back to a small bounded snippet when there's no list.
- */
-export function extractActionItems(feedback: string, maxItems = 15, maxLen = 200): string {
-  if (!feedback) return '';
-  const clean = (s: string) => s.replace(/\*\*|__|`/g, '').replace(/\s+/g, ' ').trim();
-  const numbered: string[] = [];
-  const bullets: string[] = [];
-  let skipping = false;
-  for (const raw of feedback.split('\n')) {
-    const line = raw.trim();
-    if (!line) continue;
-    // Once we reach a "Non-issues / already known / pre-existing / nits" section,
-    // stop collecting — those are explicitly NOT things to fix. (The bug this
-    // guards against: a reviewer's trailing non-issues bullet list getting sent
-    // as the checklist while the real bold-numbered blockers were dropped.)
-    const bare = line.replace(/^[*_#>\s]+/, '');
-    if (/^(non[-\s]?issues?|already[-\s]known|pre[-\s]?existing|nit(s|picks)?|out[-\s]of[-\s]scope)\b/i.test(bare)) {
-      skipping = true;
-    }
-    if (skipping) continue;
-    // Numbered item — tolerate markdown wrappers like **1. …**, ### 1) …, > 1. …
-    const num = line.match(/^[*_#>\s]*\d+[.)]\s+(.+\S)/);
-    if (num) { numbered.push(clean(num[1]!)); continue; }
-    // Bullet item (dash or • — not "*", which collides with **bold** emphasis).
-    const bul = line.match(/^[>\s]*[-•]\s+(.+\S)/);
-    if (bul) bullets.push(clean(bul[1]!));
-  }
-  // Prefer numbered items (the reviewer's main issues); bullets are usually
-  // sub-points. Fall back to a bounded snippet only if nothing parsed.
-  const chosen = (numbered.length ? numbered : bullets).slice(0, maxItems);
-  if (chosen.length === 0) return boundFeedbackForPrompt(feedback, 1500);
-  return chosen.map((t, i) => `${i + 1}. ${t.length > maxLen ? t.slice(0, maxLen) + '…' : t}`).join('\n');
-}
-
-export function reviewerVerdictComplete(text: string): boolean {
-  if (!/APPROVED:\s*(true|false)/i.test(text)) return false;
-  if (/APPROVED:\s*false/i.test(text)) {
-    const m = text.match(/FEEDBACK:\s*([\s\S]*?)\s*$/i);
-    return !!(m && m[1] && m[1].trim().length > 0);
-  }
-  return true;
-}
-
-/**
- * Write (or overwrite) a per-task feedback history file with full round details.
- * Used as a reference; the inline fixer prompt uses summarizeFeedbackHistory instead.
- */
-function writeFeedbackHistory(
-  taskId: string,
-  feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }>,
-  projectDir: string,
-): string {
-  const logsDir = path.join(projectDir, '.tdd-workflow', 'logs');
-  fs.mkdirSync(logsDir, { recursive: true });
-  const filePath = path.join(logsDir, `feedback-history-${taskId}.md`);
-
-  const lines: string[] = [`# Feedback History — ${taskId}\n`];
-  for (const h of feedbackHistory) {
-    const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
-    lines.push(`## Round ${h.round} — ${label}\n\n${h.text}\n`);
-  }
-  fs.writeFileSync(filePath, lines.join('\n'));
-  return filePath;
-}
-
-/**
- * Produce a compact inline summary of all prior feedback rounds for inclusion
- * in the session-reset fixer prompt.
- *
- * - For review rounds: extracts only the FEEDBACK: section from the structured
- *   reviewer output, truncated to maxCharsPerRound.
- * - For gate rounds: takes the text as-is (already compact), truncated.
- *
- * This keeps the "history" contribution to the context window bounded no matter
- * how many rounds have elapsed.
- */
-function summarizeFeedbackHistory(
-  feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }>,
-  maxCharsPerRound = 400,
-): string {
-  return feedbackHistory
-    .map(h => {
-      const label = h.type === 'gates' ? 'Quality Gates' : 'Code Review';
-      let summary: string;
-      if (h.type === 'review') {
-        const match = h.text.match(/FEEDBACK:\s*([\s\S]*?)$/im);
-        summary = match ? match[1]!.trim() : h.text;
-      } else {
-        summary = h.text;
-      }
-      if (summary.length > maxCharsPerRound) {
-        summary = summary.slice(0, maxCharsPerRound) + '…';
-      }
-      return `**Round ${h.round} (${label})**: ${summary}`;
-    })
-    .join('\n\n');
-}
-
-/**
- * Detect "I have no questions" placeholder content the implementer sometimes
- * writes to `.tdd-workflow/questions.md` despite the prompt telling it not to.
- * Returns true when the file should be treated as if it were empty.
- *
- * Examples that should be filtered:
- *   "(No questions — all acceptance criteria met.)"
- *   "No questions."
- *   "N/A"
- *   "None"
- *   bullet lists with no real questions ("- (none)" / "1. n/a")
- */
-export function isNoQuestionsPlaceholder(text: string): boolean {
-  // Strip markdown bullets, numbering, surrounding punctuation/whitespace.
-  const stripped = text
-    .replace(/^[\s\-*•#>]+/gm, '')  // leading bullets/markers per line
-    .replace(/^\d+[.)]\s*/gm, '')   // ordered list markers
-    .replace(/[()[\]*_`]/g, '')     // surrounding punctuation
-    .trim();
-  if (!stripped) return true;
-  // Collapse whitespace and strip trailing punctuation for matching.
-  const normalised = stripped.replace(/\s+/g, ' ').replace(/[.!?…—-]+$/g, '').toLowerCase();
-  const sentinels = [
-    /^no questions?\b/,
-    /^no remaining questions?\b/,
-    /^none\b/,
-    /^n\/?a\b/,
-    /^nothing( to ask)?\b/,
-    /^all (acceptance )?criteria (met|satisfied)\b/,
-    /^no blockers\b/,
-    /^no ambiguities\b/,
-  ];
-  return sentinels.some(re => re.test(normalised));
-}
 
 export class WorkflowExecutor {
   private state: StateManager;
@@ -370,6 +180,13 @@ export class WorkflowExecutor {
    */
   private activeImplementerSession: AgentSession | null = null;
   private activeImplementerHandle: { getLastEventTime(): number; hasThinkingLoop(): boolean; clearThinkingLoop(): void; dispose(): void } | null = null;
+  /**
+   * Active usage trackers — every assistant message's token usage is recorded
+   * into all of them. processQueue keeps one workflow-level tracker plus one
+   * per-task tracker; outside a workflow (standalone review) the list is empty
+   * and recording is a no-op.
+   */
+  private usageTrackers: UsageTracker[] = [];
   public events = new EventEmitter();
 
   constructor(
@@ -563,9 +380,19 @@ export class WorkflowExecutor {
     /** Terminal signals that are worth surfacing in Pi chat. */
     const isTerminalSignal = (text: string) => /DONE:|APPROVED:|DECISION:/i.test(text);
 
+    // Role for usage accounting, derived from the chat message type
+    // ('tdd-implementer' → 'implementer'). Falls back to a generic label.
+    const usageRole = (messageType || 'agent').replace(/^tdd-/, '');
+
     session.subscribe((event: any) => {
       if (disposed) return;
       lastEventTime = Date.now();
+
+      // Token accounting: every assistant message carries a usage block.
+      // Recorded independently of the text/tool handling below.
+      if (event.type === 'message_end' && event.message?.role === 'assistant' && event.message.usage) {
+        for (const tracker of this.usageTrackers) tracker.record(usageRole, event.message.usage);
+      }
 
       if (event.type === 'message_update') {
         modelActivitySeen = true;
@@ -659,6 +486,21 @@ export class WorkflowExecutor {
       clearThinkingLoop: () => { resetTurnProgress(); },
       sawModelActivity: () => modelActivitySeen,
       dispose: () => { disposed = true; },
+    };
+  }
+
+  /**
+   * Adapt a reviewer session + stream handle pair to the minimal interface
+   * ensureStructuredVerdict needs for its format-reminder retry.
+   */
+  private reviewerRetryHandle(
+    session: { prompt(text: string): Promise<unknown> },
+    handle: { getTurnText(): string; resetTurnText(): void },
+  ): ReviewerSessionHandle {
+    return {
+      prompt: (text: string) => session.prompt(text),
+      getTurnText: () => handle.getTurnText(),
+      resetTurnText: () => handle.resetTurnText(),
     };
   }
 
@@ -1009,6 +851,11 @@ export class WorkflowExecutor {
 
     const totalSubtasks = this.state.getState().subtasks.length;
 
+    // Workflow-level token/time accounting. A per-task tracker is added for
+    // each task; both receive every assistant message's usage via subscribeToSession.
+    const workflowUsage = new UsageTracker();
+    this.usageTrackers = [workflowUsage];
+
     // Capture each blocking gate's full output at baseline so we can compare
     // against it per-attempt. We don't just mask "was this gate failing?" —
     // we extract an error-signature set from each failing gate and only treat
@@ -1074,6 +921,9 @@ export class WorkflowExecutor {
       const originalBranch = await this.sandbox.getCurrentBranch();
       const slug = workflowSlug(this.state.getState().original_request);
       const branchName = `tdd-workflow/${slug}/${task.id.substring(0, 12)}`;
+      // Per-task token/time accounting (wall clock starts now).
+      const taskUsage = new UsageTracker();
+      this.usageTrackers = [workflowUsage, taskUsage];
       let approved = false;
       // Set when the implementer model produces no response (ModelUnreachableError).
       // Gates the pass/attempt loops so we don't re-enter and recreate the session,
@@ -1119,7 +969,7 @@ export class WorkflowExecutor {
         // Accumulates one entry per implement→review cycle for arbiter loop detection.
         const iterationHistory: IterationRecord[] = [];
         // Per-round feedback log shown to the implementer on retries (newest first).
-        const feedbackHistory: Array<{ round: number; type: 'gates' | 'review'; text: string }> = [];
+        const feedbackHistory: FeedbackRound[] = [];
         // Outer loop: pass 0 = normal attempts; passes 1..MAX_ARBITER_ROUNDS each
         // run a batch of arbiter-granted "continue" rounds, re-consulting the
         // arbiter after each batch. This lets genuine-but-slow progress keep going
@@ -1263,8 +1113,6 @@ export class WorkflowExecutor {
               // inline summary (bounded size) and the current diff so the model
               // has complete context without relying on conversation history.
               writeFeedbackHistory(task.id, feedbackHistory, this.state.projectDir);
-              const latestFeedback = feedbackHistory[feedbackHistory.length - 1]!;
-              const latestLabel = latestFeedback.type === 'gates' ? 'Quality Gates' : 'Code Review';
 
               // Fetch the current diff to include inline (cap at ~6 KB to avoid flooding context).
               const MAX_DIFF_CHARS = 6000;
@@ -1285,51 +1133,16 @@ export class WorkflowExecutor {
                 `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — fresh session, fixer prompt`,
               );
 
-              implementerPrompt =
-                `## Context Reset — Round ${attempt} Fixer\n\n` +
-                `Session reset after ${feedbackHistory.length} round(s) to keep context manageable. ` +
-                `All work is preserved on branch \`${branchName}\`.\n\n` +
-                `### Task: ${task.id}\n${technicalDescription}\n`;
-
-              if (task.acceptance?.length) {
-                implementerPrompt += `\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}\n`;
-              }
-              if (task.security) {
-                implementerPrompt += `\n### Security Requirements\n${task.security}\n`;
-              }
-              if (task.tests?.length) {
-                implementerPrompt += `\n### Required Tests\n- ${task.tests.join('\n- ')}\n`;
-              }
-              if (task.devNotes) {
-                implementerPrompt += `\n### Developer Notes\n${task.devNotes}\n`;
-              }
-
-              // Include the current diff inline so the model sees the existing
-              // implementation immediately without needing a tool call.
-              implementerPrompt += inlineDiff
-                ? `\n### Current Implementation (git diff ${originalBranch})\n\`\`\`diff\n${inlineDiff}\n\`\`\`\n`
-                : `\n### Current Implementation\nBranch \`${branchName}\` — no committed changes yet.\n`;
-
-              // Send a short checklist of what to address — the full detail is in
-              // the on-disk feedback history, so we don't flood the context window.
-              implementerPrompt +=
-                `\n### Issues to Address — Round ${latestFeedback.round} (${latestLabel})\n` +
-                `${extractActionItems(feedback)}\n` +
-                `\n_Full detail for each item: \`.tdd-workflow/logs/feedback-history-${task.id}.md\`._\n`;
-
-              // Include a size-bounded summary of all prior rounds so the model
-              // knows what has already been tried.
-              if (feedbackHistory.length > 1) {
-                const priorRounds = feedbackHistory.slice(0, -1);
-                implementerPrompt +=
-                  `\n### Prior Round Summary (${priorRounds.length} round(s))\n` +
-                  summarizeFeedbackHistory(priorRounds) + '\n';
-              }
-
-              implementerPrompt +=
-                `\n### Instructions\n` +
-                `Fix the issues in the latest feedback above. Do not start from scratch — patch the existing implementation.\n` +
-                `When done: run the tests, do a final \`git diff HEAD\` to confirm no regressions, commit, and signal \`DONE: <summary>\`.`;
+              implementerPrompt = buildFixerPrompt({
+                task,
+                technicalDescription,
+                attempt,
+                branchName,
+                originalBranch,
+                feedback,
+                feedbackHistory,
+                inlineDiff,
+              });
 
             } else if (!sessionWasReset && feedback && attempt > 1) {
               // Retry turn within the same session: send reviewer/gate feedback as a
@@ -1343,36 +1156,10 @@ export class WorkflowExecutor {
               // of this round's items — dumping every round's full text here was a
               // major context-bloat source (a test cascade → 100K+ tokens).
               writeFeedbackHistory(task.id, feedbackHistory, this.state.projectDir);
-              const priorNote = feedbackHistory.length > 1
-                ? ` (${feedbackHistory.length - 1} earlier round(s) are recorded there too)`
-                : '';
-
-              implementerPrompt =
-                `Your previous code is still on this branch — do not start from scratch.\n\n` +
-                `## Issues to Address This Round\n\n${extractActionItems(feedback)}\n\n` +
-                `_Full detail for each item: \`.tdd-workflow/logs/feedback-history-${task.id}.md\`${priorNote}._\n\n` +
-                `## How to apply this feedback\n\n` +
-                `For each issue raised in the latest round:\n` +
-                `1. Find the exact location in your code.\n` +
-                `2. Understand *why* it is wrong, not just what to change.\n` +
-                `3. Fix it — touch whatever files are needed to fully address the feedback.\n` +
-                `4. Check whether the **same pattern** exists elsewhere in files you have already modified — if so, fix those instances too. This generalisation sweep is scoped to your existing diff; do not refactor unrelated code that the reviewer did not mention.\n\n` +
-                `When done: run the tests, do a final \`git diff HEAD\` to confirm there are no regressions or unintended changes, then commit and signal \`DONE:\`.`;
+              implementerPrompt = buildRetryFeedbackPrompt(task.id, feedback, feedbackHistory.length);
             } else {
               // First turn: full task description + metadata.
-              implementerPrompt = technicalDescription;
-              if (task.acceptance && task.acceptance.length > 0) {
-                implementerPrompt += `\n\n### Acceptance Criteria\n- ${task.acceptance.join('\n- ')}`;
-              }
-              if (task.security) {
-                implementerPrompt += `\n\n### Security Requirements\n${task.security}`;
-              }
-              if (task.tests && task.tests.length > 0) {
-                implementerPrompt += `\n\n### Required Tests\n- ${task.tests.join('\n- ')}`;
-              }
-              if (task.devNotes) {
-                implementerPrompt += `\n\n### Developer Implementation Notes\n${task.devNotes}`;
-              }
+              implementerPrompt = buildInitialTaskPrompt(task, technicalDescription);
             }
 
             // Run the implementer, then nudge it to keep going if it didn't signal DONE.
@@ -1506,14 +1293,10 @@ export class WorkflowExecutor {
                 logger.info(`[${task.id}] Implementer did not signal DONE — nudging (${nudge + 1}/${MAX_NUDGES})`);
                 this.chatMessage?.(`⏩ **[${task.id}]** Implementer hasn't finished — nudging to continue (${nudge + 1}/${MAX_NUDGES})`, 'tdd-implementer');
                 if (lastTurnAbortedForLoop) {
-                  implementerPrompt =
-                    'Your previous turn was aborted because you were stuck in a thinking loop, ' +
-                    'repeating the same sentences. **Do not think for this turn.** Immediately call ' +
-                    'a tool — `read` a specific file, `bash` to run tests, or `write`/`edit` to make a ' +
-                    'concrete change. Skip the reasoning step and act.';
+                  implementerPrompt = ANTI_LOOP_NUDGE_PROMPT;
                   lastTurnAbortedForLoop = false;
                 } else {
-                  implementerPrompt = 'You have not signalled DONE yet. Continue implementing — write the remaining files, run the tests, commit, then end your message with `DONE: <summary>`.';
+                  implementerPrompt = CONTINUE_NUDGE_PROMPT;
                 }
               } else {
                 logger.warn(`[${task.id}] Implementer never signalled DONE after ${MAX_NUDGES} nudges — proceeding to quality gates anyway`);
@@ -1593,46 +1376,10 @@ export class WorkflowExecutor {
             }
 
             if (!qualityReport.allBlockingPassed) {
-              // For each failing blocking gate, compare against the baseline. If every
-              // error in the current output was already present at baseline, the gate
-              // is pre-existing and we ignore it. Otherwise build a feedback report
-              // containing only the NEW errors — not the full failure dump — so the
-              // implementer isn't distracted by legacy issues it wasn't asked to fix.
-              const regressionReports: string[] = [];
-              const regressionGates: typeof qualityReport.gates = [];
-              const preexistingGates: string[] = [];
-
-              for (const g of qualityReport.gates) {
-                if (!g.blocking || g.passed) continue;
-                const baseline = baselineGateOutputs.get(g.gate);
-                if (baseline === undefined) {
-                  // No baseline for this gate — it was green before, now red. Full regression.
-                  // Bound the raw gate output — a failing test/build can emit
-                  // hundreds of KB that would otherwise blow the implementer/arbiter
-                  // context window. Full output is in the gate report on disk.
-                  regressionGates.push(g);
-                  regressionReports.push(`[${g.gate.toUpperCase()} BLOCKING]\n${boundFeedbackForPrompt(g.output, 4000)}`);
-                  continue;
-                }
-                const { newErrors, baselineCount, currentCount } = diffGateFailures(g.gate, baseline, g.output);
-                if (newErrors.length === 0) {
-                  preexistingGates.push(`${g.gate}(${currentCount} pre-existing)`);
-                  continue;
-                }
-                regressionGates.push(g);
-                // Cap the new-error list — a single broken import can cascade into
-                // thousands of failing-test signatures; the head is what's actionable.
-                const MAX_LISTED_ERRORS = 40;
-                const listed = newErrors.slice(0, MAX_LISTED_ERRORS).map(e => `  • ${e}`).join('\n');
-                const moreErrors = newErrors.length > MAX_LISTED_ERRORS
-                  ? `\n  … and ${newErrors.length - MAX_LISTED_ERRORS} more new error(s) — see the gate report in .tdd-workflow/logs`
-                  : '';
-                regressionReports.push(
-                  `[${g.gate.toUpperCase()} BLOCKING] ${newErrors.length} new error(s) introduced ` +
-                  `(baseline had ${baselineCount}, now ${currentCount}):\n` +
-                  listed + moreErrors
-                );
-              }
+              // Compare each failing blocking gate against the baseline — only
+              // genuinely NEW errors block the implementer (see gate-evaluation.ts).
+              const { regressionGates, regressionReports, preexistingGates } =
+                evaluateGateFailures(qualityReport.gates, baselineGateOutputs);
 
               if (regressionGates.length === 0) {
                 // Every blocking failure is pre-existing — treat as passed.
@@ -1684,6 +1431,7 @@ export class WorkflowExecutor {
               gateResults: qualityReport.gates.map(g => ({ gate: g.gate, passed: g.passed, blocking: g.blocking })),
               testMetrics: qualityReport.testMetrics,
               coverageMetrics: qualityReport.coverageMetrics,
+              usageSummary: taskUsage.summaryLine() || undefined,
             });
 
             this.events.emit('taskProgress', {
@@ -1754,69 +1502,37 @@ export class WorkflowExecutor {
                 }
               } catch { /* non-fatal */ }
 
-              // Build reviewer prompt: notes first (context), then commit log, then diff (evidence).
-              // The commit log lets the reviewer see the per-commit story of the WI branch —
-              // useful when there are several iterations and the cumulative diff is large.
-              const notesSummary = implementerNotes
-                ? `\n\n## Implementer Notes\n${implementerNotes}`
-                : '';
-              const commitLogSummary = currentCommitLog
-                ? `\n\n## Commits on this branch (vs ${originalBranch})\n${currentCommitLog}`
-                : '';
-              const diffSummary = changedFiles.length > 0 || currentDiff.trim().length > 0
-                ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff (full branch diff vs ${originalBranch})\n\`\`\`diff\n${currentDiff.length > 8000 ? currentDiff.substring(0, 8000) + '\n… (truncated)' : currentDiff}\n\`\`\``
-                : '\n\n## Diff\n_(no diff captured — check workflow log for git failures)_';
-
-              // Capture lens state after implementation and include before/after for the reviewer.
-              // The reviewer uses this to judge whether new structural/type issues were introduced.
-              let lensSection = '';
+              // Capture lens state after implementation so the reviewer can judge
+              // whether new structural/type issues were introduced by this task.
+              let lensAfter: string | null = null;
               try {
-                const lensAfter = await runLensAnalysis(this.state.projectDir);
-                const beforeText = lensBaseline || 'No issues';
-                const afterText = lensAfter || 'No issues';
-                lensSection = `\n\n## Lens Analysis (Structural & Type Checks)\n**Before this task:**\n${beforeText}\n\n**After this task:**\n${afterText}`;
+                lensAfter = await runLensAnalysis(this.state.projectDir);
               } catch { /* non-fatal — omit lens section */ }
 
+              const reviewPrompt = buildTaskReviewPrompt({
+                taskDescription: task.description,
+                implementerNotes,
+                commitLog: currentCommitLog,
+                originalBranch,
+                changedFiles,
+                diff: currentDiff,
+                lensBaseline,
+                lensAfter,
+              });
+
               await withTimeout(
-                this.promptUntilIdle(reviewerSession, `Review the implementation for task: ${task.description}${notesSummary}${commitLogSummary}${lensSection}${diffSummary}`),
+                this.promptUntilIdle(reviewerSession, reviewPrompt),
                 MAX_REVIEWER_DURATION_MS,
                 `Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
               );
-              reviewText = reviewerHandle.getTurnText();
 
-              // If the reviewer analysed but didn't produce the required verdict format,
-              // send a follow-up asking it to emit only the structured lines.
-              // Use a generous timeout — thinking models need several minutes even for short replies.
-              const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-              // Re-prompt when the verdict is incomplete: missing APPROVED:, OR a
-              // rejection with no usable FEEDBACK: (e.g. a typo'd header like
-              // FEEDFIX:). Otherwise the implementer gets the reviewer's raw
-              // thinking instead of actionable feedback.
-              if (!reviewerVerdictComplete(reviewText)) {
-                logger.warn(`[${task.id}] Reviewer verdict incomplete (missing APPROVED: or FEEDBACK:) — sending format reminder`);
-                const savedReviewText = reviewText;
-                reviewerHandle.resetTurnText();
-                try {
-                  await withTimeout(
-                    reviewerSession.prompt(
-                      'STOP all tool calls. Do NOT read any more files.\n\n' +
-                      'Your review is complete but the structured verdict is missing or malformed. ' +
-                      'Output ONLY these three lines right now, with these EXACT labels — nothing else:\n\n' +
-                      'APPROVED: true/false\n' +
-                      'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-                      'FEEDBACK: <if APPROVED is false, the concrete changes needed — based on what you already read>'
-                    ),
-                    FORMAT_RETRY_TIMEOUT_MS,
-                    'format-retry-timeout',
-                  );
-                  reviewText = reviewerHandle.getTurnText();
-                } catch {
-                  reviewText = savedReviewText; // retry failed — restore original
-                }
-                if (!reviewerVerdictComplete(reviewText)) {
-                  reviewText = savedReviewText; // retry still malformed — restore
-                }
-              }
+              // If the reviewer analysed but didn't produce the required verdict
+              // format, ensureStructuredVerdict sends one format-reminder follow-up.
+              reviewText = await ensureStructuredVerdict(
+                this.reviewerRetryHandle(reviewerSession, reviewerHandle),
+                reviewerHandle.getTurnText(),
+                task.id,
+              );
             } finally {
               reviewerHandle.dispose();
               reviewerSession.dispose();
@@ -1827,14 +1543,7 @@ export class WorkflowExecutor {
             // Collect any questions the reviewer wrote (outside the timeout)
             const reviewerAnswers = await this.collectAgentQuestions(`Reviewer ${task.id}`);
 
-            // Parse Reviewer Verdict
-            const isApproved = /APPROVED:\s*true/i.test(reviewText);
-            const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-            // Only use the FEEDBACK: section as feedback — not the full review analysis.
-            // If the reviewer didn't follow the format, treat the whole session as a rejection
-            // with a clear message rather than dumping confusing analysis text into the implementer's prompt.
-            const reviewerFeedback = (feedbackMatch?.[1]?.trim())
-              || (reviewText.trim() ? `Reviewer rejected but did not follow the structured output format. Full review:\n${reviewText.substring(0, 600)}` : 'Reviewer session produced no output — possible timeout or crash.');
+            const { approved: isApproved, feedback: reviewerFeedback } = parseReviewerVerdict(reviewText);
 
             if (!isApproved) {
               logger.info(`Review rejected: ${reviewerFeedback.substring(0, 200)}`);
@@ -2003,6 +1712,9 @@ export class WorkflowExecutor {
           phase: undefined
         });
         logger.info(`Task ${task.id} completed and merged!`);
+        if (taskUsage.hasData()) {
+          this.chatMessage?.(`📊 **${task.id}** usage: ${taskUsage.summaryLine()}`, 'tdd-orchestrator');
+        }
         const completedTask = this.state.getState().subtasks.find(t => t.id === task.id);
         this.postChecklistUpdate();
         if (completedTask) {
@@ -2087,9 +1799,11 @@ export class WorkflowExecutor {
           ? rawRequest.split('\n')[0]!.substring(0, 60).trim()
           : rawRequest.substring(0, 60).trim();
         const feedbackPreview = feedback.length > 300 ? feedback.substring(0, 300) + '…' : feedback;
+        const usageLine = taskUsage.hasData() ? `**Usage:** ${taskUsage.summaryLine()}\n\n` : '';
         this.chatMessage?.(
           `❌ **${task.id}** failed after ${task.attempts || MAX_ATTEMPTS} attempts: ${task.description}\n\n` +
           `**Feedback:** ${feedbackPreview}\n\n` +
+          usageLine +
           `**Inspect:** branch \`${branchName}\` · State: \`.tdd-workflow/state.json\` · Logs: \`.tdd-workflow/logs/\`\n\n` +
           `**Next step:**\n` +
           `- \`/tdd ${epicRef} resume\` — retry with reviewer feedback preserved _(recommended)_\n` +
@@ -2110,12 +1824,20 @@ export class WorkflowExecutor {
       }
     }
 
+    // Drop the last task's tracker — final-review usage counts toward the workflow only.
+    this.usageTrackers = [workflowUsage];
+
     // Final workflow review: runs after all tasks complete, sees the full cumulative diff.
     // Per-task reviewers approved each story individually; this is an additional holistic
     // check across all changes. A rejection here is advisory — all changes are already merged.
     const allCompleted = this.state.getState().subtasks.every(t => t.status === 'completed');
     if (allCompleted && totalSubtasks > 1) {
       await this.runFinalWorkflowReview(workflowStartSha, baselineCoverage);
+    }
+
+    this.usageTrackers = [];
+    if (workflowUsage.hasData()) {
+      this.chatMessage?.(`📊 **Workflow usage:** ${workflowUsage.summaryLine()}`, 'tdd-orchestrator');
     }
   }
 
@@ -2270,30 +1992,11 @@ export class WorkflowExecutor {
         MAX_REVIEWER_DURATION_MS,
         `Reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
       );
-      reviewText = reviewerHandle.getTurnText();
-
-      const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000;
-      if (!reviewerVerdictComplete(reviewText)) {
-        logger.warn('[EXECUTOR] Standalone reviewer verdict incomplete (missing APPROVED: or FEEDBACK:) — sending format reminder');
-        const saved = reviewText;
-        reviewerHandle.resetTurnText();
-        try {
-          await withTimeout(
-            reviewerSession.prompt(
-              'STOP all tool calls. Do NOT read any more files.\n\n' +
-              'Your review is complete but the structured verdict is missing or malformed. ' +
-              'Output ONLY these three lines right now, with these EXACT labels — nothing else:\n\n' +
-              'APPROVED: true/false\n' +
-              'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-              'FEEDBACK: <if APPROVED is false, the concrete changes needed — based on what you already read>'
-            ),
-            FORMAT_RETRY_TIMEOUT_MS,
-            'format-retry-timeout',
-          );
-          reviewText = reviewerHandle.getTurnText();
-        } catch { reviewText = saved; }
-        if (!reviewerVerdictComplete(reviewText)) reviewText = saved;
-      }
+      reviewText = await ensureStructuredVerdict(
+        this.reviewerRetryHandle(reviewerSession, reviewerHandle),
+        reviewerHandle.getTurnText(),
+        'Standalone Review',
+      );
     } finally {
       reviewerHandle.dispose();
       reviewerSession.dispose();
@@ -2302,10 +2005,7 @@ export class WorkflowExecutor {
     }
 
     // ── 4. Post verdict ────────────────────────────────────────────────────
-    const isApproved = /APPROVED:\s*true/i.test(reviewText);
-    const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-    const feedback = feedbackMatch?.[1]?.trim()
-      || (reviewText.trim() ? `Reviewer did not follow structured format:\n${reviewText.substring(0, 600)}` : 'Reviewer produced no output.');
+    const { approved: isApproved, feedback } = parseReviewerVerdict(reviewText);
 
     if (isApproved) {
       this.chatMessage?.(
@@ -2388,23 +2088,7 @@ export class WorkflowExecutor {
     const logger = getLogger();
     this.chatMessage?.(`⚖️ **[${task.id}]** All ${MAX_ATTEMPTS} attempts exhausted — calling neutral arbiter…`, 'tdd-arbiter');
 
-    const diffSummary = changedFiles.length > 0
-      ? `\n\n## Changed Files\n${changedFiles.map(f => `- ${f}`).join('\n')}\n\n## Diff\n\`\`\`diff\n${diff.length > 6000 ? diff.substring(0, 6000) + '\n… (truncated)' : diff}\n\`\`\``
-      : '\n\n## Diff\n(no diff captured)';
-
-    const historySummary = iterationHistory.length > 0
-      ? `\n\n## Iteration History (${iterationHistory.length} attempt(s))\n` +
-        iterationHistory.map(r =>
-          `### Attempt ${r.attempt}\n**Implementer claimed:** ${r.implementerSummary.substring(0, 300)}\n**Reviewer feedback:** ${r.reviewerFeedback.substring(0, 300)}`
-        ).join('\n\n')
-      : '';
-
-    const arbiterPrompt =
-      `## Task\n${task.description}\n\n` +
-      `## Quality Gates\n${qualityGatesPassed ? '✅ Passed' : '❌ Failed — code has blocking quality issues'}\n\n` +
-      `## Reviewer\'s Final Feedback\n${feedback ? boundFeedbackForPrompt(feedback) : '(no feedback recorded)'}` +
-      historySummary +
-      diffSummary;
+    const arbiterPrompt = buildArbiterPrompt(task, diff, changedFiles, feedback, qualityGatesPassed, iterationHistory);
 
     const arbiterSession = await createSubAgentSession({
       taskType: 'arbitrate',
@@ -2433,17 +2117,11 @@ export class WorkflowExecutor {
       await new Promise(resolve => setTimeout(resolve, SLOT_RECOVERY_DELAY_MS));
     }
 
-    const decisionMatch = arbiterText.match(/DECISION:\s*(approve|continue|escalate)/i);
-    const roundsMatch   = arbiterText.match(/ROUNDS:\s*(\d+)/i);
-    const rationaleMatch = arbiterText.match(/RATIONALE:\s*(.+)/i);
-
-    const decision  = (decisionMatch?.[1]?.toLowerCase() ?? 'escalate') as 'approve' | 'continue' | 'escalate';
-    const rounds    = parseInt(roundsMatch?.[1] ?? '1', 10);
-    const rationale = rationaleMatch?.[1]?.trim() ?? 'Arbiter provided no rationale.';
+    const { decision, rounds, rationale, parsedOk } = parseArbiterDecision(arbiterText);
 
     // Log the raw response when parsing fails so we can diagnose silent fallbacks
     // (e.g. model returned empty content, wrong format, or thinking-only output).
-    if (!decisionMatch || !rationaleMatch) {
+    if (!parsedOk) {
       const preview = arbiterText.length === 0
         ? '(empty response — no text emitted)'
         : arbiterText.length > 1000
@@ -2469,22 +2147,7 @@ export class WorkflowExecutor {
     feedback: string,
     arbiterRationale: string,
   ): Promise<{ action: 'approve' | 'continue' | 'stop'; rounds: number }> {
-    const diffPreview = diff.length > 1500 ? diff.substring(0, 1500) + '\n… (truncated)' : diff;
-    const feedbackPreview = feedback.length > 400 ? feedback.substring(0, 400) + '…' : feedback;
-
-    const msg =
-      `⚖️ **Arbiter: your input needed for ${task.id}**\n\n` +
-      `The task could not be resolved after ${MAX_ATTEMPTS} attempts.\n\n` +
-      `**Arbiter's assessment:** ${arbiterRationale}\n\n` +
-      `**Task:** ${task.description}\n\n` +
-      `**Reviewer\'s final feedback:**\n${feedbackPreview}\n\n` +
-      `**Diff preview:**\n\`\`\`diff\n${diffPreview}\n\`\`\`\n\n` +
-      `**Your options (reply with one):**\n` +
-      `- \`approve\` — accept the current implementation as-is\n` +
-      `- \`continue N\` — grant N more rounds (e.g. \`continue 3\`)\n` +
-      `- \`stop\` — mark as failed and move on`;
-
-    this.chatMessage?.(msg);
+    this.chatMessage?.(buildEscalationMessage(task, diff, feedback, arbiterRationale, MAX_ATTEMPTS));
 
     if (!this.waitForInput) {
       getLogger().warn(`[${task.id}] Arbiter escalation: no waitForInput handler — defaulting to stop`);
@@ -2492,15 +2155,7 @@ export class WorkflowExecutor {
     }
 
     const answer = await this.waitForInput(`Reply approve / continue N / stop for ${task.id}:`);
-    if (!answer?.trim()) return { action: 'stop', rounds: 0 };
-
-    const lower = answer.trim().toLowerCase();
-    if (lower === 'approve') return { action: 'approve', rounds: 0 };
-    const continueMatch = lower.match(/^continue\s+(\d+)$/);
-    if (continueMatch) {
-      return { action: 'continue', rounds: parseInt(continueMatch[1]!, 10) };
-    }
-    return { action: 'stop', rounds: 0 };
+    return parseEscalationReply(answer);
   }
 
   private async runFinalWorkflowReview(workflowStartSha: string, baselineCoverage?: CoverageMetrics): Promise<void> {
@@ -2589,33 +2244,15 @@ export class WorkflowExecutor {
         MAX_REVIEWER_DURATION_MS,
         `Final reviewer timed out after ${MAX_REVIEWER_DURATION_MS / 60000} minutes`,
       );
-      reviewText = reviewerHandle.getTurnText();
-
-      // Format reminder if structured verdict is missing
-      const FORMAT_RETRY_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
-      if (!reviewText.includes('APPROVED:')) {
-        logger.warn('[EXECUTOR] Final reviewer missing structured verdict — sending format reminder');
-        const savedReviewText = reviewText;
-        reviewerHandle.resetTurnText();
-        try {
-          await withTimeout(
-            reviewerSession.prompt(
-              'STOP all tool calls. Do NOT read any more files.\n\n' +
-              'Your review is complete but is missing the required structured verdict. ' +
-              'Output ONLY these three lines right now — nothing else:\n\n' +
-              'APPROVED: true/false\n' +
-              'SCORES: test_coverage=X integration=X error_handling=X security=X (1-5)\n' +
-              'FEEDBACK: <your feedback based on what you have already read>'
-            ),
-            FORMAT_RETRY_TIMEOUT_MS,
-            'format-retry-timeout',
-          );
-          reviewText = reviewerHandle.getTurnText();
-        } catch {
-          reviewText = savedReviewText;
-        }
-        if (!reviewText.includes('APPROVED:')) reviewText = savedReviewText;
-      }
+      // Format reminder if the structured verdict is missing. The final review
+      // uses a looser predicate (APPROVED: present) than the per-task review —
+      // it is advisory, so usable feedback is not strictly required.
+      reviewText = await ensureStructuredVerdict(
+        this.reviewerRetryHandle(reviewerSession, reviewerHandle),
+        reviewerHandle.getTurnText(),
+        'Final Review',
+        (text) => text.includes('APPROVED:'),
+      );
     } finally {
       reviewerHandle.dispose();
       reviewerSession.dispose();
@@ -2626,10 +2263,7 @@ export class WorkflowExecutor {
     // Collect any questions the reviewer wrote
     await this.collectAgentQuestions('Final Reviewer');
 
-    const isApproved = /APPROVED:\s*true/i.test(reviewText);
-    const feedbackMatch = reviewText.match(/FEEDBACK:\s*([\s\S]*)$/i);
-    const reviewerFeedback = (feedbackMatch?.[1]?.trim())
-      || (reviewText.trim() ? `Reviewer did not follow structured format. Full review:\n${reviewText.substring(0, 600)}` : 'Final reviewer session produced no output.');
+    const { approved: isApproved, feedback: reviewerFeedback } = parseReviewerVerdict(reviewText);
 
     if (isApproved) {
       logger.info('Final workflow review: approved');

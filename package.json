@@ -4,6 +4,9 @@
   "description": "Agentic TDD workflow orchestrator for Pi, powered by local LLMs via llama.cpp",
   "main": "dist/interfaces/mcp/index.js",
   "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
   "pi": {
     "extensions": [
       "./dist/interfaces/pi"

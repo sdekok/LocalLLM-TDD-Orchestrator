@@ -75,6 +75,7 @@ Inside any project, use the slash commands:
   - `/tdd:pause` — finish the current agent turn, then halt. WIP branch + feedback + attempts are preserved.
   - `/tdd:stop` — abort the running agent immediately, roll back the current task, reset it to pending. Repo looks like the task never ran.
   - `/tdd:resume` — pick up from a paused workflow.
+- **Status**: `/tdd:status` — read-only snapshot of the current workflow: per-task progress, attempts, current phase, and the latest reviewer feedback.
 - **Cleanup**: `/tdd:project-cleanup` — scan all quality gates, then run a TDD workflow to fix every pre-existing failure
 - **Run tests**: `/tdd:test` — run the project's test suite and report failures
 - **Research**: `/research "Best practices for React state 2026"` — deep web research agent
@@ -270,6 +271,7 @@ Quality Gates:
 
 Tests: 47/47 passed
 Coverage: 87.3% lines, 72.1% branches, 91.0% functions
+LLM Usage: 36,520 in / 8,522 out tokens · 3 calls (implementer 2, reviewer 1) · 12m03s
 ```
 
 ## Development
@@ -338,3 +340,5 @@ Every sub-agent session emits per-LLM-call telemetry to the standard plugin log:
 ```
 
 `status` and HTTP latency come from the SDK's `after_provider_response` hook; any non-2xx response is logged as a warning so rate limits and provider errors surface without needing a dashboard. The `taskType` tag distinguishes implementer / reviewer / planner / arbiter / research calls when grepping the log.
+
+**Token/time accounting**: every task accumulates per-role token usage (input/output/cached) and wall time. The summary is appended to each attempt's commit message (`LLM Usage:` trailer), posted to chat when a task completes or fails (`📊 WI-x usage: …`), and a workflow-wide total is posted when the epic finishes. Use it to spot which tasks burn the most budget and tune model routing accordingly.

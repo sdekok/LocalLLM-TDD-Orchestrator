@@ -28,6 +28,7 @@ import { getLogger, setLoggerStderrMirror } from '../../utils/logger.js';
 import { readPiLlamaCppProviders, readPiCachedModels, readPiCachedModelInfo, readPiCloudProviders } from './pi-models.js';
 import { completeTddArgs, completeReviewArgs, completeResearchArgs, completePlanArgs } from './autocomplete.js';
 import { parsePlanArgs, listExistingEpics, readPriorRequest } from './plan-helpers.js';
+import { formatWorkflowStatus } from './status.js';
 
 // Gate output can be 10MB+ from large monorepo test runs. The planner only
 // needs enough to identify failing files/tests — not full stack traces.
@@ -727,6 +728,20 @@ export default function(pi: ExtensionAPI) {
         cancelChatInput();
         ctx.ui.notify(`🔥 TDD Engine Error: ${err.message}`, 'error');
       });
+    },
+  });
+
+  pi.registerCommand('tdd:status', {
+    description: 'Show a read-only snapshot of the current TDD workflow: progress, per-task status, attempts, and latest reviewer feedback.',
+    handler: async (_args: string, ctx) => {
+      if (!stateManager) {
+        stateManager = new StateManager(ctx.cwd);
+      }
+      const report = formatWorkflowStatus(stateManager.getState(), {
+        executorActive: executor !== null,
+        interruptPending: executor?.isInterrupted() ?? false,
+      });
+      postToChat(report, 'tdd-status');
     },
   });
 

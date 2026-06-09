@@ -115,6 +115,15 @@ Interrupt a running TDD workflow from chat — no need to kill Pi.
 | Reviewer feedback | preserved | cleared |
 | How to continue | `/tdd:resume` | `/tdd N` (fresh) or `/tdd N resume` (next pending) |
 
+### `/tdd:status`
+
+Read-only snapshot of the current workflow — safe to run at any time, including while agents are working.
+
+- **Progress summary**: completed / in-progress / pending / failed / paused counts, plus the refined request and feature branch.
+- **Per-task list**: status icon, attempt counter, and current phase (implementer working, running quality gates, reviewer working, merging) for the active task.
+- **Engine check**: warns if a task is marked `in_progress` but no executor is alive in this session (e.g. Pi was restarted mid-workflow) and tells you which resume command to use.
+- **Latest reviewer feedback**: shows the most recent feedback for the active (or first failed/paused) task, truncated to 600 chars with a pointer to the full history in `.tdd-workflow/logs/`.
+
 ### `/tdd:project-cleanup`
 
 Audits every quality gate across the whole project **before any agent runs**, summarises the failing gates in chat, then hands a structured cleanup brief to the standard TDD executor. The on-the-fly planner decomposes "fix these specific failures" into per-gate subtasks, each of which goes through the normal implement → review → merge loop.
