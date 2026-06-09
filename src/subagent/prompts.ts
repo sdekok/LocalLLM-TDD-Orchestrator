@@ -58,14 +58,15 @@ Violating this bypasses quality gate tracking and corrupts the workflow state.
    - **Build** the project (\`npm run build\` / \`nx affected -t build\`, or the project's build script). The build is the only step that fully type-checks — it catches type-only re-export (\`MISSING_EXPORT\`) bundler failures, strict-flag violations, and declaration-emit errors that the test run hides. In a monorepo, build the **consumers** of anything you changed, not just the edited project — a lib change can break a consumer build while the lib's own tests stay green.
    - **Lint** the project (\`nx affected -t lint\`, or the project's lint script / \`eslint\`). Lint is the only step that catches dependency-hygiene (undeclared deps) and config errors.
    - Fix every build and lint error you introduced. The orchestrator runs blocking build and lint gates after you finish; shipping with either red wastes a full review round-trip.
-9. **Pre-submit self-review**: Run \`git diff HEAD\` to see your complete changeset. Read it the way a hostile reviewer would. For every changed block, verify:
-   - **Error handling**: every new function/branch handles failure — what happens on bad input, a null return, a thrown exception?
-   - **Edge cases**: empty collections, zero/negative numbers, concurrent calls, missing optional fields
-   - **Test completeness**: each test asserts a specific outcome, not just "no error thrown"; failure paths are exercised, not only the happy path
-   - **Scope**: no unintended changes slipped in — refactors or style fixes unrelated to this task
-   - **Security**: no user-supplied input interpolated into shell commands, SQL, or file paths without sanitisation; no hardcoded secrets
+9. **Pre-submit self-review**: You already ran build + lint in step 8, so type and lint errors should be gone — if you skipped step 8, run the build now, because the orchestrator's blocking build gate will bounce the whole task otherwise. Now run \`git diff HEAD\` for the full changeset and \`git diff --name-only HEAD\` for the file list, and read it the way a hostile reviewer would. These six checks target what the automated gates do NOT catch — the issues that otherwise reach the reviewer and cost a full round:
+   1. **No stray or generated files**: \`git diff --name-only HEAD\` must list only source and test files. Never stage build or tooling output — \`coverage/\`, \`dist/\`, \`*.html\` reports, \`.pi-lens/\`, logs, or editor cruft. If such a path appears, unstage it and add it to \`.gitignore\` instead. Committing generated files is a hard FILE-SAFETY gate failure.
+   2. **Error handling**: Every new function/branch handles failure — bad input, a null return, a thrown exception.
+   3. **Edge cases**: Empty collections, zero/negative numbers, concurrent calls, missing optional fields.
+   4. **Test quality**: Each test asserts a specific outcome, not just "no error thrown"; failure paths are exercised, not only the happy path; the test would actually fail if the code under test regressed.
+   5. **Declared dependencies**: Every \`import\`/\`require\` you added resolves to a package declared in \`package.json\`, in the correct section (\`dependencies\` for runtime, \`devDependencies\` for test/build/tooling). No undeclared or phantom dependencies.
+   6. **Scope & security**: No unrelated refactors or style churn slipped in. No user-supplied input interpolated into shell commands, SQL, or file paths without sanitisation; no hardcoded secrets.
 
-   Fix anything you find. This step is not optional — do not skip it because tests pass.
+   This step is not optional — do not skip it because tests pass.
 10. **Leave reviewer notes**: Before finishing, write \`.tdd-workflow/implementation-notes.md\` using \`write\`. Include:
    - What you changed and why
    - Any design decisions or trade-offs you made
