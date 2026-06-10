@@ -84,12 +84,6 @@ Inside any project, use the slash commands:
 
 > **Tab completion**: every slash command above supports argument autocomplete inside Pi's editor. Press Tab after the command name to get suggestions — epic IDs for `/tdd <epic>` and `/plan show <epic>`, work item IDs after `task`, git branches after `/review branch`, research sessions after `/research --resume`, etc.
 
-### 5. MCP Server Mode
-
-The orchestrator can also run as a standalone MCP server:
-```bash
-node dist/interfaces/mcp/index.js
-```
 
 ## Model Configuration
 

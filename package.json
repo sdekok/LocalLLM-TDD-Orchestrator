@@ -2,7 +2,7 @@
   "name": "tdd-agentic-workflow",
   "version": "2.0.0",
   "description": "Agentic TDD workflow orchestrator for Pi, powered by local LLMs via llama.cpp",
-  "main": "dist/interfaces/mcp/index.js",
+  "main": "dist/interfaces/pi/index.js",
   "type": "module",
   "engines": {
     "node": ">=22.19"
@@ -18,14 +18,12 @@
     "build:all": "npm run build:csharp && npm run build",
     "bundle": "esbuild dist/interfaces/pi/index.js --bundle --platform=node --format=esm --outfile=dist/interfaces/pi/index.bundle.js --external:tree-sitter --external:tree-sitter-cpp --external:jsdom --external:@earendil-works/pi-coding-agent --external:pi-lens --external:ts-morph && mv dist/interfaces/pi/index.bundle.js dist/interfaces/pi/index.js",
     "deploylocal": "npm run build && rm -rf ~/.pi/extensions/tdd-workflow && ln -sf $(pwd) ~/.pi/extensions/tdd-workflow",
-    "start": "node dist/interfaces/mcp/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage"
   },
   "keywords": [
     "tdd",
-    "mcp",
     "pi-package",
     "llm",
     "pi-agent",
@@ -35,7 +33,6 @@
   "license": "ISC",
   "dependencies": {
     "@earendil-works/pi-coding-agent": "^0.79.1",
-    "@modelcontextprotocol/sdk": "^1.29.0",
     "@mozilla/readability": "^0.6.0",
     "glob": "^13.0.6",
     "jsdom": "^29.0.2",
