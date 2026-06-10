@@ -202,6 +202,8 @@ The payoff metric is attempts-per-task: as the store converges on your models' h
 
 Before any agent runs, the orchestrator captures a **baseline** of every blocking gate so that issues which were already broken don't get blamed on — or block — the implementer. Only failures the implementer *introduces* are treated as regressions; pre-existing ones are reported once and then ignored.
 
+The baseline is **cached** in `.tdd-workflow/cache/gate-baseline.json`, keyed by HEAD sha + working-tree status: starting or resuming a workflow with an unchanged tree skips the full-workspace sweep entirely (often minutes on a monorepo). Any commit, merge, or uncommitted edit invalidates it; entries expire after 24 h. Disable with `TDD_BASELINE_CACHE=0`. The baseline's coverage run (the slowest part — an instrumented full test pass) now only happens when `tddConfig.coverageThresholds` is configured; without thresholds the final epic review simply reports current coverage without a baseline delta.
+
 The baseline runs at **full workspace scope**. In an Nx monorepo the per-task gates use `nx affected` (fast — only the projects touched by the diff), but the baseline uses `nx run-many` (every project). This matters because `nx affected` against the initial empty diff would build/lint *nothing* and record no pre-existing debt — then the first task to touch a project would make that whole project "affected" and surface its pre-existing lint warnings as if the task had introduced them. Capturing the baseline across the whole workspace records the real prior state, so per-task `affected` failures are correctly recognised as pre-existing and masked.
 
 ## Pausing and Stopping a Workflow
@@ -344,6 +346,7 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
 | `LENS_FAIL_POLICY` | `fail-closed` | `fail-open` skips the Lens gate on crash; `fail-closed` treats a crash as a failure |
 | `TDD_SLOT_RECOVERY_MS` | `500` | Milliseconds to wait after sub-agent disposal before starting the next agent. Since Pi SDK 0.78 `dispose()` hard-aborts the in-flight request, so this is a safety margin; raise it for servers that linger on aborted requests |
 | `TDD_MCP_STARTUP_MS` | `5000` | Milliseconds to wait for MCP servers (context-mode, searxng) to register tools after session creation |
+| `TDD_BASELINE_CACHE` | `1` | Set to `0` to disable the quality-gate baseline cache and re-run the full-workspace sweep on every start/resume |
 
 ## Crash Forensics
 

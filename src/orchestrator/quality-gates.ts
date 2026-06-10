@@ -243,6 +243,16 @@ export interface RunQualityGatesOptions {
   fullScope?: boolean;
 }
 
+/** True when the project opts into blocking coverage via tddConfig.coverageThresholds. */
+export function hasCoverageThresholds(projectDir: string): boolean {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(projectDir, 'package.json'), 'utf-8'));
+    return !!pkg.tddConfig?.coverageThresholds;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Run coverage only, returning metrics without running the full gate suite.
  * Returns undefined when no coverage runner/tools are available.

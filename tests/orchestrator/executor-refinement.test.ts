@@ -17,6 +17,7 @@ vi.mock('../../src/orchestrator/quality-gates.js', () => ({
   runQualityGates: vi.fn(),
   detectTestCommand: vi.fn(),
   formatGateFailures: vi.fn(),
+  hasCoverageThresholds: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/orchestrator/epic-loader.js', () => {
@@ -84,6 +85,35 @@ describe('WorkflowExecutor - Refinement and Epic Loading', () => {
     
     // Original task remains in state
     expect(state.getSubtask('task-1')?.description).toBe('Add math');
+  });
+
+  it('skips refinement entirely for epic work items that already carry planning metadata', async () => {
+    state.initWorkflow('Test workflow');
+    state.setSubtasks([{
+      id: 'WI-1',
+      description: 'Implement the outbox consumer',
+      acceptance: ['Events are dispatched exactly once'],
+      tests: ['Unit: dispatcher routes by event type'],
+      devNotes: 'Use a dedicated pg client for the transaction',
+    }]);
+
+    const technicalPlan = await executor.refineTaskIntoSubtasks('WI-1', 1);
+
+    expect(planAndBreakdown).not.toHaveBeenCalled();
+    expect(technicalPlan).toBe('Implement the outbox consumer');
+  });
+
+  it('still refines bare on-the-fly subtasks (no planning metadata)', async () => {
+    state.initWorkflow('Test workflow');
+    state.setSubtasks([{ id: 'task-2', description: 'Fix the lint failures' }]);
+    (planAndBreakdown as any).mockResolvedValue({
+      refinedRequest: 'Plan',
+      subtasks: [{ id: 's1', description: 'Fix unused imports in foo.ts' }],
+    });
+
+    await executor.refineTaskIntoSubtasks('task-2', 1);
+
+    expect(planAndBreakdown).toHaveBeenCalled();
   });
 
   it('loads work items from a pre-planned epic if a match is found', async () => {

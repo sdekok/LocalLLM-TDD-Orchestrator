@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, type CoverageMetrics } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, hasCoverageThresholds, type CoverageMetrics } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -40,7 +40,7 @@ import {
   type IterationRecord,
 } from './arbiter-phase.js';
 import { evaluateGateFailures } from './gate-evaluation.js';
-import { UsageTracker } from './usage-tracker.js';
+import { UsageTracker, formatDuration } from './usage-tracker.js';
 
 // Re-exported for backwards compatibility — tests and external callers import these from here.
 export {
@@ -116,6 +116,8 @@ const IDLE_NUDGE_MS               =  5 * 60 * 1000;
 const SESSION_REFRESH_AFTER = 2;
 const MAX_CONSECUTIVE_FAILURES = 3;            // Circuit breaker for the whole workflow
 const LESSON_EXTRACTION_TIMEOUT_MS = 5 * 60 * 1000; // Budget for the post-task lesson-extraction call
+/** Baseline gate results stay valid this long for an unchanged working tree (env drift safety). */
+const BASELINE_CACHE_TTL_MS = 24 * 3600 * 1000;
 const MAX_ARBITER_ROUNDS = 3;                  // Max arbiter consultations per task — each can grant another "continue N"
 
 /**
@@ -915,29 +917,73 @@ export class WorkflowExecutor {
     // Also collect a coverage baseline so the final reviewer can flag regressions.
     const baselineGateOutputs = new Map<string, string>();
     let baselineCoverage: CoverageMetrics | undefined;
-    try {
-      // fullScope: build/lint run across the WHOLE workspace (nx run-many), not
-      // just the empty initial diff (nx affected). Otherwise the baseline records
-      // zero pre-existing build/lint failures, and the first task that makes a
-      // project "affected" surfaces that project's pre-existing warnings as if the
-      // task introduced them. A full-scope baseline captures the real prior state.
-      const baseline = await runQualityGates(this.state.projectDir, { collectCoverage: true, fullScope: true });
-      baselineCoverage = baseline.coverageMetrics;
-      const failing = baseline.gates.filter(g => g.blocking && !g.passed);
-      for (const g of failing) baselineGateOutputs.set(g.gate, g.output);
-      if (failing.length > 0) {
-        const list = failing.map(g => g.gate).join(', ');
-        logger.info(`Baseline blocking gate failures: ${list}`);
-        this.chatMessage?.(
-          `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${list}**. ` +
-          `Only NEW errors introduced by the implementer will block tasks — existing ones are ignored.`
-        );
+    // The full-workspace baseline sweep (build + tests + lint across every
+    // project) can take many minutes on a monorepo, and it produces an
+    // identical result whenever the working tree hasn't changed. Cache it
+    // keyed by HEAD sha + working-tree status so restarts and resumes skip it.
+    const cachePath = path.join(this.state.projectDir, '.tdd-workflow', 'cache', 'gate-baseline.json');
+    const cacheKey = process.env['TDD_BASELINE_CACHE'] !== '0' ? await this.baselineCacheKey() : null;
+    let baselineLoaded = false;
+    if (cacheKey) {
+      try {
+        const cached = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
+        if (cached.key === cacheKey && Date.now() - cached.capturedAt < BASELINE_CACHE_TTL_MS) {
+          for (const g of cached.failingGates ?? []) baselineGateOutputs.set(g.gate, g.output);
+          baselineCoverage = cached.coverage;
+          baselineLoaded = true;
+          logger.info(`Baseline reused from cache (captured ${new Date(cached.capturedAt).toISOString()}, tree unchanged)`);
+          this.chatMessage?.(
+            `ℹ️ Quality-gate baseline reused — working tree unchanged since the last sweep, skipping the full-workspace gate run.` +
+            (baselineGateOutputs.size > 0
+              ? ` Pre-existing failures still masked: **${[...baselineGateOutputs.keys()].join(', ')}**.`
+              : '')
+          );
+        }
+      } catch { /* no cache yet or unreadable — run the sweep */ }
+    }
+    if (!baselineLoaded) {
+      try {
+        // fullScope: build/lint run across the WHOLE workspace (nx run-many), not
+        // just the empty initial diff (nx affected). Otherwise the baseline records
+        // zero pre-existing build/lint failures, and the first task that makes a
+        // project "affected" surfaces that project's pre-existing warnings as if the
+        // task introduced them. A full-scope baseline captures the real prior state.
+        // Coverage instrumentation is the slowest part of the sweep — only pay for
+        // it when the project actually enforces coverage thresholds.
+        const baseline = await runQualityGates(this.state.projectDir, {
+          collectCoverage: hasCoverageThresholds(this.state.projectDir),
+          fullScope: true,
+        });
+        baselineCoverage = baseline.coverageMetrics;
+        const failing = baseline.gates.filter(g => g.blocking && !g.passed);
+        for (const g of failing) baselineGateOutputs.set(g.gate, g.output);
+        if (failing.length > 0) {
+          const list = failing.map(g => g.gate).join(', ');
+          logger.info(`Baseline blocking gate failures: ${list}`);
+          this.chatMessage?.(
+            `ℹ️ Pre-existing quality gate failures detected before any agent runs: **${list}**. ` +
+            `Only NEW errors introduced by the implementer will block tasks — existing ones are ignored.`
+          );
+        }
+        if (baselineCoverage) {
+          logger.info(`Coverage baseline: lines=${baselineCoverage.lines}% functions=${baselineCoverage.functions}% branches=${baselineCoverage.branches}%`);
+        }
+        if (cacheKey) {
+          try {
+            fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+            fs.writeFileSync(cachePath, JSON.stringify({
+              key: cacheKey,
+              capturedAt: Date.now(),
+              failingGates: failing.map(g => ({ gate: g.gate, output: g.output })),
+              coverage: baselineCoverage,
+            }));
+          } catch (err) {
+            logger.warn(`Could not write baseline cache: ${err}`);
+          }
+        }
+      } catch (err) {
+        logger.warn(`Could not capture quality gate baseline: ${err}`);
       }
-      if (baselineCoverage) {
-        logger.info(`Coverage baseline: lines=${baselineCoverage.lines}% functions=${baselineCoverage.functions}% branches=${baselineCoverage.branches}%`);
-      }
-    } catch (err) {
-      logger.warn(`Could not capture quality gate baseline: ${err}`);
     }
 
     while (true) {
@@ -2381,6 +2427,23 @@ export class WorkflowExecutor {
   }
 
   /**
+   * Cache key for the quality-gate baseline: HEAD sha + a hash of the working
+   * tree status. Any commit, merge, or uncommitted edit changes the key.
+   * Returns null when git state can't be read (baseline then runs uncached).
+   */
+  private async baselineCacheKey(): Promise<string | null> {
+    try {
+      const [head, status] = await Promise.all([
+        execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: this.state.projectDir, timeout: 5000, maxBuffer: DEFAULT_MAX_BUFFER }),
+        execFileAsync('git', ['status', '--porcelain'], { cwd: this.state.projectDir, timeout: 10_000, maxBuffer: DEFAULT_MAX_BUFFER }),
+      ]);
+      return `${head.stdout.trim()}:${createHash('sha1').update(status.stdout).digest('hex')}`;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Run one lesson-extraction LLM call over a bounded feedback text and return
    * parsed candidates. Fail-soft: any error returns [].
    */
@@ -2500,7 +2563,18 @@ export class WorkflowExecutor {
     // but with updated feedback injected via the system prompt.
     if (attempt > 1) return task.description;
 
-    logger.info(`Sub-refining task ${task.id} for TDD granularity...`);
+    // Epic work items arrive pre-refined: /plan already produced acceptance
+    // criteria, test requirements, and dev notes at work-item granularity.
+    // Re-planning them costs a full thinking-model call (plus a web search)
+    // per task and rarely changes the plan — skip straight to implementation.
+    // On-the-fly subtasks (no metadata) still get the granularity pass.
+    if (task.acceptance?.length || task.tests?.length || task.devNotes) {
+      logger.info(`[${task.id}] Skipping technical refinement — work item already carries acceptance/tests/devNotes from planning`);
+      return task.description;
+    }
+
+    logger.info(`Sub-refining task ${task.id} for TDD granularity (planner model call — progress logs in workflow log, not live.log)...`);
+    const refineStart = Date.now();
     const subPlan = await planAndBreakdown(
       `Implement this specific work item: ${task.description}\n\n` +
       `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
@@ -2516,7 +2590,7 @@ export class WorkflowExecutor {
     }
 
     const plan = subPlan.subtasks.map((s, i) => `${i + 1}. ${s.description}`).join('\n');
-    logger.info(`Task ${task.id} refined into ${subPlan.subtasks.length} steps`);
+    logger.info(`Task ${task.id} refined into ${subPlan.subtasks.length} steps in ${formatDuration(Date.now() - refineStart)}`);
 
     // Only post the refinement summary when the planner actually decomposed the task into
     // multiple steps. A single-step result is effectively a pass-through — posting it would

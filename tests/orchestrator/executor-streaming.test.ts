@@ -32,6 +32,7 @@ vi.mock('../../src/orchestrator/quality-gates.js', () => ({
   collectCoverageSnapshot: vi.fn().mockResolvedValue(undefined),
   detectTestCommand: vi.fn(),
   formatGateFailures: vi.fn(),
+  hasCoverageThresholds: vi.fn().mockReturnValue(false),
 }));
 
 vi.mock('../../src/orchestrator/epic-loader.js', () => ({
@@ -1138,6 +1139,36 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
   });
 
   // ── Arbiter tests ──────────────────────────────────────────────────────────
+
+  it('reuses the baseline gate sweep across runs when the working tree is unchanged', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' }); // stable mocked git state
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    state.initWorkflow('epic-baseline-cache');
+    state.setSubtasks([{ id: 'WI-1', description: 'First task' }]);
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      const { session, fire } = makeMockSession();
+      session.prompt = vi.fn().mockImplementation(async () => {
+        fire({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: opts.taskType === 'review' ? 'APPROVED: true' : 'DONE: done' } });
+      });
+      return session;
+    });
+
+    const fullScopeCalls = () =>
+      (runQualityGates as any).mock.calls.filter((c: any[]) => c[1]?.fullScope).length;
+
+    await (executor as any).processQueue();
+    expect(fullScopeCalls()).toBe(1); // first run pays for the sweep
+
+    state.setSubtasks([{ id: 'WI-2', description: 'Second task' }]);
+    await (executor as any).processQueue();
+    expect(fullScopeCalls()).toBe(1); // unchanged tree → cache hit, no second sweep
+  });
 
   it('resumed task with attempts past MAX_ATTEMPTS still runs implement→review (no blind arbiter consult)', async () => {
     const { createSubAgentSession } = await import('../../src/subagent/factory.js');
