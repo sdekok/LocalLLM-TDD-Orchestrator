@@ -11,6 +11,30 @@ export interface GateResult {
   blocking: boolean;
 }
 
+/** Lifecycle phase of a single gate, reported live via RunQualityGatesOptions.onGate. */
+export type GatePhase = 'start' | 'pass' | 'fail';
+
+export interface GateProgress {
+  /** Canonical gate id: 'build' | 'typescript' | 'tests' | 'coverage' | 'lint' | 'file-safety'. */
+  gate: string;
+  phase: GatePhase;
+  /** Short human-readable detail — the command on 'start', a metric/summary on 'pass'/'fail'. */
+  detail?: string;
+}
+
+/** Human label for a gate id, used in live progress lines. */
+export function gateLabel(gate: string): string {
+  switch (gate) {
+    case 'build': return 'build / type-check';
+    case 'typescript': return 'type-check (tsc)';
+    case 'tests': return 'tests';
+    case 'coverage': return 'coverage';
+    case 'lint': return 'lint';
+    case 'file-safety': return 'file-safety check';
+    default: return gate;
+  }
+}
+
 /**
  * Wall-clock budget for a single test or coverage run. Large suites blow the
  * old 120s budget, so default to 5 minutes. Override per project via
@@ -241,6 +265,13 @@ export interface RunQualityGatesOptions {
    * signature comparison can correctly mask pre-existing issues.
    */
   fullScope?: boolean;
+  /**
+   * Live progress callback fired as each gate starts and finishes. Lets the
+   * orchestrator surface what it's doing during the (often multi-minute) gate
+   * sweep between implementation and review rounds, instead of going silent.
+   * Best-effort — exceptions thrown by the callback are swallowed.
+   */
+  onGate?: (progress: GateProgress) => void;
 }
 
 /** True when the project opts into blocking coverage via tddConfig.coverageThresholds. */
@@ -284,6 +315,15 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   let testMetrics: TestMetrics | undefined;
   let coverageMetrics: CoverageMetrics | undefined;
 
+  // Best-effort live progress — never let a misbehaving callback break the sweep.
+  const emit = (progress: GateProgress): void => {
+    try { options.onGate?.(progress); } catch { /* progress is advisory */ }
+  };
+  const emitResult = (gate: string, r: GateResult): GateResult => {
+    emit({ gate, phase: r.passed ? 'pass' : 'fail' });
+    return r;
+  };
+
   // Gate 1: Build / type-check (BLOCKING)
   // A real build is the authoritative type-check: it runs the production
   // tsconfig(s) with strict flags AND the bundler, catching type-only
@@ -294,11 +334,13 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   // `tsc --noEmit` when no build command can be resolved.
   const buildCommand = getBuildCommand(projectDir, options.fullScope);
   if (buildCommand) {
-    gates.push(await runGate('build', splitCommand(buildCommand), projectDir, true, 300_000));
+    emit({ gate: 'build', phase: 'start', detail: buildCommand });
+    gates.push(emitResult('build', await runGate('build', splitCommand(buildCommand), projectDir, true, 300_000)));
   } else {
     const tsconfigPath = path.join(projectDir, 'tsconfig.json');
     if (fs.existsSync(tsconfigPath)) {
-      gates.push(await runGate('typescript', ['npx', 'tsc', '--noEmit'], projectDir, true, 60_000));
+      emit({ gate: 'typescript', phase: 'start', detail: 'tsc --noEmit' });
+      gates.push(emitResult('typescript', await runGate('typescript', ['npx', 'tsc', '--noEmit'], projectDir, true, 60_000)));
     }
   }
 
@@ -318,6 +360,7 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
     // --coverage here causes false failures: coverage instrumentation adds
     // ~20-40% overhead (integration tests can tip over the timeout) and can
     // produce different pass/fail results than a plain test run.
+    emit({ gate: 'tests', phase: 'start' });
     const testResult = await runner.runTests(projectDir, getTestTimeoutMs(projectDir));
 
     gates.push({
@@ -328,12 +371,18 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
     });
 
     testMetrics = testResult.metrics;
+    emit({
+      gate: 'tests',
+      phase: testResult.passed ? 'pass' : 'fail',
+      detail: testMetrics ? `${testMetrics.passed}/${testMetrics.total} passed` : undefined,
+    });
 
     // Gate 2b: Coverage — run when the caller needs a snapshot (collectCoverage:true)
     // or when the project has explicit thresholds configured. A single coverage run
     // serves both purposes so we never run tests twice for the same gate check.
     const needsCoverageRun = options.collectCoverage || !!pkg.tddConfig?.coverageThresholds;
     if (needsCoverageRun) {
+      emit({ gate: 'coverage', phase: 'start' });
       try {
         const coverageResult = await runner.runCoverage(projectDir, getTestTimeoutMs(projectDir));
         coverageMetrics = coverageResult.coverage;
@@ -350,6 +399,10 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
           output: coveragePass.message,
           blocking: true,
         });
+        emit({ gate: 'coverage', phase: coveragePass.passed ? 'pass' : 'fail', detail: `${coverageMetrics.lines}% lines` });
+      } else {
+        // Snapshot-only run (no blocking threshold gate) — still report it finished.
+        emit({ gate: 'coverage', phase: 'pass', detail: coverageMetrics ? `${coverageMetrics.lines}% lines` : 'collected' });
       }
     }
   } else {
@@ -363,11 +416,13 @@ export async function runQualityGates(projectDir: string, options: RunQualityGat
   // and is flat-config-aware (omits the dead `--ext` flag under eslint.config.*).
   const lintCommand = getLintCommand(projectDir, options.fullScope);
   if (lintCommand) {
-    gates.push(await runGate('lint', splitCommand(lintCommand), projectDir, true, 120_000));
+    emit({ gate: 'lint', phase: 'start', detail: lintCommand });
+    gates.push(emitResult('lint', await runGate('lint', splitCommand(lintCommand), projectDir, true, 120_000)));
   }
 
   // Gate 4: File safety (BLOCKING)
-  gates.push(await checkFileSafety(projectDir));
+  emit({ gate: 'file-safety', phase: 'start' });
+  gates.push(emitResult('file-safety', await checkFileSafety(projectDir)));
 
   const allBlockingPassed = gates.filter((g) => g.blocking).every((g) => g.passed);
   logger.info(`Quality gates: ${gates.filter((g) => g.passed).length}/${gates.length} passed (blocking: ${allBlockingPassed})`);

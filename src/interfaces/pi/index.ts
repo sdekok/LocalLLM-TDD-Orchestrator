@@ -30,6 +30,7 @@ import { completeTddArgs, completeReviewArgs, completeResearchArgs, completePlan
 import { parsePlanArgs, listExistingEpics, readPriorRequest } from './plan-helpers.js';
 import { formatWorkflowStatus } from './status.js';
 import { LessonStore, INJECT_MIN_OCCURRENCES } from '../../orchestrator/lessons.js';
+import { versionString } from '../../version.js';
 
 // Gate output can be 10MB+ from large monorepo test runs. The planner only
 // needs enough to identify failing files/tests — not full stack traces.
@@ -67,6 +68,11 @@ export default function(pi: ExtensionAPI) {
   // bypass Pi's renderer and end up in the input box. Logs go to files; anything
   // the user should see is posted via chatMessage/ctx.ui.notify.
   setLoggerStderrMirror(false);
+
+  // Stamp the loaded build into the log so "is my fix actually live?" is a
+  // one-line answer. A *running* Pi session keeps the bundle it loaded at
+  // startup, so this is the source of truth, not the dist on disk.
+  getLogger().info(`[PI] Loaded ${versionString()}`);
 
   let executor: WorkflowExecutor | null = null;
   let stateManager: StateManager | null = null;

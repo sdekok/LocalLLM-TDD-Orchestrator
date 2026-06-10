@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { z } from 'zod';
 import { getLogger } from '../utils/logger.js';
 
 export interface SamplingParams {
@@ -83,6 +84,99 @@ export interface ModelRouterConfig {
 }
 
 const CONFIG_FILENAMES = ['models.config.json', 'models.config.local.json'];
+
+/** Runtime list of valid routing task types — mirrors the TaskType union above. */
+const TASK_TYPES: readonly TaskType[] = [
+  'plan', 'project-plan', 'implement', 'review', 'arbitrate',
+  'research', 'design', 'design_review', 'analyze', 'document',
+];
+
+// Structural schema for a single model profile. Non-strict: unknown/extra keys
+// pass through untouched (we validate types and required fields, not vocabulary,
+// so a future field addition or a harmless extra key doesn't disable routing).
+const SamplingParamsSchema = z.object({
+  temperature: z.number().optional(),
+  top_k: z.number().optional(),
+  top_p: z.number().optional(),
+  min_p: z.number().optional(),
+  repeat_penalty: z.number().optional(),
+  frequency_penalty: z.number().optional(),
+  presence_penalty: z.number().optional(),
+});
+
+const ModelProfileSchema = z.object({
+  // `name` is display-only (used in log/error strings, never for routing), so a
+  // profile that omits it is degraded but not broken. Keep it optional rather
+  // than letting one cosmetic gap force the whole config to passthrough.
+  name: z.string().optional(),
+  ggufFilename: z.string().optional(),
+  modelId: z.string().optional(),
+  provider: z.enum(['local', 'openrouter', 'openai']),
+  baseURL: z.string().optional(),
+  apiKeyEnvVar: z.string().optional(),
+  enableThinking: z.boolean().optional(),
+  preserveThinkingHistory: z.boolean().optional(),
+  sessionRefreshAfter: z.number().optional(),
+  sessionRefreshTokens: z.number().optional(),
+  contextWindow: z.number(),
+  contextBudgetTokens: z.number().optional(),
+  maxOutputTokens: z.number(),
+  architecture: z.enum(['dense', 'moe', 'unknown']),
+  parameterCount: z.string().optional(),
+  speed: z.enum(['fast', 'medium', 'slow']),
+  samplingParams: SamplingParamsSchema.optional(),
+});
+
+const ModelRouterConfigSchema = z.object({
+  llamaCppUrl: z.string().optional(),
+  models: z.record(z.string(), ModelProfileSchema),
+  // Routing keys/values are checked semantically below for precise messages.
+  routing: z.record(z.string(), z.string()),
+});
+
+export type ConfigValidation =
+  | { ok: true; config: ModelRouterConfig }
+  | { ok: false; errors: string[] };
+
+/**
+ * Validate a (merged) model-router config. Catches the silent-fallback failures:
+ * malformed/missing profile fields, wrong types, a typo'd routing key, and a
+ * routing target that names a model not defined in `models`. Returns precise,
+ * source-tagged messages so the caller can tell the user exactly what to fix.
+ *
+ * On success returns the ORIGINAL config object (not zod's parsed copy) so no
+ * unmodelled field is ever silently dropped.
+ */
+export function validateRouterConfig(config: unknown, source = 'models.config.json'): ConfigValidation {
+  const parsed = ModelRouterConfigSchema.safeParse(config);
+  if (!parsed.success) {
+    const errors = parsed.error.issues.map(
+      i => `${source}: ${i.path.join('.') || '(root)'} — ${i.message}`,
+    );
+    return { ok: false, errors };
+  }
+
+  const cfg = config as ModelRouterConfig;
+  const errors: string[] = [];
+  const modelKeys = Object.keys(cfg.models);
+  for (const [taskType, modelKey] of Object.entries(cfg.routing)) {
+    if (!TASK_TYPES.includes(taskType as TaskType)) {
+      errors.push(
+        `${source}: routing key '${taskType}' is not a valid task type ` +
+        `(expected one of: ${TASK_TYPES.join(', ')})`,
+      );
+      continue;
+    }
+    if (!cfg.models[modelKey]) {
+      errors.push(
+        `${source}: routing.${taskType} → '${modelKey}' is not defined in models ` +
+        `(available: ${modelKeys.join(', ') || 'none'})`,
+      );
+    }
+  }
+  if (errors.length > 0) return { ok: false, errors };
+  return { ok: true, config: cfg };
+}
 
 /**
  * Walk up the directory tree from startDir to find the nearest package root
@@ -287,8 +381,23 @@ export class ModelRouter {
         this.config = { models: {}, routing: {} };
         this.isPassthrough = true;
       } else {
-        this.config = merged;
-        this.isPassthrough = false;
+        // A typo'd routing target or malformed profile used to silently fall back
+        // to defaults. Validate the merged config and, on failure, drop to
+        // passthrough with a precise message rather than routing to a model that
+        // doesn't exist.
+        const result = validateRouterConfig(merged);
+        if (!result.ok) {
+          getLogger().warn(
+            'Invalid models.config.json — model routing disabled, falling back to ' +
+            "Pi's active model (passthrough). Fix and reload:\n" +
+            result.errors.map(e => `  • ${e}`).join('\n'),
+          );
+          this.config = { models: {}, routing: {} };
+          this.isPassthrough = true;
+        } else {
+          this.config = merged;
+          this.isPassthrough = false;
+        }
       }
     }
   }

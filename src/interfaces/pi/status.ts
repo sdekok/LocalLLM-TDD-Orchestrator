@@ -1,4 +1,5 @@
 import type { WorkflowState, Subtask, TaskStatus } from '../../orchestrator/state.js';
+import { versionString } from '../../version.js';
 
 const STATUS_ICONS: Record<TaskStatus, string> = {
   pending: '⬜',
@@ -44,7 +45,7 @@ export function formatWorkflowStatus(state: WorkflowState, live?: StatusLiveInfo
     return 'No workflow state found in this project. Use `/tdd <epic>` to start one.';
   }
 
-  const lines: string[] = ['## TDD Workflow Status', ''];
+  const lines: string[] = ['## TDD Workflow Status', '', `_${versionString()}_`, ''];
 
   const request = state.refined_request || state.original_request;
   if (request) lines.push(`**Request:** ${request}`);

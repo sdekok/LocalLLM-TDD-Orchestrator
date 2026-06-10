@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, hasCoverageThresholds, type CoverageMetrics } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, hasCoverageThresholds, gateLabel, type CoverageMetrics, type GateProgress } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -1090,8 +1090,14 @@ export class WorkflowExecutor {
         // past a single grant, while MAX_ARBITER_ROUNDS caps the total consults so
         // a stuck task can't loop forever.
         let arbiterExtraRounds = 0;
-        let arbiterRounds = 0;             // arbiter consultations used so far
-        let attemptCeiling = MAX_ATTEMPTS; // highest attempt number reached (cumulative numbering across passes)
+        // Restore the arbiter-consult count and the raised attempt ceiling from a
+        // prior (possibly interrupted) run. On a fresh task both are undefined →
+        // 0 consults and a ceiling of MAX_ATTEMPTS. On a resume where the arbiter
+        // previously granted extra rounds, the persisted ceiling (e.g. 14) drives
+        // the loop so the remaining attempts execute instead of dropping into a
+        // blind consult.
+        let arbiterRounds = task.arbiterRounds ?? 0;             // arbiter consultations used so far
+        let attemptCeiling = Math.max(MAX_ATTEMPTS, task.attemptCeiling ?? 0); // highest attempt number reached (cumulative numbering across passes)
         for (let pass = 0; pass <= MAX_ARBITER_ROUNDS && !approved && !haltSession; pass++) {
           if (pass > 0 && arbiterExtraRounds === 0) break;
 
@@ -1109,17 +1115,22 @@ export class WorkflowExecutor {
           }
 
           const attemptStart = pass === 0 ? startAttempt : attemptCeiling + 1;
-          // A resumed task can carry `attempts` PAST MAX_ATTEMPTS — arbiter-granted
-          // extra rounds from a previous process are persisted in task.attempts but
-          // the raised ceiling is not. Without the max(), the attempt loop would be
-          // `for (attempt = 12; attempt <= 5)` — never executing — and the task
-          // would drop straight into a blind arbiter consult with no implementer
-          // run, no gate run, no reviewer, and an empty diff. Taking the max
-          // guarantees a resumed over-ceiling task gets at least one full
-          // implement → gates → review cycle before the arbiter is consulted.
-          const attemptEnd   = pass === 0 ? Math.max(MAX_ATTEMPTS, startAttempt) : attemptCeiling + arbiterExtraRounds;
+          // For pass 0 the loop runs up to the (possibly persisted) ceiling. The
+          // max() with startAttempt is a belt-and-braces guard for tasks
+          // interrupted *before* the ceiling was persisted: such a task can carry
+          // `attempts` past MAX_ATTEMPTS with no recorded ceiling, and without the
+          // max the loop would be `for (attempt = 12; attempt <= 5)` — never
+          // executing — dropping straight into a blind arbiter consult with no
+          // implementer run, no gates, no reviewer, and an empty diff. With the
+          // ceiling now persisted (see updateSubtask below) this is rarely needed,
+          // but it keeps legacy/over-ceiling resumes running at least one full
+          // implement → gates → review cycle.
+          const attemptEnd   = pass === 0 ? Math.max(attemptCeiling, startAttempt) : attemptCeiling + arbiterExtraRounds;
           arbiterExtraRounds = 0;        // consumed for this pass; the next arbiter consult must re-grant
           attemptCeiling = attemptEnd;   // advance the numbering ceiling for the next pass
+          // Persist the ceiling + consult count so an interrupt mid-pass
+          // reconstructs identical loop bounds on resume.
+          this.state.updateSubtask(task.id, { attemptCeiling, arbiterRounds });
 
           for (let attempt = attemptStart; attempt <= attemptEnd && !approved && !haltSession; attempt++) {
             const totalMax = attemptEnd; // used for chat messages
@@ -1508,7 +1519,29 @@ export class WorkflowExecutor {
               phase: 'quality-gates',
               message: 'Verifying implementation (TSC, Tests, Lint)...'
             });
-            const qualityReport = await runQualityGates(this.state.projectDir);
+            // Surface each gate live as it runs — the sweep can take minutes, so a
+            // single static "Verifying…" line leaves the user staring at a frozen
+            // status. onGate updates the live status line on start and posts a
+            // compact ✓/✗ trail to chat as each gate finishes.
+            const gateOutcomes: string[] = [];
+            const onGate = (p: GateProgress): void => {
+              const label = gateLabel(p.gate);
+              if (p.phase === 'start') {
+                this.events.emit('taskProgress', {
+                  id: task.id,
+                  attempt,
+                  phase: 'quality-gates',
+                  message: `Running ${label}…`,
+                });
+              } else {
+                const icon = p.phase === 'pass' ? '✅' : '❌';
+                gateOutcomes.push(`${icon} ${label}${p.detail ? ` (${p.detail})` : ''}`);
+              }
+            };
+            const qualityReport = await runQualityGates(this.state.projectDir, { onGate });
+            if (gateOutcomes.length > 0) {
+              this.chatMessage?.(`🔬 **[${task.id}]** Gates (attempt ${attempt}): ${gateOutcomes.join(' · ')}`, 'tdd-gates');
+            }
 
             // Parse and format coverage results if available
             let coverageInfo = '';
@@ -1775,6 +1808,9 @@ export class WorkflowExecutor {
           // the user has told us to halt, not spend more budget on another agent.
           if (!approved && !haltSession && !this.stopRequested && !this.pauseRequested && arbiterRounds < MAX_ARBITER_ROUNDS) {
             arbiterRounds++;
+            // Persist immediately so a resume after this consult doesn't hand the
+            // task a fresh budget of MAX_ARBITER_ROUNDS consultations.
+            this.state.updateSubtask(task.id, { arbiterRounds });
             // Quiesce the implementer first. session.prompt() can resolve while
             // the underlying agent is still streaming (we've observed implementer
             // events firing minutes after its last prompt supposedly returned),

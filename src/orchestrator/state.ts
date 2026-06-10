@@ -16,6 +16,17 @@ export interface Subtask {
   tests_written: boolean;
   code_implemented: boolean;
   attempts: number;
+  /**
+   * Highest attempt number the loop is currently allowed to reach. Starts at
+   * MAX_ATTEMPTS and is raised when the arbiter grants extra "continue" rounds.
+   * Persisted so a task interrupted *after* a grant resumes with the right loop
+   * bounds — otherwise `attempts` can sit past MAX_ATTEMPTS while the raised
+   * ceiling lives only in memory, and the resumed loop never executes (it falls
+   * straight into a blind arbiter consult). See WorkflowExecutor.processQueue.
+   */
+  attemptCeiling?: number;
+  /** Arbiter consultations used so far for this task (capped at MAX_ARBITER_ROUNDS). */
+  arbiterRounds?: number;
   feedback?: string;
   test_failures?: string;
   acceptance?: string[];
@@ -207,6 +218,8 @@ export class StateManager {
       if (task.status === 'failed') {
         task.status = 'pending';
         task.attempts = 0;
+        task.attemptCeiling = undefined;
+        task.arbiterRounds = undefined;
         task.phase = undefined;
         task.feedback = undefined;
         count++;
@@ -226,6 +239,8 @@ export class StateManager {
       if (task.status === 'failed') {
         task.status = 'pending';
         task.attempts = 0;
+        task.attemptCeiling = undefined;
+        task.arbiterRounds = undefined;
         task.phase = undefined;
         // task.feedback intentionally preserved
         count++;
