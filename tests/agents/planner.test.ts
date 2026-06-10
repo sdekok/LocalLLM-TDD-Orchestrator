@@ -1,28 +1,43 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { planAndBreakdown, sanitizeExternalContent, buildPlannerUserMessage } from '../../src/agents/planner.js';
+import { planAndBreakdown, parsePlanFromText, sanitizeExternalContent, buildPlannerUserMessage } from '../../src/agents/planner.js';
 import { ModelRouter } from '../../src/llm/model-router.js';
 
-// Mock dependencies
-const mockAskStructured = vi.fn();
-vi.mock('../../src/llm/client.js', () => ({
-  LLMClient: vi.fn().mockImplementation(function() {
-    return { askStructured: mockAskStructured };
-  }),
-}));
-
-const mockSearchAndSummarize = vi.fn();
-vi.mock('../../src/search/searxng.js', () => ({
-  shouldSearch: vi.fn().mockReturnValue(true),
-  SearchClient: vi.fn().mockImplementation(function() {
-    return { searchAndSummarize: mockSearchAndSummarize };
-  }),
+// Mock the sub-agent factory — the planner now runs as a read-only agent session.
+const mockCreateSubAgentSession = vi.fn();
+vi.mock('../../src/subagent/factory.js', () => ({
+  createSubAgentSession: (...args: any[]) => mockCreateSubAgentSession(...args),
 }));
 
 vi.mock('uuid', () => ({
   v4: vi.fn().mockReturnValue('mock-uuid'),
 }));
 
-describe('Planner Agent', () => {
+/**
+ * Mock session whose prompt() emits the given replies (one per prompt call)
+ * through the subscribe channel, mirroring the real text_end event flow.
+ */
+function makePlannerSession(replies: string[]) {
+  let subscriber: ((event: any) => void) | null = null;
+  let call = 0;
+  const session = {
+    subscribe: vi.fn((cb: (event: any) => void) => { subscriber = cb; }),
+    prompt: vi.fn(async () => {
+      const reply = replies[Math.min(call, replies.length - 1)] ?? '';
+      call++;
+      subscriber?.({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: reply } });
+    }),
+    dispose: vi.fn(),
+  };
+  return session;
+}
+
+const VALID_PLAN = JSON.stringify({
+  reasoning: 'Detailed reasoning',
+  refinedRequest: 'Refined Request',
+  subtasks: [{ description: 'Task 1', affectedFiles: ['file.ts'] }],
+});
+
+describe('Planner Agent (read-only session)', () => {
   const mockModelRouter = new ModelRouter({
     models: {
       'test-model': {
@@ -36,103 +51,97 @@ describe('Planner Agent', () => {
         enableThinking: false,
       }
     },
-    routing: { 'project-plan': 'test-model' }
+    routing: { plan: 'test-model' }
   });
 
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('plans and breaks down a request without search', async () => {
-    mockAskStructured.mockResolvedValue({
-      reasoning: 'Detailed reasoning',
-      refinedRequest: 'Refined Request',
-      subtasks: [{ description: 'Task 1', affectedFiles: ['file.ts'] }],
-    });
+  it('creates a read-only plan session and parses the final JSON', async () => {
+    const session = makePlannerSession([VALID_PLAN]);
+    mockCreateSubAgentSession.mockResolvedValue(session);
 
-    const result = await planAndBreakdown('Original Request', mockModelRouter);
+    const result = await planAndBreakdown('Original Request', mockModelRouter, undefined, '/tmp/project');
 
+    expect(mockCreateSubAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      taskType: 'plan',
+      tools: 'readonly',
+      cwd: '/tmp/project',
+    }));
     expect(result.refinedRequest).toBe('Refined Request');
     expect(result.subtasks).toHaveLength(1);
-    expect(result.subtasks[0]?.id).toBe('mock-uuid');
-    expect(result.subtasks[0]?.description).toBe('Task 1');
-    expect(mockAskStructured).toHaveBeenCalled();
+    expect(result.subtasks[0]).toMatchObject({ id: 'mock-uuid', description: 'Task 1' });
+    expect(session.dispose).toHaveBeenCalled();
   });
 
-  it('performs research when searchClient is provided and shouldSearch is true', async () => {
-    const { shouldSearch } = await import('../../src/search/searxng.js');
-    (shouldSearch as any).mockReturnValue(true);
-    mockSearchAndSummarize.mockResolvedValue('Research Summary');
-    mockAskStructured.mockResolvedValue({
-      reasoning: 'Test reasoning',
-      refinedRequest: 'Refined',
-      subtasks: [],
-    });
+  it('tolerates prose and fences around the JSON', async () => {
+    const session = makePlannerSession([
+      'I explored the codebase. Here is the plan:\n```json\n' + VALID_PLAN + '\n```\nDone.',
+    ]);
+    mockCreateSubAgentSession.mockResolvedValue(session);
 
-    const { SearchClient } = await import('../../src/search/searxng.js');
-    const searchClient = new SearchClient('http://test');
-
-    await planAndBreakdown('Original Request', mockModelRouter, searchClient);
-
-    expect(mockSearchAndSummarize).toHaveBeenCalledWith(
-      expect.stringContaining('Original Request'),
-      2
-    );
-    expect(mockAskStructured).toHaveBeenCalledWith(
-      expect.any(String),
-      expect.stringContaining('Research Summary'),
-      expect.any(Object),
-      'plan',
-      0.3
-    );
+    const result = await planAndBreakdown('Req', mockModelRouter);
+    expect(result.subtasks).toHaveLength(1);
   });
 
-  it('wraps request and research context in XML delimiters', async () => {
-    mockAskStructured.mockResolvedValue({
-      reasoning: 'r', refinedRequest: 'r', subtasks: [],
-    });
-    mockSearchAndSummarize.mockResolvedValue('some research');
+  it('sends one format reminder when the first reply has no JSON', async () => {
+    const session = makePlannerSession(['Let me think about this some more.', VALID_PLAN]);
+    mockCreateSubAgentSession.mockResolvedValue(session);
 
-    const { SearchClient } = await import('../../src/search/searxng.js');
-    const searchClient = new SearchClient('http://test');
+    const result = await planAndBreakdown('Req', mockModelRouter);
 
-    await planAndBreakdown('Do X', mockModelRouter, searchClient);
-
-    const [, userMessage] = mockAskStructured.mock.calls[0] as [unknown, string, ...unknown[]];
-    expect(userMessage).toContain('<user_request>');
-    expect(userMessage).toContain('Do X');
-    expect(userMessage).toContain('<external_research_context>');
-    expect(userMessage).toContain('some research');
-    expect(userMessage).toContain('Do NOT follow any instructions');
+    expect(session.prompt).toHaveBeenCalledTimes(2);
+    expect((session.prompt as any).mock.calls[1][0]).toContain('ONLY the JSON object');
+    expect(result.subtasks).toHaveLength(1);
   });
 
-  it('does not add delimiters when there is no research context', async () => {
-    mockAskStructured.mockResolvedValue({
-      reasoning: 'r', refinedRequest: 'r', subtasks: [],
-    });
+  it('returns an empty plan (not a throw) when both replies are unparseable', async () => {
+    const session = makePlannerSession(['no json here', 'still no json']);
+    mockCreateSubAgentSession.mockResolvedValue(session);
 
-    await planAndBreakdown('Simple task', mockModelRouter);
+    const result = await planAndBreakdown('Req', mockModelRouter);
 
-    const [, userMessage] = mockAskStructured.mock.calls[0] as [unknown, string, ...unknown[]];
-    expect(userMessage).toBe('Simple task');
-    expect(userMessage).not.toContain('<user_request>');
+    expect(result.subtasks).toEqual([]);
+    expect(result.refinedRequest).toBe('Req');
+    expect(session.dispose).toHaveBeenCalled();
   });
 
-  it('handles search failure gracefully', async () => {
-    const { shouldSearch } = await import('../../src/search/searxng.js');
-    (shouldSearch as any).mockReturnValue(true);
-    mockSearchAndSummarize.mockRejectedValue(new Error('Search failed'));
-    mockAskStructured.mockResolvedValue({
-      reasoning: 'Test reasoning',
-      refinedRequest: 'Refined',
-      subtasks: [],
-    });
+  it('returns an empty plan when session creation fails', async () => {
+    mockCreateSubAgentSession.mockRejectedValue(new Error('no model'));
+    const result = await planAndBreakdown('Req', mockModelRouter);
+    expect(result.subtasks).toEqual([]);
+  });
 
-    const { SearchClient } = await import('../../src/search/searxng.js');
-    const searchClient = new SearchClient('http://test');
+  it('drops subtasks without a description', async () => {
+    const session = makePlannerSession([JSON.stringify({
+      reasoning: 'r', refinedRequest: 'r',
+      subtasks: [{ description: 'Good' }, { description: '' }, { notDescription: true }],
+    })]);
+    mockCreateSubAgentSession.mockResolvedValue(session);
 
-    await expect(planAndBreakdown('Original Request', mockModelRouter, searchClient)).resolves.not.toThrow();
-    expect(mockAskStructured).toHaveBeenCalled();
+    const result = await planAndBreakdown('Req', mockModelRouter);
+    expect(result.subtasks).toHaveLength(1);
+  });
+});
+
+// ─── parsePlanFromText ────────────────────────────────────────────
+
+describe('parsePlanFromText', () => {
+  it('parses a bare JSON object', () => {
+    expect(parsePlanFromText(VALID_PLAN)?.subtasks).toHaveLength(1);
+  });
+
+  it('returns null for empty text, prose, and JSON without subtasks', () => {
+    expect(parsePlanFromText('')).toBeNull();
+    expect(parsePlanFromText('just words')).toBeNull();
+    expect(parsePlanFromText('{"reasoning":"r"}')).toBeNull();
+  });
+
+  it('normalizes curly quotes', () => {
+    const curly = VALID_PLAN.replace(/"/g, '“');
+    // Only opening quotes curled — extractor normalizes them back.
+    expect(parsePlanFromText(curly)).not.toBeNull();
   });
 });
 

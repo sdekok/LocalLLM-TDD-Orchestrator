@@ -87,7 +87,7 @@ describe('WorkflowExecutor - Refinement and Epic Loading', () => {
     expect(state.getSubtask('task-1')?.description).toBe('Add math');
   });
 
-  it('skips refinement entirely for epic work items that already carry planning metadata', async () => {
+  it('refines epic work items too — the planner agent grounds the breakdown in the codebase', async () => {
     state.initWorkflow('Test workflow');
     state.setSubtasks([{
       id: 'WI-1',
@@ -96,24 +96,33 @@ describe('WorkflowExecutor - Refinement and Epic Loading', () => {
       tests: ['Unit: dispatcher routes by event type'],
       devNotes: 'Use a dedicated pg client for the transaction',
     }]);
+    (planAndBreakdown as any).mockResolvedValue({
+      refinedRequest: 'Plan',
+      subtasks: [
+        { id: 's1', description: 'Create the consumer class' },
+        { id: 's2', description: 'Wire it into the worker lifecycle' },
+      ],
+    });
 
     const technicalPlan = await executor.refineTaskIntoSubtasks('WI-1', 1);
 
-    expect(planAndBreakdown).not.toHaveBeenCalled();
-    expect(technicalPlan).toBe('Implement the outbox consumer');
+    expect(planAndBreakdown).toHaveBeenCalledWith(
+      expect.stringContaining('Implement the outbox consumer'),
+      expect.anything(),
+      undefined,
+      projectDir,
+    );
+    expect(technicalPlan).toContain('Create the consumer class');
   });
 
-  it('still refines bare on-the-fly subtasks (no planning metadata)', async () => {
+  it('falls back to the original description when refinement throws', async () => {
     state.initWorkflow('Test workflow');
     state.setSubtasks([{ id: 'task-2', description: 'Fix the lint failures' }]);
-    (planAndBreakdown as any).mockResolvedValue({
-      refinedRequest: 'Plan',
-      subtasks: [{ id: 's1', description: 'Fix unused imports in foo.ts' }],
-    });
+    (planAndBreakdown as any).mockRejectedValue(new Error('planner exploded'));
 
-    await executor.refineTaskIntoSubtasks('task-2', 1);
+    const technicalPlan = await executor.refineTaskIntoSubtasks('task-2', 1);
 
-    expect(planAndBreakdown).toHaveBeenCalled();
+    expect(technicalPlan).toBe('Fix the lint failures');
   });
 
   it('loads work items from a pre-planned epic if a match is found', async () => {

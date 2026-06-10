@@ -30,7 +30,7 @@ Pi says "/tdd implement JWT auth"
    └─────────────┘
 ```
 
-The orchestrator spawns **ephemeral, headless sub-agent sessions** for planning, implementation, and review. These agents use Pi's native `read`, `write`, `edit`, and `bash` tools directly on your filesystem.
+The orchestrator spawns **ephemeral, headless sub-agent sessions** for planning, implementation, and review. These agents use Pi's native `read`, `write`, `edit`, and `bash` tools directly on your filesystem. The task planner (on-the-fly decomposition and per-work-item refinement) runs as a **read-only** agent — it explores the codebase with read/grep/lens/context-mode tools before proposing subtasks, streams to live.log like every other agent, and cannot modify files.
 
 - **Self-Healing**: If quality gates fail, the executor rolls back changes and injects deterministic failure logs into the *next* attempt's system prompt.
 - **Git Sandboxing**: Every subtask runs in an isolated git branch. Only proven, reviewed code is merged.

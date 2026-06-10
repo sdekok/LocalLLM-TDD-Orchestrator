@@ -666,7 +666,7 @@ export class WorkflowExecutor {
       }
 
       logger.warn(`⚠️ No pre-planned Epic found for "${request}". Falling back to on-the-fly decomposition.`);
-      const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined);
+      const plan = await planAndBreakdown(request, this.modelRouter, this.searchClient || undefined, this.state.projectDir);
       this.state.updateRefinedRequest(plan.refinedRequest);
 
       if (plan.subtasks.length === 0) {
@@ -2563,26 +2563,27 @@ export class WorkflowExecutor {
     // but with updated feedback injected via the system prompt.
     if (attempt > 1) return task.description;
 
-    // Epic work items arrive pre-refined: /plan already produced acceptance
-    // criteria, test requirements, and dev notes at work-item granularity.
-    // Re-planning them costs a full thinking-model call (plus a web search)
-    // per task and rarely changes the plan — skip straight to implementation.
-    // On-the-fly subtasks (no metadata) still get the granularity pass.
-    if (task.acceptance?.length || task.tests?.length || task.devNotes) {
-      logger.info(`[${task.id}] Skipping technical refinement — work item already carries acceptance/tests/devNotes from planning`);
+    // The planner runs as a read-only streaming agent (visible in live.log) that
+    // explores the codebase before decomposing. Epic work items already carry
+    // acceptance/tests/devNotes, but the grounded breakdown is still worth the
+    // call — the planner sees the actual code, the /plan metadata only described it.
+    logger.info(`Sub-refining task ${task.id} for TDD granularity (read-only planner agent)...`);
+    const refineStart = Date.now();
+    let subPlan: Awaited<ReturnType<typeof planAndBreakdown>>;
+    try {
+      subPlan = await planAndBreakdown(
+        `Implement this specific work item: ${task.description}\n\n` +
+        `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
+        `IMPORTANT: Break this down into high-granularity technical tasks. Each task should ideally add or modify 1 or 2 methods. ` +
+        `This granularity ensures quality in small models.`,
+        this.modelRouter,
+        this.searchClient || undefined,
+        this.state.projectDir,
+      );
+    } catch (err) {
+      logger.warn(`[${task.id}] Refinement failed (${err}) — using original work-item description`);
       return task.description;
     }
-
-    logger.info(`Sub-refining task ${task.id} for TDD granularity (planner model call — progress logs in workflow log, not live.log)...`);
-    const refineStart = Date.now();
-    const subPlan = await planAndBreakdown(
-      `Implement this specific work item: ${task.description}\n\n` +
-      `Existing architectural context:\n${this.state.getState().refined_request}\n\n` +
-      `IMPORTANT: Break this down into high-granularity technical tasks. Each task should ideally add or modify 1 or 2 methods. ` +
-      `This granularity ensures quality in small models.`,
-      this.modelRouter,
-      this.searchClient || undefined
-    );
 
     if (subPlan.subtasks.length === 0) {
       logger.warn(`Refinement returned 0 subtasks for ${task.id} — using original description`);

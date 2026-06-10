@@ -1,35 +1,22 @@
-import { LLMClient } from '../llm/client.js';
-import { SearchClient, shouldSearch } from '../search/searxng.js';
+import { SearchClient } from '../search/searxng.js';
 import { v4 as uuidv4 } from 'uuid';
 import { getLogger } from '../utils/logger.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { PLANNER_PROMPT } from '../subagent/prompts.js';
-
-const PLANNER_SCHEMA = {
-  type: 'object',
-  properties: {
-    reasoning: { type: 'string', description: 'Step-by-step reasoning for the proposed task list' },
-    refinedRequest: { type: 'string' },
-    subtasks: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          description: { type: 'string' },
-          affectedFiles: { type: 'array', items: { type: 'string' }, description: 'List of files likely to be modified by this task' },
-        },
-        required: ['description'],
-      },
-    },
-  },
-  required: ['reasoning', 'refinedRequest', 'subtasks'],
-};
+import { createSubAgentSession } from '../subagent/factory.js';
+import { extractOutermostJSON, normalizeJsonQuotes, TruncatedJsonError } from './components/response-extractor.js';
+import { withTimeout } from '../orchestrator/timeout.js';
 
 export interface PlanResult {
   reasoning: string;
   refinedRequest: string;
   subtasks: { id: string; description: string; affectedFiles?: string[] }[];
 }
+
+/** Total budget for the planner agent (exploration + plan generation). */
+const PLANNER_TIMEOUT_MS = 15 * 60 * 1000;
+/** Budget for the one structured-output format reminder. */
+const FORMAT_RETRY_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Sanitize content from external/untrusted sources before injecting into prompts.
@@ -69,44 +56,137 @@ export function buildPlannerUserMessage(request: string, researchContext?: strin
   ].join('\n');
 }
 
+/**
+ * Parse the planner's final message into the plan shape. Tolerates fences,
+ * surrounding prose, and curly quotes. Returns null when no valid JSON object
+ * with a subtasks array is present.
+ */
+export function parsePlanFromText(text: string): { reasoning?: string; refinedRequest?: string; subtasks?: { description: string; affectedFiles?: string[] }[] } | null {
+  if (!text?.trim()) return null;
+  try {
+    const json = extractOutermostJSON(text);
+    if (!json) return null;
+    const parsed = JSON.parse(normalizeJsonQuotes(json));
+    if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.subtasks)) return null;
+    return parsed;
+  } catch (err) {
+    if (err instanceof TruncatedJsonError) {
+      getLogger().warn(`Planner output truncated: ${err.message}`);
+    }
+    return null;
+  }
+}
+
+/** Prompt the session and wait until the agent is genuinely idle (not just accepted). */
+async function promptAndWait(session: any, text: string): Promise<void> {
+  await session.prompt(text);
+  const agent = session?.agent;
+  if (agent?.waitForIdle) {
+    try { await agent.waitForIdle(); } catch { /* idle-wait best-effort */ }
+  }
+}
+
+/**
+ * Decompose a request into TDD subtasks using a READ-ONLY planner agent.
+ *
+ * Runs as a streaming Pi sub-agent session (visible in live.log, counted in
+ * telemetry) with read-only exploration tools — read/grep/find/ls plus
+ * context-mode, lens, and web search when those extensions are installed. The
+ * PLANNER_PROMPT has always instructed the model to explore the codebase
+ * before planning; this is the path that actually gives it the tools to do so
+ * (the previous implementation was a blind, non-streaming chat completion).
+ *
+ * The final message must contain the plan JSON; one format reminder is sent
+ * when it doesn't. Fail-soft: returns an empty plan instead of throwing, so
+ * callers decide what an empty plan means (startNew errors, refinement falls
+ * back to the original description).
+ *
+ * @param _searchClient retained for signature compatibility — the agent now
+ *   searches the web itself via its own tools when SearXNG is configured.
+ */
 export async function planAndBreakdown(
   request: string,
   modelRouter: ModelRouter,
-  searchClient?: SearchClient
+  _searchClient?: SearchClient,
+  projectDir: string = process.cwd(),
 ): Promise<PlanResult> {
   const logger = getLogger();
-  const llm = new LLMClient(modelRouter);
-  logger.info('Planning and breaking down request...');
+  logger.info('Planning and breaking down request (read-only planner agent)...');
 
-  // Optionally research before planning
-  let researchContext: string | undefined;
-  if (searchClient && shouldSearch(request, 1)) {
-    try {
-      const research = await searchClient.searchAndSummarize(
-        `${request} best practices implementation guide`,
-        2
-      );
-      researchContext = research;
-      logger.info(`Fetched research context: ${research.length} chars`);
-    } catch (err) {
-      logger.warn(`Search failed during planning: ${err}`);
-    }
+  let session: any;
+  try {
+    session = await createSubAgentSession({
+      taskType: 'plan',
+      systemPrompt: PLANNER_PROMPT,
+      cwd: projectDir,
+      modelRouter,
+      tools: 'readonly',
+    });
+  } catch (err) {
+    logger.warn(`Planner session creation failed: ${err}`);
+    return { reasoning: '', refinedRequest: request, subtasks: [] };
   }
 
-  const userMessage = buildPlannerUserMessage(request, researchContext);
+  // Accumulate the agent's visible text so the final JSON can be parsed.
+  let turnText = '';
+  session.subscribe((event: any) => {
+    if (event.type === 'message_update') {
+      const ae = event.assistantMessageEvent;
+      if (ae?.type === 'text_end' && ae.content?.trim()) {
+        turnText += ae.content;
+        getLogger().stream('Planner', ae.content);
+      }
+    } else if (event.type === 'message_end' && event.message?.role === 'assistant' && !turnText) {
+      const text = event.message.content?.find((c: any) => c.type === 'text')?.text;
+      if (text) turnText += text;
+    }
+  });
 
-  const result = await llm.askStructured<{
-    reasoning: string;
-    refinedRequest: string;
-    subtasks: { description: string; affectedFiles?: string[] }[];
-  }>(PLANNER_PROMPT, userMessage, PLANNER_SCHEMA, 'plan', 0.3);
+  try {
+    await withTimeout(
+      promptAndWait(session, buildPlannerUserMessage(request)),
+      PLANNER_TIMEOUT_MS,
+      `Planner timed out after ${PLANNER_TIMEOUT_MS / 60000} minutes`,
+    );
+    let parsed = parsePlanFromText(turnText);
 
-  const subtasks = result.subtasks.map((t) => ({
-    id: uuidv4(),
-    description: t.description,
-    affectedFiles: t.affectedFiles,
-  }));
+    if (!parsed) {
+      logger.warn('Planner reply had no parseable plan JSON — sending format reminder');
+      turnText = '';
+      await withTimeout(
+        promptAndWait(
+          session,
+          'STOP all tool calls. Output ONLY the JSON object matching the required schema from your system prompt — no markdown fences, no prose, nothing before or after the JSON.',
+        ),
+        FORMAT_RETRY_TIMEOUT_MS,
+        'planner-format-retry-timeout',
+      );
+      parsed = parsePlanFromText(turnText);
+    }
 
-  logger.info(`Created ${subtasks.length} subtasks`);
-  return { reasoning: result.reasoning, refinedRequest: result.refinedRequest, subtasks };
+    if (!parsed) {
+      logger.warn('Planner produced no parseable plan after format retry — returning empty plan');
+      return { reasoning: '', refinedRequest: request, subtasks: [] };
+    }
+
+    const subtasks = (parsed.subtasks ?? [])
+      .filter((t) => typeof t?.description === 'string' && t.description.trim().length > 0)
+      .map((t) => ({
+        id: uuidv4(),
+        description: t.description,
+        affectedFiles: t.affectedFiles,
+      }));
+
+    logger.info(`Created ${subtasks.length} subtasks`);
+    return {
+      reasoning: parsed.reasoning ?? '',
+      refinedRequest: parsed.refinedRequest || request,
+      subtasks,
+    };
+  } catch (err) {
+    logger.warn(`Planner agent failed: ${err}`);
+    return { reasoning: '', refinedRequest: request, subtasks: [] };
+  } finally {
+    try { session.dispose(); } catch { /* best-effort */ }
+  }
 }

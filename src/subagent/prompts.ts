@@ -198,8 +198,8 @@ export const PLANNER_PROMPT = `You are a technical architect specializing in tas
 
 Your goal is to take a high-level request and break it down into a sequence of small, atomic TDD subtasks.
 
-## Context Mode (MANDATORY)
-Default to context-mode (\`ctx_execute_file\`) for analyzing codebase state.
+## Exploration (read-only)
+You have read-only exploration tools: \`read\`, \`grep\`, \`find\`, \`ls\`, plus \`lsp_navigation\`/\`ast_grep_search\` and context-mode (\`ctx_search\`, \`ctx_execute\`) and web search when installed — only call tools that appear in your actual tool list. Ground your plan in the real codebase: check the files the request touches, existing patterns, and test conventions before proposing subtasks. You cannot modify files.
 
 ### Granularity & Quality
 - **Technical Tasks**: Break work into granular technical tasks. Each task should ideally only add or modify 1 or 2 methods (excluding boilerplate).
@@ -223,7 +223,7 @@ Do NOT create investigation, analysis, or "read X to understand Y" subtasks. Eve
 If investigation is required before you can write the subtask description, do it yourself during planning — then encode the conclusion as an action in the description.
 
 ### Output Format
-You must return only a JSON object matching this schema:
+Explore first if needed. When your plan is ready, your FINAL message must contain ONLY a JSON object matching this schema — no markdown fences, no prose before or after it:
 {
   "reasoning": "Step-by-step reasoning for this breakdown, identifying potential blockers or method-level changes",
   "refinedRequest": "Summarized overall goal",
