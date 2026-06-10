@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { QualityReport, runQualityGates, runLensAnalysis, getLensFailPolicy, loadFileSafetyAllowlist } from '../../src/orchestrator/quality-gates.js';
+import { QualityReport, runQualityGates, runLensAnalysis, getLensFailPolicy, loadFileSafetyAllowlist, gateLabel, type GateProgress } from '../../src/orchestrator/quality-gates.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -187,6 +187,34 @@ describe('runGate: execFile (no shell) command execution', () => {
 
     // Should not throw — the gate pipeline continues with empty pkg config
     await expect(runQualityGates(tmpDir)).resolves.not.toThrow();
+  });
+
+  it('reports live onGate progress (start → pass/fail) for each gate it runs', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    (getLensClients as any).mockRejectedValue(new Error('no lens'));
+
+    const events: GateProgress[] = [];
+    // No build/lint/test runner in this tmp project → only the file-safety gate runs.
+    await runQualityGates(tmpDir, { onGate: (p) => events.push(p) });
+
+    const safety = events.filter(e => e.gate === 'file-safety');
+    expect(safety.map(e => e.phase)).toEqual(['start', 'pass']); // start precedes terminal phase
+  });
+
+  it('gateLabel maps gate ids to human labels and passes unknowns through', () => {
+    expect(gateLabel('tests')).toBe('tests');
+    expect(gateLabel('file-safety')).toBe('file-safety check');
+    expect(gateLabel('build')).toBe('build / type-check');
+    expect(gateLabel('mystery-gate')).toBe('mystery-gate');
+  });
+
+  it('swallows exceptions thrown by the onGate callback (progress is advisory)', async () => {
+    const { getLensClients } = await import('../../src/orchestrator/lens-bridge.js');
+    (getLensClients as any).mockRejectedValue(new Error('no lens'));
+
+    await expect(
+      runQualityGates(tmpDir, { onGate: () => { throw new Error('boom'); } }),
+    ).resolves.not.toThrow();
   });
 });
 

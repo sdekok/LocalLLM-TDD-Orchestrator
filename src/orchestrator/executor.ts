@@ -4,7 +4,7 @@ import { createHash } from 'crypto';
 import { StateManager, WorkflowState, Subtask } from './state.js';
 import * as path from 'path';
 import { Sandbox } from './sandbox.js';
-import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, hasCoverageThresholds, type CoverageMetrics } from './quality-gates.js';
+import { runQualityGates, runLensAnalysis, collectCoverageSnapshot, hasCoverageThresholds, gateLabel, type CoverageMetrics, type GateProgress } from './quality-gates.js';
 import { ModelRouter } from '../llm/model-router.js';
 import { SearchClient } from '../search/searxng.js';
 import { planAndBreakdown } from '../agents/planner.js';
@@ -1519,7 +1519,29 @@ export class WorkflowExecutor {
               phase: 'quality-gates',
               message: 'Verifying implementation (TSC, Tests, Lint)...'
             });
-            const qualityReport = await runQualityGates(this.state.projectDir);
+            // Surface each gate live as it runs — the sweep can take minutes, so a
+            // single static "Verifying…" line leaves the user staring at a frozen
+            // status. onGate updates the live status line on start and posts a
+            // compact ✓/✗ trail to chat as each gate finishes.
+            const gateOutcomes: string[] = [];
+            const onGate = (p: GateProgress): void => {
+              const label = gateLabel(p.gate);
+              if (p.phase === 'start') {
+                this.events.emit('taskProgress', {
+                  id: task.id,
+                  attempt,
+                  phase: 'quality-gates',
+                  message: `Running ${label}…`,
+                });
+              } else {
+                const icon = p.phase === 'pass' ? '✅' : '❌';
+                gateOutcomes.push(`${icon} ${label}${p.detail ? ` (${p.detail})` : ''}`);
+              }
+            };
+            const qualityReport = await runQualityGates(this.state.projectDir, { onGate });
+            if (gateOutcomes.length > 0) {
+              this.chatMessage?.(`🔬 **[${task.id}]** Gates (attempt ${attempt}): ${gateOutcomes.join(' · ')}`, 'tdd-gates');
+            }
 
             // Parse and format coverage results if available
             let coverageInfo = '';
