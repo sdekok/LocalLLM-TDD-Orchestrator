@@ -1139,6 +1139,51 @@ describe('WorkflowExecutor — stop-on-failure and resume', () => {
 
   // ── Arbiter tests ──────────────────────────────────────────────────────────
 
+  it('resumed task with attempts past MAX_ATTEMPTS still runs implement→review (no blind arbiter consult)', async () => {
+    const { createSubAgentSession } = await import('../../src/subagent/factory.js');
+    const { runQualityGates } = await import('../../src/orchestrator/quality-gates.js');
+    const { execFileAsync } = await import('../../src/utils/exec.js');
+    const { planAndBreakdown } = await import('../../src/agents/planner.js');
+    (execFileAsync as any).mockResolvedValue({ stdout: '', stderr: '' });
+    (planAndBreakdown as any).mockResolvedValue({ refinedRequest: 'Task', subtasks: [] });
+    (runQualityGates as any).mockResolvedValue({ allBlockingPassed: true, gates: [], testMetrics: undefined, coverageMetrics: undefined });
+
+    state.initWorkflow('epic-resume-overflow');
+    state.setSubtasks([{ id: 'WI-1', description: 'Resumed task' }]);
+    // Simulate a prior interrupted run where the arbiter granted extra rounds:
+    // task.attempts persisted past MAX_ATTEMPTS, but the raised ceiling was not.
+    // Regression: the attempt loop was `for (attempt=12; attempt<=5)` — never
+    // executing — and the task dropped straight into a blind arbiter consult.
+    state.updateSubtask('WI-1', { attempts: 12, feedback: 'old reviewer feedback' });
+
+    const sessionTypes: string[] = [];
+    (createSubAgentSession as any).mockImplementation(async (opts: any) => {
+      sessionTypes.push(opts.taskType);
+      const { session, fire } = makeMockSession();
+      if (opts.taskType === 'implement') {
+        session.prompt = vi.fn().mockImplementation(async () => {
+          fire({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DONE: patched per feedback' } });
+        });
+      } else if (opts.taskType === 'review') {
+        session.prompt = vi.fn().mockImplementation(async () => {
+          fire({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'APPROVED: true' } });
+        });
+      } else {
+        session.prompt = vi.fn().mockImplementation(async () => {
+          fire({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: 'DECISION: escalate\nRATIONALE: blind consult — should not happen' } });
+        });
+      }
+      return session;
+    });
+
+    await (executor as any).resume('resume');
+
+    expect(sessionTypes).toContain('implement');
+    expect(sessionTypes).toContain('review');
+    expect(sessionTypes).not.toContain('arbitrate'); // approved on the resumed cycle
+    expect(state.getSubtask('WI-1')?.status).toBe('completed');
+  });
+
   it('arbiter approves task after MAX_ATTEMPTS when QA passed and reviewer was too strict', async () => {
     const chatMessage = vi.fn();
     (executor as any).chatMessage = chatMessage;

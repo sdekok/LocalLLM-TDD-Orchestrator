@@ -1063,7 +1063,15 @@ export class WorkflowExecutor {
           }
 
           const attemptStart = pass === 0 ? startAttempt : attemptCeiling + 1;
-          const attemptEnd   = pass === 0 ? MAX_ATTEMPTS : attemptCeiling + arbiterExtraRounds;
+          // A resumed task can carry `attempts` PAST MAX_ATTEMPTS — arbiter-granted
+          // extra rounds from a previous process are persisted in task.attempts but
+          // the raised ceiling is not. Without the max(), the attempt loop would be
+          // `for (attempt = 12; attempt <= 5)` — never executing — and the task
+          // would drop straight into a blind arbiter consult with no implementer
+          // run, no gate run, no reviewer, and an empty diff. Taking the max
+          // guarantees a resumed over-ceiling task gets at least one full
+          // implement → gates → review cycle before the arbiter is consulted.
+          const attemptEnd   = pass === 0 ? Math.max(MAX_ATTEMPTS, startAttempt) : attemptCeiling + arbiterExtraRounds;
           arbiterExtraRounds = 0;        // consumed for this pass; the next arbiter consult must re-grant
           attemptCeiling = attemptEnd;   // advance the numbering ceiling for the next pass
 
@@ -1433,6 +1441,15 @@ export class WorkflowExecutor {
 
           // Phase 3: Quality Gates
           if (!task.phase || task.phase === 'refining' || task.phase === 'implementing' || task.phase === 'quality_gates') {
+            // Resume safety net (mirrors the reviewer's): resuming directly into
+            // the quality_gates phase skips the implement block — which is where
+            // the task branch gets checked out. Without this, gates would run
+            // against the BASE branch and judge the wrong tree.
+            const gateBranch = await this.sandbox.getCurrentBranch();
+            if (gateBranch !== branchName) {
+              logger.warn(`[${task.id}] Running gates on "${gateBranch}", not task branch "${branchName}" (resumed past implement) — checking out task branch`);
+              await this.sandbox.safeCheckout(branchName);
+            }
             this.state.updateSubtask(task.id, { phase: 'quality_gates' });
             this.events.emit('taskProgress', {
               id: task.id,
