@@ -62,6 +62,7 @@ export class StateManager {
       '.tdd-workflow/state.json',
       '.tdd-workflow/lessons.json',
       '.tdd-workflow/logs/',
+      '.tdd-workflow/sessions/',
       '.pi-lens/',
     ];
     try {

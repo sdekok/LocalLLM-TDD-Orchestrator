@@ -34,6 +34,7 @@ vi.mock('@earendil-works/pi-coding-agent', () => {
     createAgentSession,
     SessionManager: {
       inMemory: vi.fn().mockReturnValue({}),
+      create: vi.fn().mockReturnValue({ getSessionFile: () => '/tmp/.tdd-workflow/sessions/test.jsonl' }),
     },
     DefaultResourceLoader,
   };

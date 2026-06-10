@@ -345,6 +345,10 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
 | `TDD_SLOT_RECOVERY_MS` | `500` | Milliseconds to wait after sub-agent disposal before starting the next agent. Since Pi SDK 0.78 `dispose()` hard-aborts the in-flight request, so this is a safety margin; raise it for servers that linger on aborted requests |
 | `TDD_MCP_STARTUP_MS` | `5000` | Milliseconds to wait for MCP servers (context-mode, searxng) to register tools after session creation |
 
+## Crash Forensics
+
+Every sub-agent session (implementer, reviewer, arbiter, …) persists its full transcript to `.tdd-workflow/sessions/<timestamp>_<role>-<id>.jsonl` as it runs. If a session crashes, hangs, or the process dies mid-task, the transcript survives up to the last model message — open it to see exactly what the agent saw and said. Files are pruned automatically after 7 days; sessions that never received a model response leave no file. The directory is excluded from git automatically.
+
 ## Pi Version Notes
 
 Requires `@earendil-works/pi-coding-agent` ≥ 0.79:

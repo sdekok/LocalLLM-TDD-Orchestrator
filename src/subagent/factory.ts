@@ -428,9 +428,27 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   // Pi will fall back to its default (potentially wrong provider like openrouter).
   // We correct the model below once extensions have registered their models.
   logger.info(`[SUBAGENT FACTORY] Creating agent session (model will be resolved after extension binding)`);
+  // Persist sub-agent transcripts to .tdd-workflow/sessions/ for crash
+  // forensics: a crashed/hung implementer leaves an inspectable session file
+  // instead of vanishing with the process. The dedicated directory keeps these
+  // out of `pi --resume` / `--continue` (which scan the default session dir).
+  // Falls back to in-memory when the directory can't be created (read-only fs).
+  let sessionManager: SessionManager;
+  try {
+    const sessionDir = path.join(options.cwd, '.tdd-workflow', 'sessions');
+    fs.mkdirSync(sessionDir, { recursive: true });
+    pruneOldSessionFiles(sessionDir);
+    sessionManager = SessionManager.create(options.cwd, sessionDir, {
+      id: `${options.taskType}-${Date.now()}`,
+    });
+  } catch (err) {
+    logger.warn(`[SUBAGENT FACTORY] Could not create persistent session dir — using in-memory session: ${err}`);
+    sessionManager = SessionManager.inMemory();
+  }
+
   const { session } = await createAgentSession({
     cwd: options.cwd,
-    sessionManager: SessionManager.inMemory(), // Ephemeral session
+    sessionManager,
     resourceLoader: loader,
     // Pass undefined instead of an empty array when no tools are requested.
     // vLLM rejects `tools: []` with HTTP 400 ("tools must not be an empty
@@ -533,12 +551,37 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   session.setThinkingLevel(thinkingLevel as any);
 
   logger.info(`[SUBAGENT FACTORY] Agent session created successfully`);
+  try {
+    const transcript = sessionManager.getSessionFile?.();
+    if (transcript) logger.info(`[SUBAGENT FACTORY] Session transcript: ${transcript}`);
+  } catch { /* in-memory or mock session */ }
   logger.info(`[SUBAGENT FACTORY] Thinking level: ${thinkingLevel}`);
   logger.info(`[SUBAGENT FACTORY] Session setup complete`);
 
   // Register the session for emergency shutdown cleanup. This wraps dispose()
   // so every existing call site automatically unregisters on normal disposal.
   return trackSession(session);
+}
+
+/** Sub-agent session transcripts older than this are pruned at session creation. */
+const SESSION_RETENTION_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * Delete sub-agent session files older than the retention window so
+ * .tdd-workflow/sessions/ doesn't grow without bound. Fail-soft — forensics
+ * are a convenience, never a reason to block a workflow.
+ */
+function pruneOldSessionFiles(sessionDir: string): void {
+  try {
+    const cutoff = Date.now() - SESSION_RETENTION_MS;
+    for (const file of fs.readdirSync(sessionDir)) {
+      if (!file.endsWith('.jsonl')) continue;
+      const full = path.join(sessionDir, file);
+      try {
+        if (fs.statSync(full).mtimeMs < cutoff) fs.unlinkSync(full);
+      } catch { /* file may be gone already */ }
+    }
+  } catch { /* directory unreadable — skip pruning */ }
 }
 
 // ─── Context pruning ───────────────────────────────────────────────────────
