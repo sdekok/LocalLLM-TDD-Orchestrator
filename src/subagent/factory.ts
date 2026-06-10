@@ -372,8 +372,15 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
   // in multi-turn history prevents thinking quality degradation on subsequent turns.
   const extensionFactories: ExtensionFactory[] = [];
   if (profile.enableThinking) {
-    extensionFactories.push(createThinkingFilter());
-    logger.info('[SUBAGENT FACTORY] Registered thinking-filter extension');
+    if (profile.preserveThinkingHistory) {
+      // Preserved-thinking template (e.g. Qwen 3.6 preserve_thinking): keep
+      // thinking blocks in history so the rendered prompt stays byte-identical
+      // with what was generated — prefix cache hits + model sees prior reasoning.
+      logger.info('[SUBAGENT FACTORY] Thinking-filter skipped (preserveThinkingHistory=true)');
+    } else {
+      extensionFactories.push(createThinkingFilter());
+      logger.info('[SUBAGENT FACTORY] Registered thinking-filter extension');
+    }
   }
 
   // Context pruner budget. The pruner only sees the conversation history, but

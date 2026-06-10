@@ -26,6 +26,15 @@ export interface ModelProfile {
   apiKeyEnvVar?: string;         // Environment variable name for API key
   enableThinking?: boolean;      // Whether to activate reasoning mode + thinking-block history filter
   /**
+   * Keep thinking blocks in multi-turn history instead of stripping them
+   * (only meaningful with enableThinking). Set true for models/servers using
+   * preserved-thinking chat templates (e.g. Qwen 3.6 with preserve_thinking) —
+   * the byte-identical history keeps vLLM's prefix cache hot and lets the
+   * model see its prior reasoning. Leave false/unset for models whose vendors
+   * recommend stripping prior-turn thinking (e.g. Gemma).
+   */
+  preserveThinkingHistory?: boolean;
+  /**
    * Refresh the implementer session every N reviewer-rejection rounds.
    * FALLBACK ONLY: this round cadence applies just when the provider reports
    * no token usage — otherwise the token-based threshold below governs.
