@@ -1207,6 +1207,7 @@ export class WorkflowExecutor {
             // Create the implementer session on the first attempt (or after a session reset).
             // On reviewer-rejection retries within the same window the session is reused
             // (multi-turn) so the agent has full context of its prior work.
+            const sessionContinued = implementerSession !== null;
             if (!implementerSession) {
               implementerSession = await createSubAgentSession({
                 taskType: 'implement',
@@ -1277,7 +1278,11 @@ export class WorkflowExecutor {
               // follow-up. The branch still has the previous implementation so the agent
               // only needs to apply the requested changes.
               this.chatMessage?.(
-                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — continuing implementer session with reviewer feedback`
+                `🔁 **[${task.id}]** Attempt ${attempt}/${totalMax} — ` +
+                `${sessionContinued ? 'continuing implementer session' : 'fresh implementer session'}, addressing ` +
+                `${feedbackHistory[feedbackHistory.length - 1]?.type === 'gates' ? 'quality-gate failures'
+                  : feedbackHistory[feedbackHistory.length - 1]?.type === 'review' ? 'reviewer feedback'
+                  : 'previous-round feedback'}`
               );
 
               // Persist the full feedback to disk, then send only a short checklist
@@ -1735,6 +1740,13 @@ export class WorkflowExecutor {
           } else {
             logger.error(`Attempt ${attempt} error: ${err}`);
             feedback = `Runtime error: ${err}`;
+            // Surface runtime errors in chat — otherwise the attempt silently
+            // vanishes and the next one looks like it followed a review round.
+            this.chatMessage?.(
+              `⚠️ **[${task.id}]** Attempt ${attempt} aborted by a runtime error (orchestrator-side, not an agent failure): ` +
+              `\`${String(err).substring(0, 300)}\` — rolling back this attempt and retrying.`,
+              'tdd-orchestrator',
+            );
           }
           // Dispose the implementer session on error — the branch will be rolled back
           // so the session's in-flight context is no longer valid.
