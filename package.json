@@ -1,6 +1,6 @@
 {
   "name": "tdd-agentic-workflow",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Agentic TDD workflow orchestrator for Pi, powered by local LLMs via llama.cpp",
   "main": "dist/interfaces/pi/index.js",
   "type": "module",
@@ -16,7 +16,7 @@
     "build": "tsc && cp src/orchestrator/lens-bridge.js dist/orchestrator/lens-bridge.js && npm run bundle && esbuild src/orchestrator/lens-bridge.js --bundle --platform=node --format=esm --external:typescript --outfile=dist/interfaces/pi/lens-bridge.js && rm -rf dist/interfaces/pi/tools && mkdir -p dist/interfaces/pi/tools && cp -r src/analysis/tools/* dist/interfaces/pi/tools/",
     "build:csharp": "dotnet build src/analysis/tools/CsharpAstAnalyzer/CsharpAstAnalyzer.csproj -c Release",
     "build:all": "npm run build:csharp && npm run build",
-    "bundle": "esbuild dist/interfaces/pi/index.js --bundle --platform=node --format=esm --outfile=dist/interfaces/pi/index.bundle.js --external:tree-sitter --external:tree-sitter-cpp --external:jsdom --external:@earendil-works/pi-coding-agent --external:pi-lens --external:ts-morph && mv dist/interfaces/pi/index.bundle.js dist/interfaces/pi/index.js",
+    "bundle": "node scripts/bundle.mjs",
     "deploylocal": "npm run build && rm -rf ~/.pi/extensions/tdd-workflow && ln -sf $(pwd) ~/.pi/extensions/tdd-workflow",
     "test": "vitest run",
     "test:watch": "vitest",

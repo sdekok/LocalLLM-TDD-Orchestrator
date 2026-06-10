@@ -14,115 +14,22 @@ import * as os from 'os';
 import * as fs from 'fs';
 import { WorkflowExecutor } from '../../src/orchestrator/executor.js';
 import { StateManager } from '../../src/orchestrator/state.js';
-import { ModelRouter } from '../../src/llm/model-router.js';
+import {
+  makeModelRouter,
+  makeMockSession,
+  makeMessageUpdateEvent,
+} from '../helpers/executor-harness.js';
 
 // ---------- module mocks ----------
-
-vi.mock('../../src/agents/planner.js', () => ({
-  planAndBreakdown: vi.fn(),
-}));
-
-vi.mock('../../src/utils/exec.js', () => ({
-  execFileAsync: vi.fn().mockResolvedValue({ stdout: '', stderr: '' }),
-  DEFAULT_MAX_BUFFER: 10 * 1024 * 1024,
-}));
-
-vi.mock('../../src/orchestrator/quality-gates.js', () => ({
-  runQualityGates: vi.fn(),
-  collectCoverageSnapshot: vi.fn().mockResolvedValue(undefined),
-  detectTestCommand: vi.fn(),
-  formatGateFailures: vi.fn(),
-  hasCoverageThresholds: vi.fn().mockReturnValue(false),
-}));
-
-vi.mock('../../src/orchestrator/epic-loader.js', () => ({
-  EpicLoader: vi.fn().mockImplementation(function () {
-    return {
-      findEpic: vi.fn().mockReturnValue(null),
-      parseEpic: vi.fn(),
-    };
-  }),
-}));
-
-vi.mock('../../src/subagent/factory.js', () => ({
-  createSubAgentSession: vi.fn(),
-}));
-
-vi.mock('../../src/orchestrator/sandbox.js', () => {
-  const sandboxInstance = {
-    createBranch: vi.fn(async () => undefined),
-    getCurrentBranch: vi.fn(async () => 'main'),
-    safeCheckout: vi.fn(async () => undefined),
-    ensureOnBaseBranch: vi.fn(async (b?: string) => b ?? 'main'),
-    rollback: vi.fn(async () => undefined),
-    mergeAndCleanup: vi.fn(async () => undefined),
-    commit: vi.fn(async () => undefined),
-  };
-  // Use a plain constructor function so `new Sandbox()` works inside Vitest's mock hoisting
-  function MockSandbox() { return sandboxInstance; }
-  return { Sandbox: MockSandbox };
-});
-
-// ---------- helpers ----------
-
-function makeModelRouter() {
-  return new ModelRouter({
-    models: {
-      'test-model': {
-        name: 'Test',
-        ggufFilename: 'test.gguf',
-        provider: 'local',
-        contextWindow: 8192,
-        maxOutputTokens: 1024,
-        architecture: 'dense',
-        speed: 'fast',
-        enableThinking: false,
-      },
-    },
-    routing: { plan: 'test-model', implement: 'test-model', review: 'test-model' },
-  });
-}
-
-/**
- * Creates a minimal mock session with a controllable subscribe listener.
- * Returns the session mock and a helper to fire session events.
- */
-function makeMockSession() {
-  // Support multiple concurrent subscribers like a real session — the executor
-  // keeps the implementer handle subscribed across attempts while the reviewer
-  // subscribes/unsubscribes on the same (sometimes shared) session. A single
-  // listener would be clobbered by the reviewer, so the implementer's events
-  // would vanish on retries.
-  const listeners: Array<(event: any) => void> = [];
-  const session = {
-    subscribe: vi.fn((fn: (event: any) => void) => {
-      listeners.push(fn);
-      return () => {
-        const i = listeners.indexOf(fn);
-        if (i >= 0) listeners.splice(i, 1);
-      };
-    }),
-    // Emit one benign activity event per turn before resolving. A real session
-    // always streams at least one event when the model responds; without this
-    // the executor's "model produced no response" fast-fail (ModelUnreachableError)
-    // would correctly treat a silent mock as an unreachable endpoint and halt.
-    // tool_execution_start sets modelActivitySeen without touching turnText or
-    // chatMessage, so it preserves every existing assertion.
-    prompt: vi.fn(async () => {
-      for (const l of [...listeners]) l({ type: 'tool_execution_start', toolName: 'read', args: { path: 'x.ts' } });
-    }),
-    dispose: vi.fn(),
-    messages: [],
-  };
-  const fire = (event: any) => {
-    for (const l of [...listeners]) l(event);
-  };
-  return { session, fire };
-}
-
-function makeMessageUpdateEvent(ae: Record<string, unknown>) {
-  return { type: 'message_update', assistantMessageEvent: ae };
-}
+// Hoisted per-file; each delegates to a shared factory in executor-mocks.ts
+// (kept src-import-free so the dynamic import inside these factories can't pull a
+// being-mocked module back into mock resolution).
+vi.mock('../../src/agents/planner.js', async () => (await import('../helpers/executor-mocks.js')).plannerMock());
+vi.mock('../../src/utils/exec.js', async () => (await import('../helpers/executor-mocks.js')).execMock());
+vi.mock('../../src/orchestrator/quality-gates.js', async () => (await import('../helpers/executor-mocks.js')).qualityGatesMock());
+vi.mock('../../src/orchestrator/epic-loader.js', async () => (await import('../helpers/executor-mocks.js')).epicLoaderMock());
+vi.mock('../../src/subagent/factory.js', async () => (await import('../helpers/executor-mocks.js')).subagentFactoryMock());
+vi.mock('../../src/orchestrator/sandbox.js', async () => (await import('../helpers/executor-mocks.js')).sandboxMock());
 
 // ---------- tests ----------
 
