@@ -132,8 +132,14 @@ export class ModelUnreachableError extends Error {
   }
 }
 const SIMILARITY_THRESHOLD = 0.9;              // If outputs are >90% similar, it's a loop
-/** Delay after sub-agent session disposal to allow slot reclaim. Override with TDD_SLOT_RECOVERY_MS env var. */
-const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '5000', 10);
+/**
+ * Delay after sub-agent session disposal before starting the next agent.
+ * Since SDK 0.78, session.dispose() hard-aborts the in-flight request (agent,
+ * retry, compaction, bash), so the server frees its slot almost immediately —
+ * 500 ms is a safety margin, not a real wait. Raise via TDD_SLOT_RECOVERY_MS
+ * for servers that linger on aborted requests (e.g. older llama.cpp builds).
+ */
+const SLOT_RECOVERY_DELAY_MS = parseInt(process.env['TDD_SLOT_RECOVERY_MS'] ?? '500', 10);
 
 
 export interface SessionRefreshParams {

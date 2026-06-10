@@ -418,7 +418,11 @@ This session does NOT have the context-mode MCP tools (\`ctx_execute\`, \`ctx_ex
     systemPrompt: populatedPrompt,
     appendSystemPrompt: [],
   });
-  await loader.reload();
+  // Project trust (SDK 0.79+): the orchestrator only ever runs in a project the
+  // user deliberately pointed it at, so resolve trust explicitly. Without this,
+  // a future safe-by-default flip would silently skip project-local resources
+  // (context-mode MCP, pi-lens, .pi settings) in headless sub-agent sessions.
+  await loader.reload({ resolveProjectTrust: async () => true });
 
   // Create the ephemeral session without specifying the model.
   // Pi will fall back to its default (potentially wrong provider like openrouter).

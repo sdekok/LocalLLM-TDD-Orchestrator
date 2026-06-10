@@ -121,6 +121,11 @@ export default function(pi: ExtensionAPI) {
   // Intercept interactive user messages while chatInputResolve is set.
   pi.on('input', async (event) => {
     if (!chatInputResolve || event.source !== 'interactive') return;
+    // SDK 0.77+: streamingBehavior is set when the user steers or queues a
+    // follow-up while the host agent is mid-stream. Those messages are aimed
+    // at the running agent, not at a pending TDD question — let them pass
+    // instead of swallowing them as the answer.
+    if (event.streamingBehavior) return;
     const resolve = chatInputResolve;
     chatInputResolve = null;
     resolve(event.text);

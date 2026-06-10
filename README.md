@@ -342,8 +342,16 @@ Optional settings can be placed in the `tddConfig` key of the project's `package
 | `OPENAI_API_KEY` | — | API key for OpenAI models |
 | `TDD_WORKFLOW_CONFIG_DIR` | — | Override config file search directory |
 | `LENS_FAIL_POLICY` | `fail-closed` | `fail-open` skips the Lens gate on crash; `fail-closed` treats a crash as a failure |
-| `TDD_SLOT_RECOVERY_MS` | `5000` | Milliseconds to wait after sub-agent disposal before reusing the slot |
+| `TDD_SLOT_RECOVERY_MS` | `500` | Milliseconds to wait after sub-agent disposal before starting the next agent. Since Pi SDK 0.78 `dispose()` hard-aborts the in-flight request, so this is a safety margin; raise it for servers that linger on aborted requests |
 | `TDD_MCP_STARTUP_MS` | `5000` | Milliseconds to wait for MCP servers (context-mode, searxng) to register tools after session creation |
+
+## Pi Version Notes
+
+Requires `@earendil-works/pi-coding-agent` ≥ 0.79:
+
+- **Project trust** (Pi 0.79+): sub-agent sessions explicitly trust the project they run in (the orchestrator only ever runs where you point it). For the *host* Pi session, accept the trust prompt on first run in a repo — or set `defaultProjectTrust` in `~/.pi/agent/settings.json` — otherwise project-local extensions (context-mode, pi-lens) won't load.
+- **Provider retries**: transient provider failures (e.g. an inference-server restart mid-workflow) are retried by the SDK before the orchestrator's model-unreachable fast-fail kicks in. Tune with `retry.provider.maxRetries` in `~/.pi/agent/settings.json`.
+- **Cache-hit visibility**: Pi's interactive footer shows the latest prompt-cache hit rate (`CH`) — useful for confirming preserved-thinking prefix caching is working during TDD runs.
 
 ## Diagnostics
 
